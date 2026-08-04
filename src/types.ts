@@ -1,0 +1,75 @@
+export interface BrassUser {
+  sub: string;
+  email?: string;
+  display_name?: string;
+  avatar_url?: string;
+}
+
+export interface BrassInitOptions {
+  // With nothing passed, the SDK resolves all four production origins.
+  // Naming any one of the four below opts out of that entirely, so a
+  // stack is addressed by its own origins rather than by a mix.
+  authBaseUrl?: string;
+  // Origin for the Brass data API (documents, organizations, users). The
+  // auth surface uses `authBaseUrl`.
+  apiBaseUrl?: string;
+  // WebSocket endpoint for document op and presence subscriptions. On
+  // its own hostname, so it cannot be derived from `apiBaseUrl`. Passing
+  // any other `*BaseUrl` leaves it unset on purpose: a production ws
+  // origin beside a hand-overridden HTTP origin would connect to a
+  // different stack and silently drop events, whereas unset fails loudly
+  // on `subscribe`.
+  wsBaseUrl?: string;
+  // Origin the Brass-hosted UI pages are served from. The hosted-UI
+  // launchers load `${dashboardBaseUrl}/embed/*` in a modal iframe.
+  dashboardBaseUrl?: string;
+  // Pin the hosted-UI modal + embed page to a theme. Defaults to
+  // `'light'`; `'auto'` follows the OS preference. An app that forces
+  // its own theme should pass the matching value so the modal doesn't
+  // mismatch the page that opened it.
+  hostedUiTheme?: 'light' | 'dark' | 'auto';
+  // Open a document even when this app's declared schema cannot read it
+  // (default off). Off, the platform refuses such an open and the SDK asks
+  // the person whether to go ahead, so a bookmark or a reload cannot open
+  // one silently. On, every open carries the answer already, which is what
+  // an app driving opens with nobody watching needs.
+  openIncompatibleDocuments?: boolean;
+  // Mirror the active document selection to the page URL (default on):
+  // writes the doc id (and non-default branch) using `pushState` for a
+  // genuine open / branch switch and `replaceState` to pin the boot
+  // selection, and restores from the URL on boot and `popstate`. Read
+  // the id directly via `Brass.docIdFromUrl()`. Opt out with `false`
+  // for an app that owns its URL state (e.g. its own router).
+  syncDocToUrl?: boolean;
+  // Query-parameter name for the active doc id (default `'doc'`). Set to
+  // disambiguate when the app's URL already uses `doc`.
+  docUrlParam?: string;
+  // Query-parameter name for a non-default branch (default `'branch'`).
+  // Present only when the active document is on a non-default branch.
+  branchUrlParam?: string;
+  // Set `document.title` to the active document's name (default on), so
+  // history entries are distinguishable, restoring the original title
+  // when no document is open. While a document is open the title is
+  // suffixed with the app name (`Doc name · App name`), taken from the
+  // page's own `<title>` at the first sync. Opt out with `false` for an
+  // app that manages its own title.
+  syncDocToTitle?: boolean;
+}
+
+// `'unknown'` is the bootstrap window before `Brass.init` settles,
+// distinct from `'signed-out'` (init settled, no user) so an app can
+// render a neutral state instead of flashing its sign-in CTA at a user
+// who turns out to be signed in. Then tracks every sign-in / sign-out.
+// `'guest'` is the anonymous-link case: the page was opened via a
+// public-link token (`?brass_link=`), so there is no signed-in user but
+// the session still opens a read-only document. An app renders its
+// working surface for `'signed-in'` OR `'guest'` (read-only), and its
+// sign-in CTA only for `'signed-out'`.
+export type AuthStatus = 'unknown' | 'signed-in' | 'signed-out' | 'guest';
+
+export type UserChangeListener = (user: BrassUser | null) => void;
+
+// Fired when Brass.init fails (bad / missing app_id, etc.). Register
+// before init to get visibility into failures that an init wrapped
+// without a `.catch()` would otherwise swallow silently.
+export type ErrorListener = (error: Error) => void;

@@ -1,0 +1,96 @@
+# Publish this package to npm with provenance.
+#
+# This repo is a public publish mirror; the package is developed in a
+# private monorepo and synced here per release (see CONTRIBUTING.md). A
+# push of a `v<version>` tag (done by the sync) publishes that version.
+#
+# Auth has two modes, and the step conditions pick automatically:
+#   - Bootstrap: the FIRST publish of a package uses an `NPM_TOKEN` repo
+#     secret, because npm cannot attach a Trusted Publisher to a package
+#     that does not exist yet. Provenance still applies (it works with a
+#     token, as long as this runs in a public repo's Actions).
+#   - Steady state: once the package exists, configure this repo +
+#     workflow as the package's Trusted Publisher on npmjs.com and DELETE
+#     the `NPM_TOKEN` secret. Publishing is then tokenless over OIDC.
+#
+# The workflow_dispatch dry run needs no auth and rehearses build + pack.
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build + pack only, no registry write
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # mint the OIDC token Trusted Publishing + provenance use
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Surfaced as an env var so a step `if:` can branch on its presence
+    # (secrets are not allowed directly in `if:`). Empty once the secret
+    # is deleted, which flips publishing to Trusted Publishing.
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing needs npm >= 11.5.1; setup-node ships older.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npx tsc -b --force
+
+      # A tag publish must match the package it carries.
+      - name: Verify tag matches package version
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ver=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "v$ver" ]; then
+            echo "::error::Tag '$TAG' does not match package.json version '$ver'"
+            exit 1
+          fi
+
+      - name: Show tarball contents
+        run: npm pack --dry-run
+
+      - name: Rehearse (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: npm publish --access public --dry-run
+
+      - name: Publish (bootstrap token)
+        if: >-
+          !(github.event_name == 'workflow_dispatch' && inputs.dry_run) &&
+          env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+      - name: Publish (trusted publishing)
+        if: >-
+          !(github.event_name == 'workflow_dispatch' && inputs.dry_run) &&
+          env.NPM_TOKEN == ''
+        run: npm publish --provenance --access public

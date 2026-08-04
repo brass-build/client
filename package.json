@@ -1,0 +1,60 @@
+{
+  "name": "@brass-build/client",
+  "version": "0.1.0",
+  "description": "Client SDK for Brass",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "import": "./dist/vite.js"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "import": "./dist/internal.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "!src/**/__tests__/**",
+    "scripts",
+    "README.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "docs",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -b",
+    "type-check": "tsc -b",
+    "prepare": "node ./scripts/prepare.mjs",
+    "prepublishOnly": "tsc -b --force"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "loro-crdt": "^1.12.1"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.0"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brass-build/client.git"
+  },
+  "homepage": "https://brass.build",
+  "license": "MIT"
+}
