@@ -4,6 +4,8 @@
 // redo stack honest across other peers' edits.
 import { UndoManager, type LoroDoc } from 'loro-crdt';
 
+import type { UndoControllerOptions } from './types.js';
+
 // Loro's time-based merge is permanently disabled. The undo boundary here is
 // the checkpoint group bracket (`sealStep`), and the two are incompatible: a
 // nonzero merge interval merges adjacent changes by *timestamp*, and that
@@ -20,11 +22,16 @@ const UNDO_MERGE_INTERVAL_MS = 0;
 // entity sizes is a few hundred KB, well below anything that matters.
 const DEFAULT_MAX_UNDO_STEPS = 200;
 
-export interface UndoControllerOptions {
-  // Cap on retained undo steps. Older steps drop off the bottom of the
-  // stack as new ones land.
-  maxUndoSteps?: number;
-}
+// Commit origin the paged marker (`meta.paged:<root>`) is stamped with, and
+// the one origin the undo stack ignores.
+//
+// The marker says which shape a root's records are stored in, so it is a fact
+// about the store rather than a step the reader took: undoing it leaves the
+// pages the crossing mutation sealed behind a marker that says unpaged, which
+// every reader answers by handing back the page entries themselves. The write
+// that carries it therefore commits alone, so nothing an app authored is
+// excluded alongside it.
+export const PAGING_COMMIT_ORIGIN = 'brass.paging';
 
 // Thin wrapper around Loro's UndoManager exposing only what the Document
 // needs. Owned by the Document; not part of the public SDK surface.
@@ -42,6 +49,7 @@ export class UndoController {
     this._mgr = new UndoManager(loroDoc, {
       mergeInterval: UNDO_MERGE_INTERVAL_MS,
       maxUndoSteps: options?.maxUndoSteps ?? DEFAULT_MAX_UNDO_STEPS,
+      excludeOriginPrefixes: [PAGING_COMMIT_ORIGIN],
     });
     // Open the implicit group so commits before the first `createCheckpoint`
     // still bracket as one undo step.

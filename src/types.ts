@@ -1,3 +1,5 @@
+import type { HostedUiTheme } from './hosted-ui.js';
+
 export interface BrassUser {
   sub: string;
   email?: string;
@@ -27,7 +29,7 @@ export interface BrassInitOptions {
   // `'light'`; `'auto'` follows the OS preference. An app that forces
   // its own theme should pass the matching value so the modal doesn't
   // mismatch the page that opened it.
-  hostedUiTheme?: 'light' | 'dark' | 'auto';
+  hostedUiTheme?: HostedUiTheme;
   // Open a document even when this app's declared schema cannot read it
   // (default off). Off, the platform refuses such an open and the SDK asks
   // the person whether to go ahead, so a bookmark or a reload cannot open
@@ -37,9 +39,10 @@ export interface BrassInitOptions {
   // Mirror the active document selection to the page URL (default on):
   // writes the doc id (and non-default branch) using `pushState` for a
   // genuine open / branch switch and `replaceState` to pin the boot
-  // selection, and restores from the URL on boot and `popstate`. Read
-  // the id directly via `Brass.docIdFromUrl()`. Opt out with `false`
-  // for an app that owns its URL state (e.g. its own router).
+  // selection, and restores from the URL on boot and `popstate`. The
+  // document the URL named is bound as `Brass.session.document`, so an
+  // app reads the active id from `session.document?.id`. Opt out with
+  // `false` for an app that owns its URL state (e.g. its own router).
   syncDocToUrl?: boolean;
   // Query-parameter name for the active doc id (default `'doc'`). Set to
   // disambiguate when the app's URL already uses `doc`.
@@ -73,3 +76,52 @@ export type UserChangeListener = (user: BrassUser | null) => void;
 // before init to get visibility into failures that an init wrapped
 // without a `.catch()` would otherwise swallow silently.
 export type ErrorListener = (error: Error) => void;
+
+export interface UndoControllerOptions {
+  // Cap on retained undo steps. Older steps drop off the bottom of the
+  // stack as new ones land.
+  maxUndoSteps?: number;
+}
+
+/**
+ * A document's own view of how its sync is going, as the client sees it.
+ *
+ * The server records what reached it, so the facts that separate a write
+ * that was lost from a client that is merely slow live only here. Read it
+ * when a save is taking longer than it should; `Brass.onError` reports
+ * failures, and this reports the state a failure has not yet been declared
+ * for.
+ */
+export interface DocSyncDiagnostics {
+  /** Ops committed locally that the server has not acknowledged. */
+  unackedOps: number;
+  /** How long the oldest of them has been waiting, in ms. 0 when none. */
+  oldestUnackedMs: number;
+  /**
+   * The oldest unacked op's correlator. The same id rides the op to the
+   * server, so it is what an operator matches a stuck save against the
+   * server's record of the write.
+   */
+  oldestClientOpId: string | null;
+  /**
+   * Sockets the SDK has opened since it was constructed, past the first.
+   * Every open document shares one socket, so this is a fact about the
+   * client rather than about this document, and it counts a deliberate
+   * close and re-open alongside a drop.
+   */
+  reconnects: number;
+  /**
+   * Since any acknowledgement landed on this socket, in ms, or null when
+   * none ever has. A connection answering nothing and one merely behind
+   * look the same from a single op's age; this is what tells them apart.
+   */
+  lastAckAgeMs: number | null;
+  /** Bytes on the socket against the transport's in-flight budget. */
+  inFlightBytes: number;
+  /** Ops too large for the socket, travelling over HTTP right now. */
+  httpOpsInFlight: number;
+  /** Rounds the durability handshake has spent reconciling. */
+  healRounds: number;
+  /** Whether the page is hidden, which throttles the client's timers. */
+  hidden: boolean;
+}

@@ -113,7 +113,14 @@ export function createEmitter<T>(opts: EmitterOptions<T> = {}): Emitter<T> {
         retained = value;
         hasValue = true;
       }
-      for (const cb of listeners) dispatch(cb, value);
+      // Over a snapshot, because a listener may detach or clear the rest
+      // while the fanout is running: the session's own `onGone` handler
+      // closes the document, which clears its listener set, and a `Set`
+      // never visits an entry removed before its turn. Iterating live there
+      // silently drops every listener registered after the session's, which
+      // is all of the app's.
+      const receiving = Array.from(listeners);
+      for (const cb of receiving) dispatch(cb, value);
       if (oneShot) listeners.clear();
     },
     clear() {

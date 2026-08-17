@@ -2,12 +2,15 @@ import {
   buildSignInUrl,
   buildSignedOutOfAppUrl,
   refreshTokens,
-  type RefreshResult,
+  revokeAppApproval,
+  type RefreshCredential,
+  type RefreshOutcome,
   type TokenSet,
 } from './auth-flow.js';
 import { decodeIdToken } from './jwt.js';
 import { createEmitter } from './emitter.js';
 import {
+  clearParkedDocuments,
   createOpenDocument,
   type CreateDocumentArgs,
   type CreateDocumentOptions,
@@ -28,7 +31,7 @@ import {
   type SelectDocumentResult,
 } from './hosted-ui.js';
 import type { Document } from './documents.js';
-import type { DocumentSerializer } from './serializer.js';
+import type { DocumentSerializer, StoredDocument } from './serializer.js';
 import {
   createImportRunner,
   type DocumentImporter,
@@ -111,6 +114,10 @@ import type {
 } from './types.js';
 
 const DEFAULT_AUTH_BASE_URL = 'https://auth.brass.build';
+// How long `signOut` waits for the revocation before it navigates. The page
+// it lands on finishes an unrevoked sign-out itself, so waiting longer than
+// this only delays the sign-out.
+const SIGN_OUT_REVOKE_DEADLINE_MS = 4000;
 // The data API has its own host, NOT the dashboard origin: the
 // dashboard (app.brass.build) is a static SPA, the data API is a
 // separate gateway behind api.brass.build.
@@ -146,11 +153,22 @@ export interface ResolvedBaseUrls {
 
 // Resolve the four base URLs from init options. Zero config applies all
 // four production origins (including `wsBaseUrl`, so documents and
-// presence work with nothing passed). Naming ANY `*BaseUrl` fills
-// nothing from production: an app that overrides `apiBaseUrl` and
-// inherits a production `wsBaseUrl` would connect the WS to the wrong
-// stack and silently drop events, whereas an unfilled `wsBaseUrl` fails
-// loudly on subscribe. Pure so the precedence is unit-testable.
+// presence work with nothing passed).
+//
+// Naming ANY `*BaseUrl` withholds the production `wsBaseUrl`: an app that
+// overrides `apiBaseUrl` and inherited a production socket would connect to
+// the wrong stack and silently drop events, where an unfilled `wsBaseUrl`
+// fails loudly on subscribe.
+//
+// `authBaseUrl`, `apiBaseUrl` and `dashboardBaseUrl` still fall back to their
+// production defaults, so a caller who names some but not all of them reaches
+// production for the rest. `dashboardBaseUrl` is the one that goes wrong
+// quietly: every hosted surface (the picker, share, the version bar) is framed
+// from it, so an app on another stack frames production's, which either
+// refuses to render or hands back ids the configured API cannot open. Name it
+// alongside the others.
+//
+// Pure so the precedence is unit-testable.
 export function resolveBaseUrls(options: BrassInitOptions): ResolvedBaseUrls {
   const anyUrlOverride = Boolean(
     options.authBaseUrl || options.apiBaseUrl || options.wsBaseUrl || options.dashboardBaseUrl,
@@ -178,6 +196,23 @@ const REFRESH_LEEWAY_MS = 60_000;
 // group accepts both shapes, and the permissive tail keeps minor
 // server-side format bumps from stranding SDK consumers.
 const APP_ID_PATTERN = /^brass_app_(?:(?:test|live|internal)_)?[A-Za-z0-9_-]+$/;
+
+// What one `/refresh` settled, applied to the client's own state. Carries the
+// `no_session` / `unavailable` split `RefreshOutcome` draws, because the two
+// are opposite answers for a caller: `no_session` is the server saying this
+// app has none, `unavailable` is the absence of an answer.
+type RefreshSettlement =
+  | { status: 'ok'; tokens: TokenSet }
+  | { status: 'no_session' }
+  | { status: 'unavailable' };
+
+// The rejection for `unavailable`. A 503 status is what makes the outcome
+// legible to the layers that branch on one: an app's own retry, and the
+// selection self-heal that clears a persisted doc id on a definitive 403 /
+// 404 and leaves a transient alone.
+function refreshUnavailableError(): BrassError {
+  return new BrassError('The sign-in service is unavailable', { status: 503 });
+}
 
 export class BrassClient {
   private appId: string | null = null;
@@ -230,7 +265,12 @@ export class BrassClient {
   // Init-failure listeners. Swallow a listener's throw so one bad handler
   // cannot block the others or mask the original error (already logged).
   private readonly errorListeners = createEmitter<Error>({ onError: () => {} });
-  private inflightRefresh: Promise<TokenSet | null> | null = null;
+  private inflightRefresh: Promise<RefreshSettlement> | null = null;
+  // Bumped by every `signOut`, and captured by a `/refresh` when it starts.
+  // A refresh that settles against a moved epoch drops its answer: the
+  // credentials it would write were cleared by a sign-out while it was in
+  // flight, and re-writing them signs the person back in.
+  private authEpoch = 0;
   private initialized = false;
   // Incognito / third-party-cookie fallback state. Both null in a normal
   // browser, where the cross-site `brass_auth` cookie carries the session
@@ -238,7 +278,7 @@ export class BrassClient {
   //   - `pendingAuthCode`: the one-time `brass_code` pulled off the
   //     landing URL by bootstrap(), consumed at most once by refresh() if
   //     the cookie channel is unavailable.
-  //   - `sessionToken`: the platform-session pointer from a code
+  //   - `sessionToken`: the app-bound session pointer from a code
   //     exchange. Once set, every refresh() uses it instead of the
   //     cookie. Mirrored into sessionStorage so a reload in a
   //     cookie-blocked browser hydrates it; see session-persistence.ts.
@@ -280,8 +320,9 @@ export class BrassClient {
     completeImport: (docId) => this.docsInternal().completeImport(docId),
     reportError: (error) => this.fireError(error),
   });
-  // Separate from the projects namespace's WS client: one connection
-  // per surface.
+  // One socket carrying every document topic this client subscribes,
+  // built on first open so an app that never opens a document never
+  // connects.
   private docWsClient: BrassWsClient | null = null;
 
   // init ALWAYS resolves: failures (bad/missing app_id) fire onError +
@@ -439,7 +480,7 @@ export class BrassClient {
       // renders a signed-out UI or calls `signIn()`, which navigates the
       // frame away from the export it was loaded to run.
       if (this.exportGuest === null) {
-        for (const listener of this.listeners) {
+        for (const listener of Array.from(this.listeners)) {
           listener(this.user);
         }
       }
@@ -458,23 +499,34 @@ export class BrassClient {
     window.location.assign(buildSignInUrl(this.authBaseUrl, appId, window.location.href));
   }
 
-  // Per-app sign-out. Top-level navigation to a Brass-hosted confirmation
-  // page that:
-  //   1. Revokes this app's server-side approval (subsequent /refresh
-  //      calls for this app return 401 even on cookie reuse).
-  //   2. Surfaces the email the user is still signed in to Brass as,
-  //      and offers a one-click "Sign out of Brass too" link.
+  // Per-app sign-out. Revokes this app's server-side approval (subsequent
+  // /refresh calls for this app return 401 even on cookie reuse), then makes
+  // a top-level navigation to a Brass-hosted page that surfaces the email
+  // the user is still signed in to Brass as, and offers a one-click "Sign
+  // out of Brass too" link.
   //
-  // Navigation (not a background fetch) so the user gets a visible
-  // confirmation, closing the trust gap of "did sign-out actually
-  // happen?" The decision to ALSO sign out of the platform belongs to
-  // the user, made on the Brass-hosted page; the calling app cannot
-  // trigger platform-level sign-out from its own UI.
+  // The navigation is what closes the trust gap of "did sign-out actually
+  // happen?"; the revocation rides the credentialed route because the page
+  // answers whoever arrives at it and so writes nothing on arrival. The
+  // decision to ALSO sign out of the platform belongs to the user, made on
+  // the Brass-hosted page; the calling app cannot trigger platform-level
+  // sign-out from its own UI.
   signOut(): void {
     const appId = this.requireAppId();
     if (typeof window === 'undefined') {
       throw new Error('Brass.signOut must be called in a browser');
     }
+    // Read before the clears below drop it: where the cross-site cookie is
+    // blocked, this pointer is the revocation's only credential.
+    const credential: RefreshCredential = this.sessionToken
+      ? { kind: 'sessionToken', sessionToken: this.sessionToken }
+      : { kind: 'cookie' };
+    // Fence any `/refresh` already on the wire: landing after the clears
+    // below, it writes back the token set, the login hint and the session
+    // pointer, and re-emits the signed-in user. The hint and the pointer
+    // outlive the page, so that resurrects the session on the next load
+    // too, and the navigation below can be delayed or cancelled.
+    this.authEpoch += 1;
     this.setTokens(null);
     // Drop any fallback-mode credential too, so a stale session token
     // can't resurrect the session on the next getAccessToken(). Clear
@@ -496,12 +548,22 @@ export class BrassClient {
     // on the way to the confirmation page. Harmless when the app is not
     // gated (the cookie simply isn't there). Off a hosted origin there is
     // no such cookie, so go straight to the confirmation page.
-    if (isBrassHostedHost(window.location.hostname)) {
-      const leave = `${window.location.origin}/__brass/leave?return_to=${encodeURIComponent(signedOutUrl)}`;
-      window.location.assign(leave);
-    } else {
-      window.location.assign(signedOutUrl);
-    }
+    const target = isBrassHostedHost(window.location.hostname)
+      ? `${window.location.origin}/__brass/leave?return_to=${encodeURIComponent(signedOutUrl)}`
+      : signedOutUrl;
+    // Leave once the revocation settles, so the page reports a sign-out that
+    // already happened rather than offering the button that finishes it.
+    let left = false;
+    const leave = (): void => {
+      if (left) return;
+      left = true;
+      window.location.assign(target);
+    };
+    const deadline = setTimeout(leave, SIGN_OUT_REVOKE_DEADLINE_MS);
+    void revokeAppApproval(this.authBaseUrl, appId, credential).then(() => {
+      clearTimeout(deadline);
+      leave();
+    });
   }
 
   get currentUser(): BrassUser | null {
@@ -563,10 +625,11 @@ export class BrassClient {
     this.errorListeners.emit(error);
   }
 
-  // The raw HTTP metadata + grant namespace (create / get / move /
-  // grantAccess); the editable surface stays on
-  // `Brass.openDocumentById` / `Brass.createDocument`. Throws "Call
-  // Brass.init(appId) first" before init.
+  // The metadata + thumbnail namespace for a document the app already
+  // holds an id for (`get` / `setThumbnail` / `getThumbnail`); the
+  // editable surface stays on `Brass.openDocumentById` /
+  // `Brass.createDocument`. Throws "Call Brass.init(appId) first" before
+  // init.
   get documents(): DocumentsNamespace {
     return this.docsInternal();
   }
@@ -713,9 +776,8 @@ export class BrassClient {
       dashboardBaseUrl: this._dashboardBaseUrl,
       getDocument: (docId) => this.documents.get(docId),
       // The version-preview bar is a hosted embed; it takes the same theme
-      // and fallback session pointer as the other hosted surfaces.
+      // as the other hosted surfaces.
       hostedUiTheme: this.hostedUiTheme,
-      getSessionToken: () => this.sessionToken,
     };
   }
 
@@ -788,11 +850,6 @@ export class BrassClient {
           if (active) this.session._noteLocalDelete(docId);
           else this.session._clearLocalDelete(docId);
         },
-        // Hand our fallback platform-session pointer to the embed so it can
-        // authenticate the dashboard when its own framed cookie is blocked
-        // (incognito / Safari ITP). Null in a normal browser, where the
-        // embed's cross-site cookie carries the session on its own.
-        getSessionToken: () => this.sessionToken,
         // Name the user this app is acting as, so the embed can refuse to
         // act as anyone else. The embed authenticates from the dashboard
         // origin's platform-session cookie, which moves when a second
@@ -837,7 +894,13 @@ export class BrassClient {
     options?: OpenDocumentByIdOptions,
   ): Promise<OpenedDocument> {
     const opened = await this.openDocumentInternal(docId, options);
-    this.maybeWriteDocIdToUrl(opened.id);
+    // The URL names the document the reader is looking at, and the session
+    // owns that whenever it holds one: this open is detached, so claiming the
+    // URL would leave the address bar naming a document the session is not
+    // showing, and a reload would swap the reader onto it. An app with no
+    // session document still gets the sync, which is the read-mostly caller
+    // this method exists for.
+    if (this.session.document === null) this.maybeWriteDocIdToUrl(opened.id);
     return opened;
   }
 
@@ -845,7 +908,7 @@ export class BrassClient {
   // the link" anonymous path). No sign-in: the token is the credential and
   // the server serves a read-only, member-stripped snapshot with no live
   // subscription. `Brass.session` drives this from the URL on boot when the
-  // page carries `?brass_link=`; there is no app-facing entry point.
+  // page carries `?brass_link=`.
   private async openByLinkInternal(
     token: string,
     options?: OpenDocumentByIdOptions,
@@ -1023,13 +1086,13 @@ export class BrassClient {
   registerImporter(importer: DocumentImporter): void {
     this.importRunner.setImporter(importer);
     if (this.guestLinkTokenValue !== null) return;
-    for (const doc of this.openDocuments.values()) {
+    for (const doc of this.liveOpenDocuments()) {
       void this.importRunner.attempt(doc);
     }
   }
 
   // Track an opened document so an export request can resolve its id to
-  // the live Document. Drop it when the doc goes; a re-open overwrites.
+  // the live Document. A re-open overwrites.
   private trackOpenDocument(doc: OpenedDocument): void {
     this.openDocuments.set(doc.id, doc);
     doc.onGone(() => {
@@ -1045,24 +1108,55 @@ export class BrassClient {
     }
   }
 
+  // The tracked documents still open, dropping the rest as it goes.
+  // `onGone` covers only a server-side eviction, and two ordinary paths
+  // retire a Document without one: an app's `close()` (which parks it, so
+  // the public surface throws while the instance lives on in the park
+  // cache) and that cache's LRU eviction (a full teardown, no listener
+  // left to fire). Reading through this is what keeps a retired wrapper
+  // out of an answer, and what keeps the set from growing for the life of
+  // the page.
+  private liveOpenDocuments(): Document[] {
+    const live: Document[] = [];
+    for (const [docId, doc] of this.openDocuments) {
+      if (doc._isLive) live.push(doc);
+      else this.openDocuments.delete(docId);
+    }
+    return live;
+  }
+
+  private liveOpenDocument(docId: string): Document | null {
+    const doc = this.openDocuments.get(docId);
+    if (!doc) return null;
+    if (doc._isLive) return doc;
+    this.openDocuments.delete(docId);
+    return null;
+  }
+
   // Run the registered serializer for an export request from a hosted
   // surface. Resolves the doc from the open set (the active session doc is
   // the fallback for an app that drives it through the session), then hands
   // it to the serializer. A missing serializer is the ordinary "this app
-  // does not export" outcome, not an error.
+  // does not export" outcome, not an error. A document the app has closed
+  // reports `no_document`: running the serializer against it would throw
+  // out of the app's own record reads and report `serializer_failed`, which
+  // names the app's code for a state the platform is holding.
   private async serializeForExport(docId: string): Promise<ExportSerializeOutcome> {
     if (!this.serializer) {
       return { ok: false, code: 'no_serializer', message: 'No serializer registered.' };
     }
     const sessionDoc = this.documentSession?.document ?? null;
     const doc =
-      this.openDocuments.get(docId) ??
-      (sessionDoc && sessionDoc.id === docId ? sessionDoc : null);
+      this.liveOpenDocument(docId) ??
+      (sessionDoc && sessionDoc.id === docId && sessionDoc._isLive ? sessionDoc : null);
     if (!doc) {
       return { ok: false, code: 'no_document', message: 'Document is not open.' };
     }
     try {
-      const bytes = await this.serializer(doc);
+      // A serializer runs detached, with no subscription to have been fed by,
+      // and it needs the document once, so it is handed the containers whole
+      // (`StoredDocument`) rather than the fed surface an app holds.
+      const bytes = await this.serializer(doc as StoredDocument & Document);
       return { ok: true, bytes };
     } catch (err) {
       return {
@@ -1107,6 +1201,7 @@ export class BrassClient {
         apiBaseUrl: this.apiBaseUrl,
         getAccessToken: () => this.getAccessToken(),
         getAppAssertion: () => this.getAppAssertion(),
+        identity: () => this.user?.sub ?? null,
         ...(wsClient ? { wsClient } : {}),
         branchProvider: {
           list: (docId) => docsInternal.listBranches(docId),
@@ -1200,29 +1295,50 @@ export class BrassClient {
     return this.docWsClient;
   }
 
+  // Resolves null only when the server answered that this app has no live
+  // session, and rejects with a 503 `BrassError` when a `/refresh` found no
+  // answer at all. The two outcomes drive opposite handling: null is the
+  // signed-out state a caller renders a sign-in CTA for, where a rejection
+  // is a momentary outage the caller retries. Collapsing them into null
+  // reports a 401-shaped "Not signed in" to a signed-in user whose network
+  // blipped, and hides the transient from every layer that self-heals on it.
   async getAccessToken(): Promise<string | null> {
     this.requireInit();
+    // On a `?brass_link=` page the link token is the credential and `init`
+    // runs no auth bootstrap, so answer null rather than probing /refresh.
+    // A visitor with no session would draw a 401 the browser logs; one who
+    // holds a session for this app would get a real token, and a caller
+    // that prefers a token over the link token (the socket does) would then
+    // present membership where the page's whole authority is the link.
+    if (this.guestLinkTokenValue !== null) return null;
     const current = this.tokens;
     if (current && current.expiresAt - REFRESH_LEEWAY_MS > Date.now()) {
       return current.accessToken;
     }
-    const refreshed = await this.refresh();
-    return refreshed?.accessToken ?? null;
+    const settled = await this.refresh();
+    if (settled.status === 'unavailable') throw refreshUnavailableError();
+    return settled.status === 'ok' ? settled.tokens.accessToken : null;
   }
 
   // The acting-app assertion paired with the current access token, or
   // null when the proxy issued none. Mirrors `getAccessToken`'s
   // freshness check so the two stay in lockstep: a request builder that
   // calls `getAccessToken()` then this reads the same (possibly just
-  // refreshed) token set without forcing a second refresh.
+  // refreshed) token set without forcing a second refresh. Rejects on a
+  // transient outage for the same reason `getAccessToken` does.
   async getAppAssertion(): Promise<string | null> {
     this.requireInit();
+    // Paired with `getAccessToken`: a link guest holds no token to assert
+    // an acting app against, and reaching /refresh here would authenticate
+    // the page the same way.
+    if (this.guestLinkTokenValue !== null) return null;
     const current = this.tokens;
     if (current && current.expiresAt - REFRESH_LEEWAY_MS > Date.now()) {
       return current.appAssertion ?? null;
     }
-    const refreshed = await this.refresh();
-    return refreshed?.appAssertion ?? null;
+    const settled = await this.refresh();
+    if (settled.status === 'unavailable') throw refreshUnavailableError();
+    return settled.status === 'ok' ? (settled.tokens.appAssertion ?? null) : null;
   }
 
   private async bootstrap(): Promise<void> {
@@ -1230,7 +1346,7 @@ export class BrassClient {
     const appId = this.requireAppId();
     // Every successful sign-in 302s back to return_to with the
     // platform-session cookie set AND a one-time `brass_code` query
-    // parameter (see infra/lambda/auth/token-redirect.ts). The cookie
+    // parameter. The cookie
     // is the primary channel; the code is the incognito / Safari ITP /
     // post-third-party-cookie fallback for when the browser drops the
     // cross-site cookie on our /refresh XHR.
@@ -1243,8 +1359,7 @@ export class BrassClient {
     //
     // No app-controlled silent-mint path: the SDK never auto-fires
     // Brass.signIn() based on a URL hint. New app approvals always
-    // require an explicit click on the auth-hosted picker (see the
-    // adaptive /sign-in branch in infra/lambda/auth/sign-in.ts).
+    // require an explicit click on the auth-hosted picker.
     // Same treatment for the launching organization: read it off the URL
     // and strip it here, so a client-side navigation later in the session
     // cannot lose it and the address bar stays the app's own.
@@ -1300,19 +1415,27 @@ export class BrassClient {
     this.pendingAuthCode = null;
   }
 
-  private async refresh(): Promise<TokenSet | null> {
+  private async refresh(): Promise<RefreshSettlement> {
     if (this.inflightRefresh) return this.inflightRefresh;
     const appId = this.requireAppId();
-    this.inflightRefresh = (async () => {
-      const result = await this.runRefresh(appId);
+    const epoch = this.authEpoch;
+    this.inflightRefresh = (async (): Promise<RefreshSettlement> => {
+      const outcome = await this.runRefresh(appId);
+      // No answer means no change: the token set, the login hint, and any
+      // fallback session token stay as they are, and a later attempt settles
+      // the session.
+      if (outcome.status === 'unavailable') return { status: 'unavailable' };
+      // A sign-out landed while this round-trip was in flight, so whatever
+      // it resolved belongs to a session the person has left. Report it as
+      // no session and write nothing: the caller waiting on this token gets
+      // the signed-out answer the sign-out established.
+      if (this.authEpoch !== epoch) return { status: 'no_session' };
+      const result = outcome.status === 'ok' ? outcome.result : null;
       this.setTokens(result?.tokens ?? null);
       // Remember whether a live session exists for this app so the next
       // cold load knows whether to probe /refresh (see bootstrap). A
-      // success proves a session; an empty result means none (or it's
-      // gone), so drop the hint and the next signed-out load stays
-      // silent. A transient network failure also clears it; the cost is
-      // one extra sign-in click on the next load, self-healing on the
-      // next success.
+      // success proves a session; `no_session` is the server saying there
+      // is none, so drop the hint and the next signed-out load stays silent.
       if (result) {
         storeLoginHint(appId);
       } else {
@@ -1323,12 +1446,11 @@ export class BrassClient {
         // Mirror into sessionStorage so a reload on this tab can
         // hydrate it (the cookie channel is unavailable in this
         // browser by construction; we only get here via the code or
-        // sid channels). The server-side `approved_apps` gate stays
-        // the security boundary; the stored sid is no more sensitive
-        // than the cookie it mirrors.
+        // sid channels). The pointer is bound to this app id, so what
+        // is stored authenticates this app and nothing else.
         storeSessionToken(appId, result.sessionToken);
       }
-      return result?.tokens ?? null;
+      return result ? { status: 'ok', tokens: result.tokens } : { status: 'no_session' };
     })().finally(() => {
       this.inflightRefresh = null;
     });
@@ -1338,16 +1460,20 @@ export class BrassClient {
   // Picks the credential channel for a single /refresh round-trip. The
   // cookie path is primary and untouched for browsers that send the
   // third-party cookie; the one-time code is consumed only when that
-  // cookie path genuinely came back empty. Once a fallback session
+  // cookie path resolved no session. Once a fallback session
   // token is in hand (the cross-site cookie is proven unavailable for
   // this page's life), every later refresh uses it directly.
-  private async runRefresh(appId: string): Promise<RefreshResult | null> {
+  //
+  // A rung falls through to the next only on `no_session`. Each one discards
+  // a credential as it passes (the stale sid, the one-time code), and an
+  // `unavailable` says nothing about the credential it just tried.
+  private async runRefresh(appId: string): Promise<RefreshOutcome> {
     if (this.sessionToken) {
       const viaSession = await refreshTokens(this.authBaseUrl, appId, {
         kind: 'sessionToken',
         sessionToken: this.sessionToken,
       });
-      if (viaSession) return viaSession;
+      if (viaSession.status !== 'no_session') return viaSession;
       // Stored sid is stale (server-side revoke, row expiry). Drop both
       // the in-memory copy and the sessionStorage mirror, then fall
       // through to the cookie / code paths. Without this, a hydrated-
@@ -1358,19 +1484,32 @@ export class BrassClient {
       clearSessionToken(appId);
     }
     const viaCookie = await refreshTokens(this.authBaseUrl, appId);
-    if (viaCookie) return viaCookie;
-    // Cookie channel produced nothing. Fall back to the one-time code if
-    // we landed with one. Clear it first: it is single-use server-side,
-    // so a failed exchange must not be retried.
+    if (viaCookie.status !== 'no_session') return viaCookie;
+    // Cookie channel resolved no session. Fall back to the one-time code if
+    // we landed with one. Clear it first: it is single-use server-side, so a
+    // failed exchange must not be retried.
     const code = this.pendingAuthCode;
+    if (!code) return viaCookie;
     this.pendingAuthCode = null;
-    if (!code) return null;
     return refreshTokens(this.authBaseUrl, appId, { kind: 'code', code });
   }
 
   private setTokens(next: TokenSet | null): void {
-    this.tokens = next;
     const nextUser = next ? decodeIdToken(next.idToken) : null;
+    // A different person on this page. `/refresh` resolves whichever platform
+    // session the browser holds, so the identity behind a page that never
+    // navigated can become someone else's (another tab signs out and a second
+    // person signs in). Run the retirement first, as its own transition, so
+    // what the previous identity left open is retired before the new one is
+    // announced rather than inherited by it.
+    if (
+      this.user !== null &&
+      nextUser !== null &&
+      this.user.sub !== nextUser.sub
+    ) {
+      this.setTokens(null);
+    }
+    this.tokens = next;
     if (sameUser(this.user, nextUser)) return;
     this.user = nextUser;
     // Suppress emits while init is still in flight: init's finally
@@ -1379,9 +1518,17 @@ export class BrassClient {
     // fire here (null -> user) AND fire again from init's finally
     // (the same user), double-emitting on every signed-in app load.
     if (!this.bootstrapped) return;
-    for (const listener of this.listeners) {
+    // Copied before the walk: a listener that detaches another would otherwise
+    // remove it before its turn, and a `Set` never visits such an entry.
+    for (const listener of Array.from(this.listeners)) {
       listener(nextUser);
     }
+    // After the listeners, because the session closes the active document as
+    // it hears the sign-out and a close PARKS the Document. A parked Document
+    // answers the next open of its key out of memory, with no token and no
+    // request, so one left behind here is the previous person's document
+    // handed to whoever signs in next.
+    if (nextUser === null) clearParkedDocuments();
   }
 
   private async hydrateProfile(): Promise<void> {

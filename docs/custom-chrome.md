@@ -1,20 +1,17 @@
 # Custom chrome
 
-`Brass.mountToolbar` renders the whole document bar and is the
-recommended path for an app that is one working surface under a bar.
-This page covers the two custom shapes, from least to most custom: a
-multi-pane app that builds its own header out of the **standard
-pieces**, and a fully custom shell that renders `session.commands`
-into its own DOM.
+`Brass.mountToolbar` renders the whole document bar, and it is the path
+to take for an app that is one working surface under a bar. Build your
+own header out of the **standard pieces** for a multi-pane app, or
+render `session.commands` into your own DOM for a fully custom shell.
 
 ## Composable header pieces (multi-pane apps)
 
 A multi-pane app (a tree beside an inspector, a list beside a preview)
-builds its own header for its own layout, but should not re-implement
-the account menu, presence roster, title, undo / redo, or the header's
-responsive layout by hand. Take the header shell with
-`Brass.mountHeader`, then drop the standard pieces into its three
-slots:
+builds its own header for its own layout, and takes the account menu,
+presence roster, title, undo / redo, and the header's responsive layout
+ready-made. Take the header shell with `Brass.mountHeader`, then drop
+the standard pieces into its three slots:
 
 ```ts
 // Each piece mount owns (replaces the children of) the element you
@@ -54,15 +51,15 @@ Each piece renders one cluster wired to `Brass.session` and returns
 - `Brass.mountDriveSync` renders the drive-sync badge. It renders
   nothing on a non-drive doc, so it is safe to mount in any header.
 - `Brass.mountAccountMenu` renders the account avatar menu (email, an
-  Open dashboard link, and sign out).
+  Open Brass dashboard link, and sign out).
 
 `mountHeader` already includes the historical-version preview banner
 (the return-to-live strip shown while a document is previewing an
 earlier version) above the bar, so a multi-pane app on the header shell
-gets correct preview UX with no extra mount. Only a fully custom shell
-(next section, no `mountHeader`) mounts it itself, with
-`Brass.mountVersionPreview(el)`; like the drive badge it renders
-nothing until there is something to show.
+needs no extra mount for it. A fully custom shell (next section, no
+`mountHeader`) mounts it itself with `Brass.mountVersionPreview(el)`,
+which renders nothing until there is something to show, like the drive
+badge.
 
 Mount the chrome once, when the user signs in, not per document: the
 file menu has to exist in the "signed in, nothing open" state or a
@@ -70,8 +67,8 @@ fresh user has no New / Open (the same rule as `mountToolbar`).
 
 ## Fully custom shells: the command list as data
 
-The widgets are one renderer of this same command list, so nothing
-below is a different surface, just a lower-level entry point into it.
+The widgets above render this same command list, so you are reaching
+that list at a lower level here, not a different surface.
 
 `session.commands` is the SDK's built-in actions as data: the SDK owns
 each command's behavior and live state. Each carries a `surface` hint
@@ -128,8 +125,8 @@ hook for keyboard shortcuts).
 
 ## What each command does by default
 
-Reading the list and calling `run()` wires all of it; you render and
-invoke, the SDK owns the behavior:
+Reading the list and calling `run()` wires all of it. You render and
+invoke, and the SDK owns the behavior:
 
 - **`history`** drives version preview end to end. During a preview
   `doc.readOnly` is `true`, so gate your own edit controls on it;

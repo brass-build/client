@@ -1,11 +1,10 @@
 # Presence (live cursors, who's-here)
 
-`doc.presence` is the ephemeral "who is here right now" layer over an
-open document: the roster of other live participants plus a
-lightweight per-user `state` (cursor / camera / selection) and an
-app-namespaced `ext` blob. It is non-null on any open
-writable `Document`, and `null` otherwise. Presence is fully
-ephemeral: nothing survives a disconnect.
+`doc.presence` is the "who is here right now" layer over an open
+document: the roster of other live participants plus a small per-user
+`state` (cursor / camera / selection) and an app-namespaced `ext` blob.
+It is non-null on any open writable `Document`, and `null` otherwise.
+Presence is fully ephemeral: nothing survives a disconnect.
 
 ```ts
 import type { PresenceParticipant } from '@brass-build/client';
@@ -24,12 +23,9 @@ doc.presence?.set({ ext: { myApp: { tool: 'select' } } });
 // canvas APIs without parsing) and their last `state`. Interpolate
 // between updates in your render loop.
 //
-// `on('change', ...)` fires once on subscribe with the current roster
-// when peers are already present (you opened a document others are
-// already in), then on every join, leave, or `state` / `ext` update.
-// It does not fire on subscribe when you are the only one here, and an
-// empty roster is the default paint anyway, so one listener covers both
-// the initial render and every change.
+// `on('change', ...)` fires once on subscribe when peers are already
+// present, then on every join, leave, or `state` / `ext` update, so one
+// listener covers both the initial render and every change.
 const renderRoster = (roster: PresenceParticipant[]) => {
   for (const p of roster) renderAvatar(p.connectionId, p.color, p.state);
 };
@@ -79,16 +75,44 @@ indicator) goes under `ext` instead so it stays namespaced and out of
 the cross-app conventions. The `ext` block is otherwise free-form:
 `ext.myApp = { tool: 'select', chatBubble: 'hi' }`.
 
+## How much you can publish
+
+Each layer is capped at 2,048 bytes of serialised JSON, exported as
+`PRESENCE_LAYER_MAX_BYTES`. Brass measures the two layers separately, so a
+large `ext` blob leaves `state` its full budget.
+
+`selection` is the field that reaches the cap in ordinary use, because it
+grows with what the user picked, and one marquee select crosses it.
+Publish a bounded summary when a selection can get large, such as the
+first few ids plus a count, or the selection's bounding box.
+
+The SDK measures each layer before it sends and withholds one that is over
+the cap, so peers keep the last value that fit rather than losing it. Read
+`presence.status` for the current answer, or subscribe with `onStatus`:
+
+```ts
+doc.presence?.onStatus((status) => {
+  if (status.oversize) {
+    showNotice(`Not sharing your ${status.withheld.join(' and ')}`);
+  } else {
+    clearNotice();
+  }
+});
+```
+
+`onStatus` fires on attach and then whenever the answer changes, so an app
+publishing an oversized payload at 10 Hz hears about it once.
+
 ## Types
 
-`doc.presence` is typed `PresenceClient | null`; each `roster` entry
+`doc.presence` is typed `PresenceClient | null`. Each `roster` entry
 is a `PresenceParticipant` with
 `{ connectionId, sub, displayName, avatarUrl, color, joinedAt, lastSeen,
 state, ext }`. `displayName`, `avatarUrl`, and `color` are always
-present as strings; `avatarUrl` is `''` when the user has no picture.
-Both types are exported from `@brass-build/client` (alongside
-`PresenceSetInput` and `PresenceChangeListener`) so you can annotate
-handlers and roster state without source-reading the SDK.
+present as strings, and `avatarUrl` is `''` when the user has no
+picture. Both types are exported from `@brass-build/client`, alongside
+`PresenceSetInput` and `PresenceChangeListener`, for annotating your
+handlers and roster state.
 
 ## Hand-rolling the header roster (custom shell)
 
@@ -107,7 +131,7 @@ const renderRoster = (roster: readonly PresenceParticipant[]): void => {
     const pip = document.createElement('span');
     pip.className = 'pip';
     pip.style.background = p.color;
-    pip.title = p.displayName ?? p.sub ?? '';
+    pip.title = p.displayName;
     if (p.avatarUrl) {
       const img = document.createElement('img');
       img.src = p.avatarUrl;
@@ -115,7 +139,7 @@ const renderRoster = (roster: readonly PresenceParticipant[]): void => {
       img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:50%';
       pip.appendChild(img);
     } else {
-      pip.textContent = (p.displayName ?? p.sub ?? '?').slice(0, 1).toUpperCase();
+      pip.textContent = p.displayName.slice(0, 1).toUpperCase();
     }
     return pip;
   }));
@@ -125,5 +149,5 @@ const renderRoster = (roster: readonly PresenceParticipant[]): void => {
 Drive it from the same `change` subscription as the in-surface remote
 cursors (see the README's "Presence" section). The listener fires on
 subscribe whenever peers are already present, so it paints the initial
-roster for you; render `doc.presence?.roster ?? []` yourself only if you
-want the empty state on screen before anyone joins.
+roster for you. Render `doc.presence?.roster ?? []` yourself to put the
+empty state on screen before anyone joins.

@@ -27,12 +27,8 @@
 // page learns the host origin from `init` and targets outbound at it (never
 // `*`).
 
-// Both sides ignore any `message` whose `data[ENVELOPE]` is not this exact
-// value, so unrelated postMessage traffic never reaches the handshake.
 import { BrassError } from './errors.js';
-
-const ENVELOPE = '__brass_embed';
-const PROTOCOL_VERSION = 1;
+import { EMBED_ENVELOPE, EMBED_PROTOCOL_VERSION } from './embed-protocol.js';
 
 // No `ready` within this window means the iframe is unusable (CSP, origin
 // unreachable, bridge threw). What the window is worth is set by what the
@@ -267,14 +263,6 @@ export interface HostedUiLauncherOptions {
   // state instead of parking the remote-eviction error surface. Signalled
   // pre-flight, so the note beats the server's `doc_gone` frame.
   onLocalDelete?: (docId: string, active: boolean) => void;
-  // The SDK's fallback platform-session pointer (`sid`), non-null only when
-  // this browser blocked the cross-site `brass_auth` cookie and the SDK is
-  // running in code / session-token mode. Read at dialog-open time and posted
-  // in the bridge `init` (to the pinned dashboard origin only) so the embed
-  // page can refresh the dashboard's own tokens when its framed cookie is
-  // likewise blocked. Null in a normal browser, where the embed's cookie
-  // carries its session and no hand-off is needed.
-  getSessionToken?: () => string | null;
   // The `sub` of the user this app is currently acting as, read at
   // dialog-open time and posted in the bridge `init`. The embed page
   // authenticates from the dashboard origin's own platform-session cookie,
@@ -314,11 +302,6 @@ function redirectToStandalone(
 ): void {
   const url = new URL(`${baseUrl}/embed/${surface}`);
   for (const [key, value] of Object.entries(params)) {
-    // `sessionToken` is an in-iframe-only credential hand-off (posted over the
-    // bridge to the pinned dashboard origin); never let it reach a URL. On the
-    // redirect fallback the standalone page is top-level and first-party, so
-    // its own cookie carries the session and no hand-off is needed.
-    if (key === 'sessionToken') continue;
     if (value !== undefined && value !== null) {
       url.searchParams.set(key, String(value));
     }
@@ -666,13 +649,13 @@ function openEmbed(
       if (event.origin !== dashboardOrigin) return;
       if (event.source !== iframe.contentWindow) return;
       const data = event.data as Record<string, unknown> | null;
-      if (!data || data[ENVELOPE] !== PROTOCOL_VERSION) return;
+      if (!data || data[EMBED_ENVELOPE] !== EMBED_PROTOCOL_VERSION) return;
 
       switch (data['type']) {
         case 'ready': {
           if (readyTimer !== undefined) clearTimeout(readyTimer);
           iframe.contentWindow?.postMessage(
-            { [ENVELOPE]: PROTOCOL_VERSION, type: 'init', surface, params },
+            { [EMBED_ENVELOPE]: EMBED_PROTOCOL_VERSION, type: 'init', surface, params },
             dashboardOrigin,
           );
           // Embed page mounted; fade the loader out (delayed removal so the
@@ -710,7 +693,7 @@ function openEmbed(
           const docId = typeof params['docId'] === 'string' ? params['docId'] : '';
           const reply = (outcome: ExportSerializeOutcome): void => {
             iframe.contentWindow?.postMessage(
-              { [ENVELOPE]: PROTOCOL_VERSION, type: 'export-result', requestId, ...outcome },
+              { [EMBED_ENVELOPE]: EMBED_PROTOCOL_VERSION, type: 'export-result', requestId, ...outcome },
               dashboardOrigin,
             );
           };
@@ -833,6 +816,23 @@ function openEmbed(
   });
 }
 
+// Warm the connection to the origin the embed pages come from. An app talks to
+// the api and auth origins, never this one, so the first hosted surface a
+// reader opens otherwise pays DNS, TCP and TLS before the iframe's document
+// request can even start. Idempotent, since an app may build more than one
+// launcher.
+function preconnectToDashboard(origin: string): void {
+  if (typeof document === 'undefined') return;
+  const links = document.head.querySelectorAll('link[rel="preconnect"]');
+  for (const link of links) {
+    if (link.getAttribute('href') === origin) return;
+  }
+  const link = document.createElement('link');
+  link.rel = 'preconnect';
+  link.href = origin;
+  document.head.appendChild(link);
+}
+
 export function createHostedUiLauncher(
   opts: HostedUiLauncherOptions,
 ): HostedUiLauncher {
@@ -840,6 +840,7 @@ export function createHostedUiLauncher(
   // Parsed once for the postMessage origin checks; a malformed
   // `dashboardBaseUrl` throws here, at construction, not mid-handshake.
   const dashboardOrigin = new URL(baseUrl).origin;
+  preconnectToDashboard(dashboardOrigin);
   // Watch for activations from here on, so a surface opened later knows which
   // control the reader pressed to get there.
   trackHostedUiActivations();
@@ -847,21 +848,16 @@ export function createHostedUiLauncher(
   // would put a dark embed inside a light host on a dark-OS user.
   const theme: HostedUiTheme = opts.theme ?? 'light';
 
-  // Merge the SDK's fallback session pointer into a surface's bridge params
-  // when this browser blocked the cross-site cookie (so the embed page can
-  // refresh the dashboard's tokens without its own framed cookie). Read at
-  // open time, not launcher-construction time, since the sid is populated by
-  // the first fallback refresh, which may land after the launcher is built.
-  // Every embed surface authenticates the same way, so this is cross-cutting
-  // rather than per-surface like `appId`.
-  const withSession = (
+  // Name the user this app is acting as in every surface's bridge params.
+  // Read at open time, not launcher-construction time, since the app may
+  // authenticate after the launcher is built. Every embed surface checks the
+  // same way, so this is cross-cutting rather than per-surface like `appId`.
+  const withActingSub = (
     params: Record<string, unknown>,
   ): Record<string, unknown> => {
-    const sid = opts.getSessionToken?.();
     const actingSub = opts.getActingSub?.();
     return {
       ...params,
-      ...(sid ? { sessionToken: sid } : {}),
       ...(actingSub ? { actingSub } : {}),
     };
   };
@@ -880,7 +876,7 @@ export function createHostedUiLauncher(
       baseUrl,
       dashboardOrigin,
       surface,
-      withSession(params),
+      withActingSub(params),
       unavailable,
       theme,
       exportDoc ? opts.serializeForExport : undefined,

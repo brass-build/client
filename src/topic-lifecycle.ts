@@ -17,6 +17,11 @@
 //     `retrySpent` survives into a same-connection re-subscribe so the
 //     retry stays one-per-topic-per-connection.
 //
+// A frame-scoped reason (`isFrameScopedReason`) is the exception to all of
+// that: it describes the frame the server could not process, not the
+// subscription it arrived on, so every live phase keeps its state and hands
+// the error to the topic's callbacks, which hold the frame that drew it.
+//
 // Invariant: every transition into `tornDown` emits `send_unsubscribe`,
 // so no server-side subscription row can outlive the client-side state
 // (an orphan row would have its `last_seen` kept fresh by the heartbeat,
@@ -55,6 +60,10 @@ export type TopicEffect =
   // Detach the topic's callbacks: further server frames must not reach
   // them and the user's unsubscribe becomes a no-op.
   | { kind: 'drop_listeners' }
+  // Hand the error to the topic's callbacks and leave the subscription
+  // alone. The callbacks own whatever frame drew it, so they own the
+  // recovery.
+  | { kind: 'deliver_error'; reason: string }
   | { kind: 'fire_error'; reason: string };
 
 export interface StepResult {
@@ -63,15 +72,27 @@ export interface StepResult {
 }
 
 // True while topic-scoped frames must be held back: sending before the
-// `subscribed` ack races the server's SUB# row write and draws a spurious
+// `subscribed` ack races the server's subscription record write and draws a spurious
 // `forbidden`.
 export function holdsFrames(state: TopicState): boolean {
   return state.phase === 'subscribing' || state.phase === 'retrying';
 }
 
+// True for a reason that judges one frame rather than the subscription.
+// `unavailable` answers a durable op write the server was authorised to
+// take and could not store right now, so the topic stays up and the writer
+// re-sends the op.
+export function isFrameScopedReason(reason: string): boolean {
+  return reason === 'unavailable';
+}
+
 const SEND_SUBSCRIBE: TopicEffect = { kind: 'send_subscribe' };
 const FLUSH_HELD: TopicEffect = { kind: 'flush_held' };
 const DROP_HELD: TopicEffect = { kind: 'drop_held' };
+
+function deliverError(state: TopicState, reason: string): StepResult {
+  return { state, effects: [{ kind: 'deliver_error', reason }] };
+}
 
 // Rejection / spent-retry teardown. `send_unsubscribe` releases any
 // server-side row a completed retry may have re-created (the invariant in
@@ -123,6 +144,9 @@ export function step(state: TopicState, event: TopicEvent): StepResult {
             effects: [FLUSH_HELD],
           };
         case 'error':
+          if (isFrameScopedReason(event.reason)) {
+            return deliverError(state, event.reason);
+          }
           // Never established on this connection: the rejection is final.
           return tearDown(state, event.reason);
         case 'socket_open':
@@ -139,6 +163,9 @@ export function step(state: TopicState, event: TopicEvent): StepResult {
     case 'established':
       switch (event.type) {
         case 'error':
+          if (isFrameScopedReason(event.reason)) {
+            return deliverError(state, event.reason);
+          }
           // A mid-stream `not_subscribed` is an eviction (the server
           // dropped the subscription row while this client stayed alive,
           // e.g. a presence reap that raced a live-but-quiet connection),
@@ -169,6 +196,9 @@ export function step(state: TopicState, event: TopicEvent): StepResult {
     case 'retrying':
       switch (event.type) {
         case 'error':
+          if (isFrameScopedReason(event.reason)) {
+            return deliverError(state, event.reason);
+          }
           // An eviction draws errors for EVERY frame in flight against the
           // reaped row; the trailing ones land while the retry's subscribe
           // is unacked and describe frames that predate it, so the retry

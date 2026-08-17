@@ -6,7 +6,14 @@ export function decodeIdToken(idToken: string): BrassUser | null {
   const payloadPart = parts[1];
   if (!payloadPart) return null;
   try {
-    const json = atob(payloadPart.replace(/-/g, '+').replace(/_/g, '/'));
+    // A JWT payload is UTF-8, and `atob` answers one latin1 character per
+    // byte, so a claim with any non-ASCII character (an accented name in
+    // `email`) needs the bytes decoded rather than the string used as is.
+    const bytes = Uint8Array.from(
+      atob(payloadPart.replace(/-/g, '+').replace(/_/g, '/')),
+      (ch) => ch.charCodeAt(0),
+    );
+    const json = new TextDecoder().decode(bytes);
     const claims = JSON.parse(json) as { sub?: unknown; email?: unknown };
     if (typeof claims.sub !== 'string') return null;
     const user: BrassUser = { sub: claims.sub };

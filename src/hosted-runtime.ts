@@ -1,32 +1,28 @@
 // Runtime config resolution for Brass-hosted bundles.
 //
-// A bundle served by app hosting (`https://{slug}.onbrass.app` and non-prod
-// equivalents under `.onbrass.app`) gets its identity and environment from
-// the serving slot, not from code: the api writes
-// `/.well-known/brass-runtime.json` into the served prefix (see CONTRACT.md
-// "App hosting"), and `Brass.init()` reads it back same-origin and adopts
+// A bundle served by app hosting gets its identity and environment from the
+// serving slot, not from code: the platform stamps a runtime descriptor into
+// the served prefix, and `Brass.init()` reads it back same-origin and adopts
 // it wholesale. It is authoritative on a hosted origin, so the same artifact
 // picks up each environment's config from whichever origin serves it and a
 // bundle that hardcodes one environment can't carry it onto another's slot.
 // `isBrassHostedHost` recognizes the default `*.onbrass.app` slots by
 // hostname; a custom serving domain (a vanity URL) is not recognizable that
 // way, so the SDK also reads the descriptor whenever a bundle relies on the
-// slot for its environment (no `env` / `*BaseUrl` passed to `Brass.init`),
-// on any host. A present descriptor is authoritative and overrides even a
+// slot for its environment (no `*BaseUrl` passed to `Brass.init`), on any
+// host. A present descriptor is authoritative and overrides even a
 // baked app id. A developer on their own hosting passes explicit origins and
 // never triggers the fetch.
 
 export const HOSTED_RUNTIME_PATH = '/.well-known/brass-runtime.json';
 
 // The window global a Brass serving slot stamps into the served `index.html`
-// (an inline script the unpack worker injects). This is the primary,
+// as an inline script. This is the primary,
 // fetch-free path: the HOST decides whether a bundle is on a Brass slot by
 // whether the served page carries this global, so the SDK never guesses from
 // the hostname (a custom serving domain is indistinguishable from
-// self-hosting by name) nor makes a request that 404s off a slot. Must match
-// `HOSTED_RUNTIME_GLOBAL` in infra/lambda/lib/hosting-runtime.ts (the
-// published package cannot import the workspace module, so the name is
-// duplicated by necessity).
+// self-hosting by name) nor makes a request that 404s off a slot. The name is
+// part of the serving contract, so it is fixed rather than configurable.
 const HOSTED_RUNTIME_GLOBAL = '__brassRuntime';
 
 // The apex app hosting serves bundles under. Every hosting origin is some

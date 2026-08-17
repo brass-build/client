@@ -14,11 +14,13 @@
 //
 // - A GET is idempotent, so replaying it is always safe: retry the whole
 //   transient 5xx / 429 set AND a thrown network error (`RETRY_READ`).
-// - A write is NOT idempotent, so only a 503 is safe to replay: the API
-//   gateway returns a 503 BEFORE the request reaches the handler (a transient
-//   throttle / scale-up / deploy-window blip), so the write never ran and
-//   a replay cannot double-apply it. A 502 / 504 / 429 or a network throw
-//   might mean the handler ran, so those stay hard failures (`RETRY_WRITE_503`).
+// - A write is NOT idempotent, so only a 503 is safe to replay, and only on
+//   a route where a 503 means the write did not land: the gateway's own 503
+//   (a transient throttle / scale-up / deploy-window blip) is returned before
+//   the request reaches the handler, and a handler that answers 503 does so
+//   for a write it refused rather than applied. A 502 / 504 / 429 or a network
+//   throw might mean the handler ran, so those stay hard failures
+//   (`RETRY_WRITE_503`).
 // - A 500 is never retried under either policy: an unhandled server error
 //   is usually deterministic, so a replay just doubles the cost without
 //   changing the outcome.
@@ -62,6 +64,9 @@ export interface RetryOptions {
   policy?: RetryPolicy;
   // Total attempts including the first. Default 3 (so up to 2 replays).
   maxAttempts?: number;
+  // Attempts a thrown network error gets, when the policy replays throws.
+  // Defaults to `maxAttempts`.
+  maxNetworkAttempts?: number;
   // Base backoff; attempt N waits ~base * 2^(N-1) with jitter. Default 300.
   baseDelayMs?: number;
   // Invoked before each replay with the 1-based attempt that just failed and
@@ -86,10 +91,12 @@ export async function fetchWithRetry(
 ): Promise<Response> {
   const policy = options.policy ?? RETRY_READ;
   const maxAttempts = options.maxAttempts ?? 3;
+  const maxNetworkAttempts = options.maxNetworkAttempts ?? maxAttempts;
   const baseDelayMs = options.baseDelayMs ?? 300;
   const sleep = options.sleep ?? defaultSleep;
 
   let lastError: unknown;
+  let networkThrows = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let response: Response | undefined;
     try {
@@ -99,6 +106,8 @@ export async function fetchWithRetry(
       // a write policy rethrows it rather than risk a double-apply.
       if (!policy.replayNetworkErrors) throw err;
       lastError = err;
+      networkThrows += 1;
+      if (networkThrows >= maxNetworkAttempts) throw err;
     }
     if (response && !policy.replayStatuses.has(response.status)) {
       return response;

@@ -375,7 +375,14 @@ export function createDocumentSession(
     // `openError` message joins the signature so a switch from one failed open
     // to a different one (same 'error' status, no bound doc) still re-fires.
     const err = openError ? `${openError.status ?? ''}:${openError.message}` : '';
-    return `${status()}|${document?.id ?? ''}|${documentName ?? ''}|${load}|${err}|${cmds}`;
+    // The previewed version and the browsing flag are their own terms because
+    // nothing else in this signature follows them: a preview -> preview step
+    // holds the id, the name, the status and every command's enabled state
+    // (edit affordances are already disabled by the first checkout), so
+    // without these the step is a silent emit and the chrome rendering the
+    // preview keeps showing the version the reader stepped away from.
+    const ver = `${document?.version ?? ''}:${document?.versionBrowsing ? 1 : 0}`;
+    return `${status()}|${document?.id ?? ''}|${documentName ?? ''}|${load}|${err}|${ver}|${cmds}`;
   }
 
   function emit(): void {
@@ -386,7 +393,10 @@ export function createDocumentSession(
     // subscribe handler awaits whenReady sees it already resolved by the time
     // its listener runs.
     settleWhenReady();
-    for (const listener of listeners) {
+    // Copied before the walk, so a listener that detaches another still
+    // leaves it this fire: an entry removed from a `Set` before its turn is
+    // never visited.
+    for (const listener of Array.from(listeners)) {
       try {
         listener(session);
       } catch (err) {
@@ -533,8 +543,7 @@ export function createDocumentSession(
         // A `branches` event resolves `defaultBranchId`, which `urlBranch`
         // needs to drop a specified-but-default branch; re-sync in place so
         // the pinned branch settles once the default is known.
-        const kind = (event as { kind?: string } | undefined)?.kind;
-        if (kind === 'branches') syncUrlForActive('replace');
+        if (event.kind === 'branches') syncUrlForActive('replace');
         // Take the doc's name whenever it moves. A rename reaches the doc
         // from the server's `doc_meta` frame, which sets it directly, and
         // `documentName` is what the emit signature reads: without this the
@@ -564,7 +573,15 @@ export function createDocumentSession(
           // (access was genuinely lost in the move). Detach the moved doc first
           // so that failure parks the gone surface rather than rebinding a doc
           // that is itself gone.
+          //
+          // Detaching is what leaves the evicted copy to be disposed here:
+          // `activate` closes the document it detached itself, and it detached
+          // a null one. Nothing else holds this copy, and an evicted Document
+          // keeps its topic subscription and its LoroDoc until it is closed, so
+          // every move would otherwise leave one resident for the life of the
+          // page, taking a copy of every op the reopened document receives.
           const branch = urlBranch(next);
+          const evicted = next;
           document = null;
           documentName = null;
           void activate(
@@ -581,7 +598,9 @@ export function createDocumentSession(
             null,
             'skip',
             branch,
-          ).catch(() => markGoneRemote());
+          )
+            .catch(() => markGoneRemote())
+            .finally(() => closeQuietly(evicted));
           return;
         }
         // Evicted from under the viewer (remote delete, or a future eviction
@@ -712,11 +731,51 @@ export function createDocumentSession(
     const previousSpecifiedBranch = activeSpecifiedBranch;
     document = null;
     documentName = null;
+    // What the join's spilled ops have cost so far, and what the whole
+    // download was declared to be. Carried across the two phases so the pair
+    // reads as one figure. Per open, because a second open of the same
+    // document downloads it again.
+    let tailLoadedBytes = 0;
+    let downloadTotalBytes: number | null = null;
     emit();
     // Surface snapshot-download progress. Ignored once a newer open supersedes
     // this generation, so a slow stale download can't repaint the new open.
-    const onSnapshotProgress = (loaded: number, total: number | null): void => {
+    const onSnapshotProgress = (
+      loaded: number,
+      total: number | null,
+      phase?: 'snapshot' | 'tail',
+    ): void => {
       if (generation !== openGeneration) return;
+      // One download, reported once. A document whose ops spilled to storage
+      // fetches them from the join before the snapshot, so a load has two
+      // stretches of bytes arriving over the network with a reader watching.
+      // Which of them is on the wire is a fact about how the platform stores a
+      // document, not something a reader can act on, so both count into the
+      // same figure under the same word.
+      //
+      // The tail runs first and declares no total, so its bytes are carried
+      // into the snapshot's total once that is known. The percentage is then
+      // monotonic across the pair rather than filling twice.
+      if (phase === 'tail') {
+        tailLoadedBytes = loaded;
+        // The tail's total already includes the snapshot still to come, so the
+        // figure runs across both rather than filling once here and again
+        // after. Held for the snapshot phase, which reports only its own.
+        downloadTotalBytes = total;
+      }
+      if (phase !== 'tail') {
+        loaded += tailLoadedBytes;
+        if (downloadTotalBytes !== null) total = downloadTotalBytes;
+        else if (total !== null) total += tailLoadedBytes;
+      }
+      // Both phases fall through to the same reporting. The tail's total
+      // already covers the snapshot still to come, so a tail callback that
+      // reaches the total is a load with no snapshot phase behind it (an
+      // inline snapshot arrived with the join and declares no bytes), and
+      // the last byte of the download is the last progress event there will
+      // ever be. Reported as a fraction of its own phase instead, that load
+      // ends parked on a number that never moves again while the reader
+      // waits out the import.
       const complete = total !== null && total > 0 && loaded >= total;
       if (complete) {
         // Bytes are in; the remaining work (loro import, projection, render)
@@ -732,25 +791,22 @@ export function createDocumentSession(
       }
       emit();
     };
-    let doc: OpenedDocument;
-    try {
-      doc = await load(onSnapshotProgress);
-    } catch (err) {
+    // Give up on this open. A warm swap (previous doc present) rebinds it and
+    // only rejects the caller, so the working surface is never clobbered; with
+    // nothing to fall back to the session parks in 'error' so a status-gated
+    // app renders the failure, where a rebind would land on the empty state
+    // and read as the app's document-less home. `display` is what the app
+    // renders; it defaults to the platform's own open-failure copy.
+    function abandonOpen(err: unknown, display?: BrassError): never {
       if (generation === openGeneration) {
         loading = false;
         loadingMessage = null;
         loadingProgress = null;
-        // Rebind the previous document so the user keeps their editor.
         // 'replace' restores the URL without planting an entry for an open
         // that never happened.
         activeSpecifiedBranch = previousSpecifiedBranch;
-        // With no document to fall back to, a rebind lands on the empty state,
-        // which reads as the app's document-less home and hides the failure.
-        // Park the session in 'error' instead so a status-gated app renders
-        // the failure. A warm swap (previous doc present) keeps the editor and
-        // only rejects the caller, so the working surface is never clobbered.
         if (surfaceOpenError && previousDocument === null) {
-          openError = toDisplayError(err);
+          openError = display ?? toDisplayError(err);
           // Leave the URL pointing at the doc that failed ('skip', not the
           // 'replace' below that clears it for a null document): the error
           // surface corresponds to that id, so a reload re-shows it and the
@@ -765,6 +821,12 @@ export function createDocumentSession(
         closeQuietly(previousDocument);
       }
       throw err;
+    }
+    let doc: OpenedDocument;
+    try {
+      doc = await load(onSnapshotProgress);
+    } catch (err) {
+      abandonOpen(err);
     }
     if (generation !== openGeneration) {
       // A newer open / close superseded this one. Discard the orphan (so its
@@ -814,6 +876,18 @@ export function createDocumentSession(
         closeQuietly(previousDocument);
         return doc;
       }
+    }
+    // The work ended with no content: the platform could not prepare this
+    // document, so the open failed. Binding it would present an empty
+    // document as ready, and the app would let the user work in it. The
+    // platform's own message is what the app renders.
+    if (doc._contentLoadFailed) {
+      closeQuietly(doc);
+      const failure = new BrassError(
+        doc.status?.message ?? OPEN_FAILED_MESSAGE,
+        { status: 0 },
+      );
+      abandonOpen(failure, failure);
     }
     loading = false;
     loadingMessage = null;

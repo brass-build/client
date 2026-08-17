@@ -1,7 +1,7 @@
 // SDK surface: `Brass.documents.*`. The metadata surface: get /
-// thumbnails / branches. The editable surface (snapshot + ops +
-// mutate) is the `Document` runtime class via `Brass.openDocumentById`
-// / `Brass.createDocument`. Access-granting is hosted-only (the share
+// thumbnails. The editable surface (snapshot + ops + mutate) is the
+// `Document` runtime class via `Brass.openDocumentById` /
+// `Brass.createDocument`. Access-granting is hosted-only (the share
 // dialog), not a programmatic method here.
 
 import type { Document } from './documents.js';
@@ -305,6 +305,11 @@ export function createDocumentsNamespace(
   opts: DocumentsFactoryOptions,
 ): DocumentsNamespace & DocumentsInternalNamespace {
   const apiFetch = createApiFetch(opts);
+  // Identifies THIS client to the import claim, so two tabs of one app
+  // signed in as one user are two claimants and only one of them imports.
+  // Minted once per namespace, so re-claiming from this client refreshes
+  // its own claim rather than taking a second one.
+  const importClientId = randomToken();
 
   return {
     get(docId) {
@@ -452,12 +457,14 @@ export function createDocumentsNamespace(
       return apiFetch<ImportClaimResponse>({
         method: 'POST',
         path: `/documents/${encodeURIComponent(docId)}/import-claim`,
+        body: { client_id: importClientId },
       });
     },
     completeImport(docId) {
       return apiFetch<{ schema_ref: { app_id: string; schema_hash: string } }>({
         method: 'POST',
         path: `/documents/${encodeURIComponent(docId)}/import-complete`,
+        body: { client_id: importClientId },
       });
     },
     async getThumbnail(docId, options) {
@@ -475,6 +482,14 @@ export function createDocumentsNamespace(
       return res.thumbnail;
     },
   };
+}
+
+function randomToken(): string {
+  const g = globalThis as { crypto?: { randomUUID?: () => string } };
+  if (g.crypto?.randomUUID) return g.crypto.randomUUID();
+  let s = '';
+  for (let i = 0; i < 32; i++) s += Math.floor(Math.random() * 16).toString(16);
+  return s;
 }
 
 // Reads `SetThumbnailInput.image` into base64 plus a resolved MIME

@@ -1,13 +1,14 @@
 // Per-app sessionStorage layer for the incognito / third-party-cookie
-// fallback session token: the opaque `sid` from a `brass_code` exchange, so
-// a hard reload in a cookie-blocked browser (incognito, Safari ITP) keeps
-// the user signed in. In a normal browser the cross-site cookie carries the
-// session and nothing is written here.
+// fallback session token: the opaque pointer a `brass_code` exchange hands
+// back, so a hard reload in a cookie-blocked browser (incognito, Safari ITP)
+// keeps the user signed in. In a normal browser the cross-site cookie carries
+// the session and nothing is written here.
 //
-// The value is no more sensitive than the cookie it mirrors: an opaque
-// pointer, useless off an allowlisted Origin, gated by `approved_apps`
-// server-side, same 30-day TTL. `sessionStorage` (per-tab, dropped on tab
-// close) matches the cookie-channel UX. Keyed per-app id.
+// The pointer is bound server-side to the app it was minted for, so its
+// authority is this app and it dies with this app's per-app sign-out. That is
+// what makes it safe to persist at all, and why the key is per-app id.
+// `sessionStorage` (per-tab, dropped on tab close) matches the cookie-channel
+// UX.
 
 const KEY_PREFIX = '__brass_session_';
 

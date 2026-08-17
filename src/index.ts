@@ -1,3 +1,12 @@
+// The app-facing entry (`@brass-build/client`). A type reaches this barrel
+// only when a member of `Brass`, `Document`, or `DocumentSession` names it
+// in a signature, so what an app's autocomplete offers is what an app can
+// call. The plumbing under those members (the session's dependency seam,
+// the document factory, the join and at-version wire shapes) stays exported
+// from its own module for this package's own use, and `./internal` carries
+// the primitives Brass's own dashboard and console import.
+// `__tests__/exports-contract.test.ts` pins both sets.
+
 import { BrassClient } from './client.js';
 import type {
   CreateDocumentOptions,
@@ -14,6 +23,7 @@ import type {
   ErrorListener,
   BrassInitOptions,
   BrassUser,
+  UndoControllerOptions,
   UserChangeListener,
 } from './types.js';
 
@@ -22,13 +32,11 @@ export type {
   ErrorListener,
   BrassInitOptions,
   BrassUser,
+  UndoControllerOptions,
   UserChangeListener,
 };
 export { BrassError, type BrassErrorCode } from './errors.js';
 export {
-  type AcquireOrganizationResult,
-  type HostedUiLauncher,
-  type HostedUiLauncherOptions,
   type HostedUiTheme,
   type SelectDocumentResult,
 } from './hosted-ui.js';
@@ -52,7 +60,6 @@ export {
   type CommandGroup,
   type CommandSurface,
   type DocumentSession,
-  type DocumentSessionDeps,
   type SessionOpenOptions,
   type SessionStatus,
 } from './session.js';
@@ -96,34 +103,38 @@ export type {
   ChangeSource,
   HandleUnsubscribe,
   ListHandle,
+  ListChange,
   ListSubscriber,
+  Splice,
   MapHandle,
   MapSubscriber,
   OrderedMapHandle,
-} from './handles.js';
-export type { UndoControllerOptions } from './undo.js';
-export type { DocumentSerializer } from './serializer.js';
+  OrderedMapPosition,
+} from './handle-types.js';
+
+export type {
+  DocumentSerializer,
+  StoredDocument,
+  StoredList,
+  StoredMap,
+} from './serializer.js';
 export type { DocumentImporter } from './importer.js';
-export { DocumentStream, type StreamRuntime } from './document-streams.js';
+export { DocumentStream } from './document-streams.js';
 export {
-  type CreateDocumentFn,
   type CreateDocumentOptions,
-  type DocumentAtVersionResponse,
-  type DocumentDriveSummaryWire,
-  type DocumentFactory,
-  type DocumentSnapshotResponse,
-  type OpenDocumentFactoryOptions,
-  type OpenDocumentByIdFn,
   type OpenDocumentByIdOptions,
-  type OpenDocumentWsClient,
   type OpenedDocument,
 } from './open-document.js';
+export { PRESENCE_LAYER_MAX_BYTES } from './presence.js';
 export type {
   PresenceChangeListener,
   PresenceClient,
+  PresenceLayer,
   PresenceParticipant,
   PresenceSetInput,
   PresenceState,
+  PresenceStatus,
+  PresenceStatusListener,
 } from './presence.js';
 
 const client = new BrassClient();
@@ -169,8 +180,8 @@ export const Brass = {
   getAccessToken(): Promise<string | null> {
     return client.getAccessToken();
   },
-  // Metadata read for a known id (`get`) plus thumbnails / branches /
-  // pushToDrive. Create / move / list / grant access are hosted-only.
+  // Metadata read for a known id (`get`) plus thumbnails. Create / move /
+  // list / grant access are hosted-only.
   get documents(): DocumentsNamespace {
     return client.documents;
   },

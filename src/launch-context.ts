@@ -10,8 +10,8 @@
 // collide with an app's own query string, and stripped from the address bar
 // on read so it does not linger in history or a referrer.
 //
-// The dashboard writes this parameter in `src/lib/open-app-url.ts`; the
-// published SDK cannot import the workspace, so the name is spelled in both
+// The dashboard writes this parameter when it opens an app, and the published
+// SDK cannot import the dashboard's source, so the name is spelled in both
 // places.
 
 export const LAUNCH_ORGANIZATION_PARAM = 'brass_org';

@@ -16,7 +16,7 @@
 // never mint a grant themselves.
 
 import type { BrassUser } from './types.js';
-import type { Command } from './documents.js';
+import type { Command, Document as BrassDocument } from './documents.js';
 import type { DocumentSession } from './session.js';
 import type { PresenceParticipant } from './presence.js';
 import type { DocumentDriveStatus } from './document-signals.js';
@@ -59,9 +59,6 @@ export interface VersionPreviewDeps {
   dashboardBaseUrl: string;
   // Pins the embed's light/dark theme (matches the other hosted surfaces).
   hostedUiTheme?: 'light' | 'dark' | 'auto';
-  // Fallback platform-session pointer, forwarded to the embed for the
-  // cookie-blocked (incognito / Safari ITP) case.
-  getSessionToken?: () => string | null | undefined;
 }
 
 export interface AccountMenuDeps {
@@ -69,9 +66,9 @@ export interface AccountMenuDeps {
   onUserChange: (listener: (user: BrassUser | null) => void) => () => void;
   signIn: () => void;
   signOut: () => void;
-  // Base URL of the Brass dashboard, for the account menu's "Open dashboard"
-  // link. The client's resolved dashboard origin (picks the environment),
-  // with no trailing slash.
+  // Base URL of the Brass dashboard, for the account menu's "Open Brass
+  // dashboard" link. The client's resolved dashboard origin (picks the
+  // environment), with no trailing slash.
   dashboardBaseUrl: string;
 }
 
@@ -254,7 +251,30 @@ const CSS = `
    fallback shown when no image is set or the image fails to load. */
 .b-avatar-img { width:100%; height:100%; object-fit:cover; display:block; }
 .b-avatar-img[hidden], .b-avatar-initial[hidden] { display:none; }
-.b-email { color:var(--brass-fg-muted); font-size:12px; padding:2px 4px; word-break:break-all; }
+/* The account menu opens on the identity it acts for: the avatar again at
+   reading size, the name, and the email under it. The rows below are the
+   actions on that identity, so they carry a glyph and sit apart from the
+   header behind a rule. */
+.b-account .b-pop { min-width:236px; max-width:min(300px, calc(100vw - 16px)); }
+.b-account-head { display:flex; align-items:center; gap:10px; padding:6px 8px 8px; }
+.b-account-face { flex:0 0 auto; width:36px; height:36px; border-radius:50%;
+  display:inline-flex; align-items:center; justify-content:center; overflow:hidden;
+  background:var(--brass-accent); color:var(--brass-accent-fg);
+  font-size:15px; font-weight:600; }
+/* minmax(0,1fr) so a long name or email ellipsizes instead of widening the
+   menu: a grid item's default min-width is its content's intrinsic size. */
+.b-account-id { display:grid; grid-template-columns:minmax(0,1fr); gap:1px; min-width:0; }
+.b-account-name, .b-email { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.b-account-name { font-size:13px; font-weight:600; line-height:1.3; }
+.b-email { color:var(--brass-fg-muted); font-size:12px; line-height:1.3; }
+.b-account .b-pop button, .b-account .b-pop a {
+  display:flex; align-items:center; gap:10px; font-size:13px; }
+.b-account .b-pop svg { flex:0 0 auto; color:var(--brass-fg-muted); }
+.b-account .b-pop button:hover svg, .b-account .b-pop a:hover svg { color:var(--brass-fg); }
+/* Restated at this specificity so the flex rows above don't unhide a row the
+   guest / signed-in swap hides. */
+.b-account .b-pop button[hidden], .b-account .b-pop a[hidden],
+.b-account .b-pop .b-account-head[hidden], .b-account .b-pop .b-sep[hidden] { display:none; }
 /* Drive sync: a dim link icon at rest, accent (or danger) with a dot when
    there is something to do. Clicking opens a top-layer Popover (never clipped
    by the header overflow, light-dismissed on outside tap). */
@@ -304,6 +324,23 @@ const CSS = `
   background:var(--brass-surface-2); color:var(--brass-fg-muted);
   border-bottom:1px solid var(--brass-border); }
 .b-version iframe { display:block; }
+/* The SDK-drawn strip that stands in when the embed reports it cannot render.
+   Same box as the placeholder, plus the two controls that need no version
+   timeline, so returning to the live head stays reachable. */
+.b-version-fallback { display:flex; align-items:center; gap:8px; width:100%;
+  min-height:44px; padding:0 14px; font-size:13px;
+  background:var(--brass-surface-2); color:var(--brass-fg-muted);
+  border-bottom:1px solid var(--brass-border); box-sizing:border-box; }
+.b-version-fallback[hidden] { display:none; }
+/* Takes the strip's slack, so the controls hold the trailing edge whichever
+   of them is showing, and it is the only part that ellipsizes. */
+.b-version-fallback-msg { flex:1 1 auto; min-width:0; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+.b-version-fallback button { flex:0 0 auto; background:transparent;
+  border:1px solid var(--brass-border); border-radius:6px; cursor:pointer;
+  color:var(--brass-fg); font:inherit; font-size:12px; padding:4px 10px; }
+.b-version-fallback button:hover { background:var(--brass-surface); }
+.b-version-fallback button[hidden] { display:none; }
 /* Keyboard focus. The bar's controls draw the ring INSIDE their own border box
    (negative outline-offset), because the left cluster and the title row clip
    their overflow so a long name ellipsizes: a ring outside the box falls in
@@ -347,6 +384,43 @@ function el<K extends keyof HTMLElementTagNameMap>(
 function initialOf(user: BrassUser): string {
   const label = user.display_name ?? user.email ?? user.sub;
   return label.trim().charAt(0).toUpperCase() || '?';
+}
+
+// A user's face: the uploaded image over a monogram. The monogram is the
+// fallback, shown when the user has no avatar image and restored if the image
+// fails to load (a broken / unreachable URL renders the initial, never a
+// broken-image glyph). The caller places the pair inside its own circle, so
+// the account menu's trigger and its header draw the same face at two sizes.
+function buildAvatarFace(): {
+  nodes: [HTMLImageElement, HTMLSpanElement];
+  render(user: BrassUser | null): void;
+} {
+  const img = el('img', 'b-avatar-img');
+  img.alt = '';
+  const initial = el('span', 'b-avatar-initial');
+  const showMonogram = (): void => {
+    img.hidden = true;
+    initial.hidden = false;
+  };
+  img.addEventListener('error', () => {
+    img.removeAttribute('src');
+    showMonogram();
+  });
+  return {
+    nodes: [img, initial],
+    render(user: BrassUser | null): void {
+      initial.textContent = user ? initialOf(user) : '?';
+      const url = user?.avatar_url?.trim() ?? '';
+      if (!url) {
+        img.removeAttribute('src');
+        showMonogram();
+        return;
+      }
+      if (img.getAttribute('src') !== url) img.src = url;
+      img.hidden = false;
+      initial.hidden = true;
+    },
+  };
 }
 
 function renderCommandButton(cmd: Command, asTool: boolean): HTMLButtonElement {
@@ -584,7 +658,11 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
   loc.hidden = true;
   root.append(titleRow, loc);
 
-  let lastDocId: string | null = null;
+  // The document the location chip describes, held by INSTANCE. A branch
+  // switch, and a re-open after the document moves, bind a new Document under
+  // the same id, and a move is exactly the event that changes the location
+  // label, so an id comparison would leave the chip naming the old project.
+  let boundDoc: DocumentSession['document'] = null;
   // The non-default branch label (null on the default), read by `fitBranch`
   // so a resize re-evaluates the drop without a full re-render.
   let branchLabel: string | null = null;
@@ -608,8 +686,9 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
     return deps.session.document?._currentBranchName() ?? null;
   }
 
-  async function refreshLocation(): Promise<void> {
-    const doc = deps.session.document;
+  // Resolves the label for one document, named by the caller so the in-flight
+  // fetch is attributed to the Document it was started for.
+  async function refreshLocation(doc: DocumentSession['document']): Promise<void> {
     const docId = doc?.id ?? null;
     if (!docId) {
       loc.hidden = true;
@@ -617,7 +696,7 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
     }
     try {
       const record = await deps.getDocument(docId);
-      if (deps.session.document?.id !== docId) return; // superseded
+      if (deps.session.document !== doc) return; // superseded
       // The server hands back an opaque location label (rendered verbatim);
       // the toolbar never composes it from project / org ids, so the
       // hierarchy above the document can evolve without a client change. A
@@ -633,14 +712,14 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
       }
       loc.hidden = false;
     } catch {
-      if (deps.session.document?.id === docId) loc.hidden = true;
+      if (deps.session.document === doc) loc.hidden = true;
     }
   }
 
   function runManage(): void {
     void (async () => {
       await deps.session.run('manage');
-      void refreshLocation();
+      void refreshLocation(deps.session.document);
     })();
   }
   title.onclick = runManage;
@@ -675,11 +754,10 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
       branch.title = `On branch "${branchLabel}"`;
     }
     fitBranch();
-    // Re-resolve location only when the active document changes.
-    const docId = doc?.id ?? null;
-    if (docId !== lastDocId) {
-      lastDocId = docId;
-      void refreshLocation();
+    // Re-resolve location only when the bound document changes.
+    if (doc !== boundDoc) {
+      boundDoc = doc;
+      void refreshLocation(doc);
     }
   };
   render();
@@ -728,7 +806,12 @@ function buildPresenceRoster(deps: PresenceRosterDeps): PieceInternal {
   injectStyles(document);
   const root = el('div', 'brass-ui b-roster');
 
-  let lastDocId: string | null = null;
+  // The document whose presence client is subscribed, held by INSTANCE.
+  // Presence is scoped to a (document, branch) pair, and a branch switch binds
+  // a new Document under the SAME id, so an id comparison would keep the
+  // roster subscribed to the branch the user just left and show the wrong
+  // people as present on the one they are looking at.
+  let boundDoc: DocumentSession['document'] = null;
   let presenceOff: (() => void) | null = null;
 
   const renderRoster = (participants: readonly PresenceParticipant[]): void => {
@@ -773,9 +856,9 @@ function buildPresenceRoster(deps: PresenceRosterDeps): PieceInternal {
   }
 
   const render = (): void => {
-    const docId = deps.session.document?.id ?? null;
-    if (docId !== lastDocId) {
-      lastDocId = docId;
+    const doc = deps.session.document;
+    if (doc !== boundDoc) {
+      boundDoc = doc;
       bindPresence();
     }
   };
@@ -790,10 +873,10 @@ function buildPresenceRoster(deps: PresenceRosterDeps): PieceInternal {
   };
 }
 
-// A monochrome chain-link glyph (inherits `color` via `currentColor`). Built
+// A monochrome 16px stroke glyph (inherits `color` via `currentColor`). Built
 // in the SVG namespace because `createElement('svg')` yields an HTML element
 // that won't render.
-function chainLinkIcon(): SVGSVGElement {
+function strokeIcon(...paths: string[]): SVGSVGElement {
   const ns = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(ns, 'svg');
   svg.setAttribute('width', '16');
@@ -805,10 +888,7 @@ function chainLinkIcon(): SVGSVGElement {
   svg.setAttribute('stroke-linecap', 'round');
   svg.setAttribute('stroke-linejoin', 'round');
   svg.setAttribute('aria-hidden', 'true');
-  for (const d of [
-    'M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71',
-    'M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.71',
-  ]) {
+  for (const d of paths) {
     const path = document.createElementNS(ns, 'path');
     path.setAttribute('d', d);
     svg.append(path);
@@ -816,10 +896,33 @@ function chainLinkIcon(): SVGSVGElement {
   return svg;
 }
 
+function chainLinkIcon(): SVGSVGElement {
+  return strokeIcon(
+    'M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71',
+    'M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.71',
+  );
+}
+
 // How long the popover holds its "Publishing..." affordance after a push
 // before giving up on the synced confirmation. Long enough to cover a normal
 // drive webhook round-trip.
 const PUBLISH_HOLD_MS = 30000;
+
+// `value` when it is an absolute http(s) URL, else null. The drive-sync
+// popover's "View in <drive>" link is the one place the toolbar puts a
+// server-supplied string into an `href`, and an href runs whatever scheme it
+// names: a `javascript:` URL executes in the app's own page on the click.
+// A relative URL throws out of `new URL` and is refused with the rest, which
+// is right here, since the link points at an external drive item.
+function httpUrlOrNull(value: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+}
 
 // The drive-sync indicator: a link icon (dim at rest, accent / danger with a
 // dot when there is something to do) whose popover describes the state
@@ -849,7 +952,11 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
   dot.setAttribute('aria-hidden', 'true');
   button.append(dot);
 
-  let lastDocId: string | null = null;
+  // The document whose drive status is subscribed, held by INSTANCE. A branch
+  // switch binds a new Document under the same id, and each carries its own
+  // drive state, so an id comparison would leave the indicator describing the
+  // document that was closed.
+  let boundDoc: DocumentSession['document'] = null;
   let statusOff: (() => void) | null = null;
 
   // A publish runs on a server worker and reaches `synced` only after the
@@ -916,10 +1023,11 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
     // there is one), then the commands. Rebuilt on every status change, so an
     // open popover updates live.
     const rows: HTMLElement[] = [];
-    if (status.itemUrl) {
+    const itemUrl = status.itemUrl ? httpUrlOrNull(status.itemUrl) : null;
+    if (itemUrl) {
       const head = el('div', 'b-drive-head');
       const link = el('a', 'b-drive-source');
-      link.href = status.itemUrl;
+      link.href = itemUrl;
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
       link.textContent = `View in ${driveName}`;
@@ -1017,9 +1125,9 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
   }
 
   const onSession = (): void => {
-    const docId = deps.session.document?.id ?? null;
-    if (docId !== lastDocId) {
-      lastDocId = docId;
+    const doc = deps.session.document;
+    if (doc !== boundDoc) {
+      boundDoc = doc;
       bind();
     }
   };
@@ -1044,18 +1152,41 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     label: 'Account',
     align: 'end',
   });
+  // The menu opens on the identity it acts for: the avatar at reading size,
+  // the display name, and the email under it. The name line drops out when the
+  // user has none, leaving the email as the single identifying line.
+  const head = el('div', 'b-account-head');
+  const headFace = buildAvatarFace();
+  const faceEl = el('span', 'b-account-face');
+  faceEl.append(...headFace.nodes);
+  const nameEl = el('div', 'b-account-name');
   const emailEl = el('div', 'b-email');
+  const identity = el('div', 'b-account-id');
+  identity.append(nameEl, emailEl);
+  head.append(faceEl, identity);
+  const headSep = el('hr', 'b-sep');
+  headSep.setAttribute('role', 'separator');
   // Opens the dashboard in a new tab, so the user keeps the app open in the
   // current one. `/home` is the authenticated landing (resolves the active
   // org); the bare origin is the sign-in page.
   const dashboardLink = el('a');
-  dashboardLink.textContent = 'Open dashboard';
+  dashboardLink.append(
+    strokeIcon(
+      'M14 3h7v7',
+      'M10 14 21 3',
+      'M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5',
+    ),
+    'Open Brass dashboard',
+  );
   dashboardLink.href = `${deps.dashboardBaseUrl}/home`;
   dashboardLink.target = '_blank';
   dashboardLink.rel = 'noopener noreferrer';
   dashboardLink.onclick = () => menu.close();
   const signOutBtn = el('button');
-  signOutBtn.textContent = 'Sign out';
+  signOutBtn.append(
+    strokeIcon('M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4', 'm16 17 5-5-5-5', 'M21 12H9'),
+    'Sign out',
+  );
   signOutBtn.onclick = () => {
     menu.close();
     deps.signOut();
@@ -1065,50 +1196,37 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
   // meaningless, so the menu offers a single "Sign in" that takes the top
   // window through the app's normal sign-in and returns to this URL.
   const signInBtn = el('button');
-  signInBtn.textContent = 'Sign in';
+  signInBtn.append(
+    strokeIcon('M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4', 'm10 17 5-5-5-5', 'M15 12H3'),
+    'Sign in',
+  );
   signInBtn.onclick = () => {
     menu.close();
     deps.signIn();
   };
-  menu.pop.append(emailEl, dashboardLink, signOutBtn, signInBtn);
+  menu.pop.append(head, headSep, dashboardLink, signOutBtn, signInBtn);
 
-  // The avatar trigger holds both the uploaded image and the monogram. The
-  // monogram is the fallback: shown when the user has no avatar image, and
-  // restored if the image fails to load (a broken / unreachable URL renders
-  // the initial, never a broken-image glyph).
-  const avatarImg = el('img', 'b-avatar-img');
-  avatarImg.alt = '';
-  const initialEl = el('span', 'b-avatar-initial');
-  menu.trigger.append(avatarImg, initialEl);
-
-  const showMonogram = (): void => {
-    avatarImg.hidden = true;
-    initialEl.hidden = false;
-  };
-  avatarImg.addEventListener('error', () => {
-    avatarImg.removeAttribute('src');
-    showMonogram();
-  });
+  const triggerFace = buildAvatarFace();
+  menu.trigger.append(...triggerFace.nodes);
 
   const renderUser = (user: BrassUser | null): void => {
-    initialEl.textContent = user ? initialOf(user) : '?';
-    emailEl.textContent = user ? (user.email ?? user.display_name ?? user.sub) : '';
+    triggerFace.render(user);
+    headFace.render(user);
+    nameEl.textContent = user?.display_name ?? '';
+    nameEl.hidden = !user?.display_name;
+    emailEl.textContent = user ? (user.email ?? user.sub) : '';
+    // The email ellipsizes to hold the menu's width, so the untruncated
+    // address stays reachable on hover.
+    emailEl.title = emailEl.textContent;
     // Swap the menu body between the signed-in actions and the guest's lone
     // "Sign in": a null user is an anonymous link holder.
     const signedIn = user !== null;
+    head.hidden = !signedIn;
+    headSep.hidden = !signedIn;
     emailEl.hidden = !signedIn;
     dashboardLink.hidden = !signedIn;
     signOutBtn.hidden = !signedIn;
     signInBtn.hidden = signedIn;
-    const url = user?.avatar_url?.trim() ?? '';
-    if (url) {
-      if (avatarImg.getAttribute('src') !== url) avatarImg.src = url;
-      avatarImg.hidden = false;
-      initialEl.hidden = true;
-    } else {
-      avatarImg.removeAttribute('src');
-      showMonogram();
-    }
   };
   renderUser(deps.getUser());
   const unsub = deps.onUserChange(renderUser);
@@ -1144,6 +1262,14 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
   // closes it, when the active document changes, or when no doc is open.
   let browsing = false;
   let lastDocId: string | null = null;
+  // The version the reader dismissed the bar at, when the document was left
+  // holding one. A document that cannot return to its head (one pinned to a
+  // version) stays on it, so without this the next render reads a non-null
+  // `doc.version` and latches the bar the reader just dismissed straight back
+  // on. A dismissal at the live head records nothing: there is no version
+  // left to latch on, and the head is where the next browse-in-the-app
+  // request arrives, so a record there would swallow it.
+  let dismissedAt: number | undefined = undefined;
 
   const session = deps.session;
   const hideBar = (): void => {
@@ -1153,27 +1279,44 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       frame = null;
     }
   };
+  // A failed intent reaches the reader through the bar (which reverts to the
+  // document's real state) and the developer through `Brass.onError`. Both
+  // halves matter: the bar moves optimistically, so a swallowed failure is a
+  // bar naming a version nothing is showing.
+  const attempt = async (
+    doc: BrassDocument,
+    act: () => void | Promise<void>,
+  ): Promise<void> => {
+    try {
+      await act();
+    } catch (err) {
+      doc._reportChromeError(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+  };
   const frameDeps: VersionBarDeps = {
     dashboardBaseUrl: deps.dashboardBaseUrl,
     ...(deps.hostedUiTheme ? { theme: deps.hostedUiTheme } : {}),
-    ...(deps.getSessionToken ? { getSessionToken: deps.getSessionToken } : {}),
     // Read the live active document at call time: a bridge intent lands
     // async, so it must not close over a doc that may have been superseded.
-    checkoutVersion: (version) => {
-      void session.document?._checkoutVersion(version).catch(() => {});
+    currentVersion: () => session.document?.version ?? null,
+    checkoutVersion: async (version) => {
+      const doc = session.document;
+      if (!doc) return;
+      await attempt(doc, () => doc._checkoutVersion(version));
     },
-    returnToHead: () => {
+    returnToHead: async () => {
       // Return to the live head but keep the bar open (the browsing session
       // persists); the bar re-renders in its "at latest" state with a Close
       // button. Dismissal is the explicit `close` intent only.
-      try {
-        session.document?.returnToHead();
-      } catch {
-        // frozen / no live head: leave the preview as-is
-      }
+      const doc = session.document;
+      if (!doc) return;
+      await attempt(doc, () => doc.returnToHead());
     },
     fork: (fromVersion, name) => {
-      void session.document?._forkFromVersion(fromVersion, name).catch(() => {});
+      const doc = session.document;
+      if (!doc) return;
+      void attempt(doc, () => doc._forkFromVersion(fromVersion, name)).catch(() => {});
     },
     browse: () => {
       void session.run('history');
@@ -1182,8 +1325,18 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       // Explicit dismissal: end the browsing session and hide the bar
       // synchronously so the tap is instant. The document's own browsing
       // flag is cleared too, or the next render would latch the bar back on.
+      const doc = session.document;
       browsing = false;
-      session.document?._setVersionBrowsing(false);
+      dismissedAt = doc?.version ?? undefined;
+      doc?._setVersionBrowsing(false);
+      // Leaving the bar means leaving the preview: the bar is the only
+      // surface that returns a document to its head, so a dismissal that
+      // left it checked out would leave an app read-only with nothing to
+      // clear it. A document pinned to its version has no head to return to
+      // and keeps showing it; `dismissedAt` is what keeps the bar dismissed.
+      if (doc && doc.version !== null) {
+        void attempt(doc, () => doc.returnToHead()).catch(() => {});
+      }
       hideBar();
     },
   };
@@ -1191,21 +1344,36 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
   const render = (): void => {
     const doc = session.document;
     const docId = doc?.id ?? null;
-    // A new active document (or none) ends any prior browsing session.
+    // A new active document (or none) ends any prior browsing session. Keyed
+    // on the id rather than the Document instance because a checkout keeps the
+    // instance and only moves its `version`, so the bar follows the document
+    // the user is stepping through rather than closing under them.
     if (docId !== lastDocId) {
       lastDocId = docId;
       browsing = false;
+      dismissedAt = undefined;
     }
     // A live checkout (`doc.version !== null`) starts / keeps the browsing
     // session. Other read-only states (a view-only share link, a still-loading
     // doc) are not this bar's concern, and `doc.id` is null only on the offline
     // / test path the embed can't serve.
+    // `versionBrowsing` is set by the reader asking for this surface, and the
+    // close cleared it, so it names a fresh request whatever version the
+    // document is on and outranks the dismissal.
     if (
       doc != null &&
       docId !== null &&
-      (doc.version !== null || doc.versionBrowsing)
+      (doc.version !== null || doc.versionBrowsing) &&
+      (doc.versionBrowsing || doc.version !== dismissedAt)
     ) {
       browsing = true;
+      dismissedAt = undefined;
+      // Mirror the open bar onto the document, which is what makes it
+      // read-only for as long as the bar is up. A preview entered by picking
+      // a version sets only `version`, so without this the reader who then
+      // returns to latest keeps the bar and gets the document back, which is
+      // the pair the flag exists to keep together.
+      doc._setVersionBrowsing(true);
     }
     // The bar stays open for the whole session, including at the live head
     // (`doc.version === null`, browsing still true), until `close`.
@@ -1217,6 +1385,7 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
         branch: doc.branchId ?? undefined,
         version: doc.version,
         branchName: doc._currentBranchName() ?? undefined,
+        pinned: doc._isVersionPinned,
       });
     } else {
       hideBar();

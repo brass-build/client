@@ -6,12 +6,51 @@
 // local merge, throttled outbound), and notifies `on('change')`. The
 // server stores what it is sent verbatim, so the merge happens here.
 
+import { createEmitter } from './emitter.js';
+
 // `set(...)` is debounced to at most one `presence` frame per interval
 // (leading edge fires immediately, trailing send carries merges from
 // the window). 100 ms = 10 Hz: low fanout cost, smooth interpolation.
 export const PRESENCE_PUBLISH_INTERVAL_MS = 100;
 
+/**
+ * The largest a single presence layer (`state` or `ext`) may serialise to.
+ *
+ * The platform caps each layer at this and drops a frame whose layer is
+ * over, so a payload past it reaches no peer. Roughly 130 to 140 entity ids
+ * in `state.selection`, which an ordinary marquee select crosses, so measure
+ * against it whenever what you publish scales with what the user picked.
+ */
+export const PRESENCE_LAYER_MAX_BYTES = 2048;
+
 const PRESENCE_TOPIC_PREFIX = 'presence:doc:';
+
+const TEXT_ENCODER = new TextEncoder();
+
+// Serialised UTF-8 byte length of one layer, measured the same way the
+// platform measures it. A non-serialisable value (circular, a BigInt) reads
+// as over the cap rather than throwing out of the publish path, since a
+// frame carrying it could not be sent either way.
+function presenceLayerBytes(layer: Record<string, unknown>): number {
+  let json: string;
+  try {
+    json = JSON.stringify(layer);
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+  return TEXT_ENCODER.encode(json).length;
+}
+
+// The outgoing payload as one comparable string, or null when it cannot be
+// serialised. Null reads as "different" at the call site, so a comparison
+// that cannot be answered sends the frame rather than skipping it.
+function presencePayloadKey(presence: PresenceSetInput): string | null {
+  try {
+    return JSON.stringify(presence);
+  } catch {
+    return null;
+  }
+}
 
 // Reserved-by-convention sub-keys on the presence `state` block, so
 // two apps on the same document agree on each key's meaning even when
@@ -72,6 +111,36 @@ export type PresenceChangeListener = (
   roster: PresenceParticipant[],
 ) => void;
 
+/** The two independently capped layers of a presence payload. */
+export type PresenceLayer = 'state' | 'ext';
+
+/**
+ * Whether this client's presence is reaching its peers.
+ *
+ * A layer larger than `PRESENCE_LAYER_MAX_BYTES` is withheld from the wire,
+ * so the roster everyone else renders keeps the last value that fit. Read
+ * `status` for the current answer, or `onStatus` to be told when it moves.
+ */
+export interface PresenceStatus {
+  /** True while some layer is too large to publish. */
+  oversize: boolean;
+  /** The layers being withheld, `state` before `ext`. Empty when
+   *  `oversize` is false. */
+  withheld: PresenceLayer[];
+}
+
+export type PresenceStatusListener = (status: PresenceStatus) => void;
+
+const PRESENCE_STATUS_OK: PresenceStatus = { oversize: false, withheld: [] };
+
+function statusEqual(a: PresenceStatus, b: PresenceStatus): boolean {
+  return (
+    a.oversize === b.oversize &&
+    a.withheld.length === b.withheld.length &&
+    a.withheld.every((layer, i) => layer === b.withheld[i])
+  );
+}
+
 // The public shape attached as `doc.presence`. An interface (not the
 // concrete class) so `documents.ts` can type the field without
 // importing the implementation.
@@ -87,6 +156,14 @@ export interface PresenceClient {
   // `addEventListener` / `removeEventListener` style where the listener
   // reference is what's kept at teardown.
   off(event: 'change', listener: PresenceChangeListener): void;
+  // Subscribe to whether this client's presence is reaching its peers.
+  // Fires on attach with the current status, then on every change to it,
+  // never per `set(...)`: a publisher whose every update is too large
+  // reports the condition once, not at 10 Hz. Returns an unsubscribe
+  // function.
+  onStatus(listener: PresenceStatusListener): () => void;
+  // Whether this client's presence is reaching its peers, right now.
+  readonly status: PresenceStatus;
   // The current roster of OTHER live participants (self is not in it; read `self`).
   readonly roster: PresenceParticipant[];
   // This client's own current presence payload, as last set.
@@ -99,10 +176,10 @@ export interface PresenceClient {
   leave(): void;
   /**
    * @internal Called when the owning Document parks (`Document._suspend`).
-   * Drops app-registered `change` listeners so a callback wired in the
-   * parked session does not keep firing on remote presence frames after
-   * the app has closed the doc, and gates the outbound publish path so a
-   * parked doc stops advertising this client's cursor. Keeps the WS
+   * Drops app-registered `change` and `status` listeners so a callback
+   * wired in the parked session does not keep firing on remote presence
+   * frames after the app has closed the doc, and gates the outbound publish
+   * path so a parked doc stops advertising this client's cursor. Keeps the WS
    * subscription and roster alive so a resumed open is seamless. Not
    * `leave()`: parking is reversible and the subscription must survive it.
    */
@@ -191,6 +268,34 @@ class PresenceController implements PresenceClient {
   private _throttleTimer: ReturnType<typeof setTimeout> | null = null;
   private _lastSentAt = 0;
   private _closed = false;
+  // The last value of each layer that reached the wire, or null for a layer
+  // that has never been published. A withheld layer re-sends its entry: the
+  // server stores the payload verbatim, so omitting the layer would clear it
+  // from every peer's roster rather than leaving it at its last good value.
+  private _sentState: Record<string, unknown> | null = null;
+  private _sentExt: Record<string, unknown> | null = null;
+  // The payload of the last frame this connection published, so a tick that
+  // resolves to the same one can be skipped. Distinct from the two layers
+  // above, which are the last values that FIT and are what a withheld layer
+  // falls back to.
+  private _sentPayloadKey: string | null = null;
+  // Set by the two paths that republish because the server's copy of this
+  // client's presence is gone (a re-subscribe rewrites the row empty, and a
+  // resumed open re-advertises after a park). The frame they need is exactly
+  // the one the comparison above would skip, so it takes precedence for one
+  // send.
+  private _republishPending = false;
+  private readonly _statusEmitter = createEmitter<PresenceStatus>({
+    fireOnAttach: true,
+    retain: 'latest',
+    // Publishing runs at 10 Hz, and an app that overflows a layer usually
+    // overflows it on every update, so the gate is what turns a per-update
+    // condition into the edge an app can act on.
+    equals: statusEqual,
+    onError: (err) => {
+      console.error('[Brass] presence onStatus listener threw:', err);
+    },
+  });
   // Set while the owning Document is parked (`_suspendListeners`). Gates the
   // outbound publish path so a parked doc advertises nothing, whether from a
   // late `set(...)` or from the reconnect-snapshot republish (the WS
@@ -208,6 +313,9 @@ class PresenceController implements PresenceClient {
     branchId: string,
   ) {
     this._topic = `${PRESENCE_TOPIC_PREFIX}${docId}:${branchId}`;
+    // Seed the retained status so `status` reads and a fire-on-attach
+    // `onStatus` both answer before the first `set(...)`.
+    this._statusEmitter.emit(PRESENCE_STATUS_OK);
     this._unsub = this._wsClient.subscribe(this._topic, (frame) =>
       this._onFrame(frame),
     );
@@ -215,6 +323,14 @@ class PresenceController implements PresenceClient {
 
   get roster(): PresenceParticipant[] {
     return [...this._roster.values()];
+  }
+
+  get status(): PresenceStatus {
+    return this._statusEmitter.retained ?? PRESENCE_STATUS_OK;
+  }
+
+  onStatus(listener: PresenceStatusListener): () => void {
+    return this._statusEmitter.on(listener);
   }
 
   get self(): {
@@ -284,6 +400,7 @@ class PresenceController implements PresenceClient {
     }
     this._roster.clear();
     this._listeners.clear();
+    this._statusEmitter.clear();
   }
 
   _suspendListeners(): void {
@@ -297,6 +414,7 @@ class PresenceController implements PresenceClient {
     // would otherwise send a fresh frame while parked.
     this._suspended = true;
     this._listeners.clear();
+    this._statusEmitter.clear();
     if (this._throttleTimer !== null) {
       clearTimeout(this._throttleTimer);
       this._throttleTimer = null;
@@ -313,6 +431,7 @@ class PresenceController implements PresenceClient {
       Object.keys(this._selfState).length > 0 ||
       Object.keys(this._selfExt).length > 0
     ) {
+      this._republishPending = true;
       this._scheduleSend();
     }
   }
@@ -337,7 +456,7 @@ class PresenceController implements PresenceClient {
         return;
       case 'doc_gone':
         // The server also fans `doc_gone` on `presence:doc:` (paired
-        // with the SUB# eviction in `fanoutDocGone`). `leave()` stops
+        // with the subscription eviction). `leave()` stops
         // publishing immediately so a trailing presence frame crossing
         // the eviction window can't be rejected `forbidden` and surface
         // to `onError` as a misleading "subscribe(...): forbidden", and
@@ -368,6 +487,7 @@ class PresenceController implements PresenceClient {
       Object.keys(this._selfState).length > 0 ||
       Object.keys(this._selfExt).length > 0
     ) {
+      this._republishPending = true;
       this._scheduleSend();
     }
   }
@@ -409,7 +529,11 @@ class PresenceController implements PresenceClient {
 
   private _emitChange(): void {
     const roster = this.roster;
-    for (const listener of this._listeners) {
+    // Copied before the walk: a listener that closes the document reaches
+    // `_suspendListeners`, which clears this set, and a `Set` never visits an
+    // entry removed before its turn. Iterating it live drops every listener
+    // after that one.
+    for (const listener of Array.from(this._listeners)) {
       try {
         listener(roster);
       } catch {
@@ -444,19 +568,94 @@ class PresenceController implements PresenceClient {
 
   private _sendNow(): void {
     if (this._closed || this._suspended) return;
+    // Stamped even when nothing goes out, so the throttle still paces the
+    // measurement rather than re-serialising on every `set(...)`.
     this._lastSentAt = Date.now();
+
+    const withheld: PresenceLayer[] = [];
     const presence: PresenceSetInput = {};
-    if (Object.keys(this._selfState).length > 0) {
-      presence.state = this._selfState;
+    const state = this._publishableLayer(
+      'state',
+      this._selfState,
+      this._sentState,
+      withheld,
+    );
+    if (state) presence.state = state;
+    const ext = this._publishableLayer(
+      'ext',
+      this._selfExt,
+      this._sentExt,
+      withheld,
+    );
+    if (ext) presence.ext = ext;
+
+    this._emitStatus(withheld);
+
+    // Every layer is either empty or oversized with nothing published behind
+    // it, so the frame would carry nothing peers do not already have.
+    if (presence.state === undefined && presence.ext === undefined) return;
+
+    // A frame repeating what this connection already published costs the
+    // server a row write and every peer a roster fanout, and says nothing.
+    // A withheld layer makes that the steady state rather than an edge case:
+    // it resolves to its last good value on every tick, so an app publishing
+    // an oversized layer at its input rate would re-send that one value at up
+    // to 10 Hz for as long as the layer stays over.
+    const payloadKey = presencePayloadKey(presence);
+    if (
+      !this._republishPending &&
+      payloadKey !== null &&
+      payloadKey === this._sentPayloadKey
+    ) {
+      return;
     }
-    if (Object.keys(this._selfExt).length > 0) {
-      presence.ext = this._selfExt;
-    }
+    this._republishPending = false;
+    this._sentPayloadKey = payloadKey;
+    this._sentState = presence.state ?? null;
+    this._sentExt = presence.ext ?? null;
     this._wsClient.send({
       type: 'presence',
       topic: this._topic,
       presence,
     });
+  }
+
+  // Resolve what one layer contributes to the outbound frame: the current
+  // value when it fits, otherwise the last value that did (recorded in
+  // `withheld` either way). Measuring here is what keeps a presence frame
+  // orders of magnitude under the size that closes the socket, which matters
+  // because the socket carries the document's ops too and the reconnect
+  // republishes retained presence, so one oversized frame would otherwise
+  // wedge the document in a reconnect loop instead of dropping an update.
+  private _publishableLayer(
+    layer: PresenceLayer,
+    current: Record<string, unknown>,
+    lastSent: Record<string, unknown> | null,
+    withheld: PresenceLayer[],
+  ): Record<string, unknown> | undefined {
+    if (Object.keys(current).length === 0) return undefined;
+    if (presenceLayerBytes(current) <= PRESENCE_LAYER_MAX_BYTES) return current;
+    withheld.push(layer);
+    return lastSent ?? undefined;
+  }
+
+  private _emitStatus(withheld: PresenceLayer[]): void {
+    const next: PresenceStatus =
+      withheld.length === 0
+        ? PRESENCE_STATUS_OK
+        : { oversize: true, withheld };
+    if (statusEqual(next, this.status)) return;
+    if (next.oversize) {
+      // The rising edge only, so a 10 Hz publisher gets one line rather than
+      // ten a second. Without it an app that never wired `onStatus` has no
+      // sign that its peers stopped seeing the layer.
+      console.warn(
+        `[Brass] presence ${next.withheld.join(' and ')} exceeds ` +
+          `${PRESENCE_LAYER_MAX_BYTES} bytes and is not being published. ` +
+          `Publish less, or watch presence.onStatus to react.`,
+      );
+    }
+    this._statusEmitter.emit(next);
   }
 }
 

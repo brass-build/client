@@ -4,21 +4,28 @@
 // rather than imported: this package ships unbundled and can only import
 // its own relative files. The server owns the contract; these follow it.
 
-// The transport does not deliver a message above this. It closes the
-// connection instead, taking down everything else multiplexed onto the
-// socket, so an oversized frame must never be sent.
-const WS_FRAME_MAX_BYTES = 128 * 1024;
+// A frame over this closes the connection, taking every other op and
+// presence down with it, and the reconnect re-sends the oversized frame, so
+// the document never saves anything. The transport also caps a message at
+// 128 KiB, but the frame binds first in a browser: it negotiates
+// `permessage-deflate` and Chromium sends a message as one frame, so what
+// gets through depends on how the op compresses (43,264 bytes for
+// incompressible base64, measured). Staying at the frame limit is what makes
+// the bound independent of the content.
+const WS_FRAME_MAX_BYTES = 32 * 1024;
 
-// What one stored record holds inline. Past it the blob is uploaded
-// straight to storage rather than carried in a request body, so this is
-// where the write path changes shape, not where it stops.
-const OP_ROW_MAX_BLOB_CHARS = 350 * 1024;
+// Past this the blob is uploaded to storage and the write names the staged
+// object instead of carrying it. Set by what a request body delivers
+// (6,289,920 bytes measured), with room for the envelope and headers. Not a
+// ceiling on op size.
+/** @internal Exported so a test can size against it rather than restate it. */
+export const OP_ROW_MAX_BLOB_CHARS = 5 * 1024 * 1024;
 
-// The largest op the platform accepts. A single value past this cannot
-// be split (a record is the merge unit, so one assignment is the
-// smallest thing a commit carries), which is why the refusal points at
+// The largest op the platform accepts. A single value past this cannot be
+// split (a record is the merge unit), which is why the refusal points at
 // storing the bulk as a file instead.
-const MAX_OP_BLOB_CHARS = 8 * 1024 * 1024;
+/** @internal Exported so a producer can derive its ceiling from it. */
+export const MAX_OP_BLOB_CHARS = 8 * 1024 * 1024;
 
 export interface OpFrame {
   type: 'op';

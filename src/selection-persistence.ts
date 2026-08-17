@@ -73,7 +73,16 @@ export function readLastDocument(
 ): SelectDocumentResult | null {
   const storage = getStorage();
   if (!storage) return null;
-  const raw = storage.getItem(docKey(appId));
+  let raw: string | null;
+  try {
+    raw = storage.getItem(docKey(appId));
+  } catch {
+    // A storage that holds a handle but refuses reads (a partitioned or
+    // locked-down context). Recalling the last document is a niceness, so it
+    // degrades to none rather than throwing out of the caller, which would
+    // replace the real reason a document could not be reopened.
+    return null;
+  }
   if (raw === null) return null;
   let parsed: unknown;
   try {

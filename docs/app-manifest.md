@@ -7,10 +7,9 @@ a download button on the documents your app writes out.
 
 ## Where it goes
 
-The manifest is a file called `brass-app.json`. It must be placed in a
-directory called `/.well-known/` at your bundle root, next to
-`index.html`. Some bundlers skip dot-directories when they copy static
-assets, so confirm that the manifest is actually in your `dist/`
+Put `brass-app.json` in a `/.well-known/` directory at your bundle
+root, next to `index.html`. Some bundlers skip dot-directories when
+they copy static assets, so confirm the manifest is in your `dist/`
 directory after you build.
 
 The platform re-reads the manifest after each deploy, so publishing
@@ -21,15 +20,15 @@ the bundle from your own origin, the platform fetches
 `<origin>/.well-known/brass-app.json` as an anonymous client, so serve
 that path publicly even when the rest of your app requires sign-in.
 
-These tokens only drive discovery and grant no access, so you declare
-them yourself.
+The `opens` and `creates` tokens below only drive discovery and grant
+no access, so you declare them yourself.
 
 ## What goes in it
 
 ```json
 {
   "opens": ["tracker"],
-  "accepts": [{ "extension": "csv" }, { "content_type": "text/csv" }],
+  "imports": [{ "extension": "csv" }, { "content_type": "text/csv" }],
   "creates": "tracker",
   "exports": { "content_type": "text/csv", "file_extension": ".csv" },
   "icon": "/icon.svg",
@@ -42,7 +41,7 @@ Every field is optional, so ship only the ones your app uses.
 - **`opens`** lists the `schema_type`s of documents your app reads.
   Declaring a `schema` already folds its family in, so most apps list
   nothing extra here.
-- **`accepts`** matches an uploaded file by extension or content type,
+- **`imports`** matches an uploaded file by extension or content type,
   so Brass offers your app to whoever uploads one. Your app then reads
   the file's bytes through `sourceBlob()`.
 - **`creates`** is the `schema_type` Brass stamps on the documents your

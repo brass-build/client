@@ -15,10 +15,8 @@
 import { Document } from './documents.js';
 import type { DocumentStreamInfo } from './documents-namespace.js';
 import type { StreamRuntime } from './document-streams.js';
-import type { DocumentSerializer } from './serializer.js';
-
-const ENVELOPE = '__brass_embed';
-const PROTOCOL_VERSION = 1;
+import type { DocumentSerializer, StoredDocument } from './serializer.js';
+import { EMBED_ENVELOPE, EMBED_PROTOCOL_VERSION } from './embed-protocol.js';
 
 // The URL flag Brass appends when it frames an app purely to serialize.
 // A normal app load never carries it, so a real user visit is untouched.
@@ -102,7 +100,7 @@ export function startExportGuest(): ExportGuestController {
       }, STREAM_REQUEST_TIMEOUT_MS);
       pendingStreamFetches.set(requestId, { resolve, reject, timer });
       window.parent.postMessage(
-        { [ENVELOPE]: PROTOCOL_VERSION, type, requestId, ...extra },
+        { [EMBED_ENVELOPE]: EMBED_PROTOCOL_VERSION, type, requestId, ...extra },
         hostOrigin,
       );
     });
@@ -145,7 +143,7 @@ export function startExportGuest(): ExportGuestController {
       | { ok: false; code: string; message: string },
   ): void {
     window.parent.postMessage(
-      { [ENVELOPE]: PROTOCOL_VERSION, type: 'export-result', requestId, ...outcome },
+      { [EMBED_ENVELOPE]: EMBED_PROTOCOL_VERSION, type: 'export-result', requestId, ...outcome },
       hostOrigin,
     );
   }
@@ -168,7 +166,10 @@ export function startExportGuest(): ExportGuestController {
         : Document.create(identity);
       for (const op of tailOps) doc.applyRemoteOp(op);
       doc.setStreamRuntime(makeStreamRuntime(hostOrigin));
-      const bytes = await serializer(doc);
+      // A serializer runs detached, with no subscription to have been fed by,
+      // and it needs the document once, so it is handed the containers whole
+      // (`StoredDocument`) rather than the fed surface an app holds.
+      const bytes = await serializer(doc as StoredDocument & Document);
       reply(hostOrigin, requestId, { ok: true, bytes });
     } catch (err) {
       reply(hostOrigin, requestId, {
@@ -180,8 +181,13 @@ export function startExportGuest(): ExportGuestController {
   }
 
   function onMessage(event: MessageEvent): void {
+    // Source pinning, the counterpart of the origin pins below and of the
+    // one the host side applies: `window.parent` is the framer this guest
+    // replies to, so a message from any other window is not part of this
+    // exchange whatever origin it claims.
+    if (event.source !== window.parent) return;
     const data = event.data as Record<string, unknown> | null;
-    if (!data || data[ENVELOPE] !== PROTOCOL_VERSION) return;
+    if (!data || data[EMBED_ENVELOPE] !== EMBED_PROTOCOL_VERSION) return;
 
     // A reply to a proxied stream fetch. Accept only from the pinned framer
     // origin (set once the export request arrives), so a second frame cannot
@@ -262,7 +268,7 @@ export function startExportGuest(): ExportGuestController {
   window.addEventListener('message', onMessage);
   // Announce readiness. Posted with `'*'` because the host origin is not
   // known until its first message arrives; the ping carries no data.
-  window.parent.postMessage({ [ENVELOPE]: PROTOCOL_VERSION, type: 'ready' }, '*');
+  window.parent.postMessage({ [EMBED_ENVELOPE]: EMBED_PROTOCOL_VERSION, type: 'ready' }, '*');
 
   return {
     setSerializer(next: DocumentSerializer): void {

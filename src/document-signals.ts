@@ -9,7 +9,7 @@
 import { createEmitter } from './emitter.js';
 
 // Reason a Document's underlying doc was evicted. Mirrors the `doc_gone`
-// frame's `reason` (CONTRACT.md "Server-pushed `doc_gone`"). New literals land
+// frame's `reason`. New literals land
 // here as the platform grows transitions that evict open subscribers.
 // `moved`: the doc changed organization or project, so its access gate
 // changed and open subscribers re-establish under the new location.
@@ -19,7 +19,7 @@ export type DocumentGoneListener = (reason: DocumentGoneReason) => void;
 export type DocumentGoneUnsubscribe = () => void;
 
 // Opaque status of slow server-side work (hydration, extraction, push).
-// Mirrors the wire shape (CONTRACT.md "Server-pushed `doc_status`"). The app
+// Mirrors the wire shape of the server's status frame. The app
 // renders `message` verbatim, draws a bar from `progress`, and waits while
 // `pending`. No kind / phase / error code: the server owns all wording and can
 // change phases without any app change.
@@ -39,7 +39,7 @@ export type DocumentStatusListener = (status: DocumentWorkStatus) => void;
 export type DocumentStatusUnsubscribe = () => void;
 
 // Coarse divergence state of a drive-linked doc vs its source. Mirrors the
-// server's `tracking_state` (CONTRACT.md "Drive document tracking state"). The
+// server's `tracking_state`. The
 // app reads `state` to decide which affordance to show, never to pick wording
 // (that is server-authored `label` / `detail`).
 export type DocumentDriveTrackingState =
@@ -54,11 +54,11 @@ export type DocumentDriveTrackingState =
 // reads this to decide whether to show a Publish affordance at all.
 export type DriveMirrorDirection = 'two_way' | 'import_only';
 
-// The drive sync state of an open document, the read-side companion to
-// `doc.pushToDrive(...)`. Present only on drive-linked docs; `null` otherwise.
-// Lets an app show "you have unpublished edits" without polling. Words are
+// The drive sync state of an open document. Present only on drive-linked
+// docs; `null` otherwise. Lets an app show "you have unpublished edits"
+// without polling, while the hosted toolbar owns publishing itself. Words are
 // server-authored (`label` / `detail`, rendered verbatim); the app branches
-// only on `state` / `canPush` to decide whether to show an affordance.
+// only on `state` / `canPush`.
 export interface DocumentDriveStatus {
   // Adapter type token; an app may key an icon off it. The human label is
   // `driveName`, so an app never maps the type to a vendor name itself.

@@ -16,6 +16,7 @@ export {
   buildSignInUrl,
   refreshTokens,
   type RefreshCredential,
+  type RefreshOutcome,
   type RefreshResult,
   type TokenSet,
 } from './auth-flow.js';

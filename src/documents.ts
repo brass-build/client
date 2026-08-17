@@ -17,11 +17,8 @@ import {
   decodeImportBlobMeta,
 } from 'loro-crdt';
 
-import { MutateBatcher } from './mutate-batching.js';
-import {
-  UndoController,
-  type UndoControllerOptions,
-} from './undo.js';
+import { PAGING_COMMIT_ORIGIN, UndoController } from './undo.js';
+import type { DocSyncDiagnostics, UndoControllerOptions } from './types.js';
 import {
   createOrderedMapHandle,
   createRootListHandle,
@@ -29,22 +26,24 @@ import {
   rebindRootListAnchor,
   rebindRootMapAnchor,
   resyncRootHandle,
+  snapshotRootMapKeys,
   teardownRootHandle,
-  wrapLoroMapProxy,
-  type ChangeSource,
-  type HandleOwner,
-  type ListHandle,
-  type MapHandle,
-  type OrderedMapHandle,
+  type StateVersion,
 } from './handles.js';
+import type {
+  ChangeSource,
+  HandleOwner,
+  ListHandle,
+  MapHandle,
+  OrderedMapHandle,
+} from './handle-types.js';
 import {
-  CURRENT_PAGING_SCHEME,
-  isPagedByPageCount,
+  flattenPagedLookup,
+  isPagedMarker,
   META_KEY,
-  PAGE_COUNT_KEY,
-  PAGING_SCHEME_KEY,
-  RECORDS_KEY,
+  pagedRootKey,
 } from './record-paging.js';
+import { MAX_OP_BLOB_CHARS } from './ws-frame-limit.js';
 import type {
   BranchSummary,
   DocumentCheckpoint,
@@ -83,6 +82,7 @@ import {
   BranchController,
   type BranchProvider,
 } from './document-branches.js';
+import { releaseUnsavedWork, trackUnsavedWork } from './unload-guard.js';
 import {
   CommandMenu,
   type Command,
@@ -140,21 +140,23 @@ export interface DocumentMutator<E extends object = EntityProxy> {
 }
 
 // What the entity proxy presents by default: any nested plain object
-// shape backed by a LoroMap / LoroList container tree. `Record<string,
+// shape backed by a LoroMap / LoroMovableList container tree. `Record<string,
 // unknown>` because Loro's value type is dynamic; typed apps pass their
 // shape to `DocumentMutator<E>` / `doc.mutate<E>` instead.
 export type EntityProxy = Record<string, unknown>;
 
-export type DocumentSubscriber = (event: unknown) => void;
+export type DocumentSubscriber = (event: SyntheticSubscribeEvent) => void;
 export type DocumentUnsubscribe = () => void;
 
-// Discriminated event the SDK fires through `doc.subscribe` for
-// non-CRDT changes (checkout, return-to-head, saving count). Apps can
-// ignore the event arg and re-read in the handler, or narrow on
-// `event.kind`. CRDT-origin events keep their Loro shape (also
-// delivered through the same `subscribe`).
+// The discriminated event `doc.subscribe` fires. Every event the document
+// produces arrives in this shape, whether a content change or one of the
+// SDK's own metadata ticks, so an app can ignore the argument and re-read in
+// the handler, or narrow on `event.kind`.
 export type SyntheticSubscribeEvent =
-  | { kind: 'checkout'; version: number }
+  // A content change, with what produced it. `source` is the same value the
+  // handle surface reports as `origin.source`.
+  | { kind: 'change'; source: ChangeSource }
+  | { kind: 'history'; version: number }
   | { kind: 'return-to-head' }
   // A bare re-read tick: the document's branch state settled or changed
   // (the list loaded on open, or a switch/create landed). Carries no
@@ -163,6 +165,12 @@ export type SyntheticSubscribeEvent =
   // branch model, management is hosted.
   | { kind: 'branches' }
   | { kind: 'saving-count' }
+  // The document's capacity verdict changed, so `doc.atCapacity` reads
+  // differently than it did. Fired on its own kind rather than folded into
+  // `saving-count` because an app acts on it differently: a saving count
+  // moves constantly and settles, while this one gates whether adding more
+  // is worth offering at all.
+  | { kind: 'capacity' }
   | { kind: 'commands' };
 
 // Snapshot of the Document's undo/redo state, pushed to
@@ -193,7 +201,6 @@ const REDO_COMMIT_ORIGIN = 'brass.redo';
 function changeSourceOf(event: unknown): ChangeSource {
   const by = (event as { by?: unknown }).by;
   if (by === 'import') return 'remote';
-  if (by === 'checkout') return 'checkout';
   // by === 'local': disambiguate via the commit-origin tag.
   const origin = (event as { origin?: unknown }).origin;
   if (origin === UNDO_COMMIT_ORIGIN) return 'undo';
@@ -201,20 +208,53 @@ function changeSourceOf(event: unknown): ChangeSource {
   return 'local';
 }
 
-// Per-chunk cap on a resync-push blob (durability handshake). Each push
-// ships as one op frame, and the transport carries 128 KB; the blob is
-// base64-encoded (~1.33x) inside a JSON envelope, so the raw blob must
-// stay well under that. 64 KB base64s to ~85 KB. A larger missing slice
-// is split into multiple chunks (see `computeResyncPush`), each capped.
-const RESYNC_PUSH_MAX_BYTES = 64 * 1024;
+// Per-chunk cap on a blob this Document pushes as several ops: a durability
+// resync's missing slice (`computeResyncPush`) and a local commit no write
+// budget bounded (`splitLocalUpdate`).
+//
+// Each chunk goes out through the same local-op hook an ordinary commit
+// uses, so the transport picks itself by size and a chunk this large takes
+// the HTTP op write. Sizing the chunk to a WebSocket frame instead is what
+// makes a heal the most expensive write the SDK performs: the slice a bulk
+// write leaves behind is the whole document, and at frame size that is
+// thousands of ops, each one landing on the document's single storage
+// partition at exactly the size that stays inline on its row. Measured, a
+// 40 MB divergence healed in 16 KB chunks throttled the partition and left
+// the join a tail it refused to serve. The same divergence at this size is
+// tens of ops whose bytes go to the bucket instead.
+const RESYNC_PUSH_MAX_BYTES = 512 * 1024;
 
-// Hard ceiling for a single irreducible op (one Loro op, unsplittable).
-// Sized so the base64 frame still clears the 128 KB limit (90 KB base64s
-// to ~120 KB plus envelope). An op this large cannot occur on a doc
-// whose normal edits send at all (same frame limit), so this only guards
-// a pathological op; it is skipped with a warning rather than retried
+// Hard ceiling for a single irreducible op (one Loro op, unsplittable),
+// beyond which the chunk is skipped with a warning rather than retried
 // forever, while the doc's other chunks still heal.
-const RESYNC_PUSH_HARD_MAX_BYTES = 90 * 1024;
+//
+// Skipping drops an edit the server never received, so this sits at exactly
+// what the write path can carry rather than at what a frame holds. Base64
+// turns B raw bytes into ceil(B/3)*4 characters, so the last raw size whose
+// encoding still fits the durable cap is three quarters of it. Derived
+// rather than written out, because the two have to move together and a
+// literal here would let the ceiling drift above what the server accepts,
+// which turns a heal into silent loss. A blob this large travels through
+// the staged upload rather than a request body, a path the write already
+// takes on its own size.
+const RESYNC_PUSH_HARD_MAX_BYTES = Math.floor((MAX_OP_BLOB_CHARS * 3) / 4);
+
+// What one run of the durability handshake settled. Only `covered` means the
+// durable frontier holds everything local does; a caller driving the
+// handshake to close a known divergence keeps asking on anything else.
+//
+//   covered      the server holds it all, so the handshake is finished
+//   pushed       chunks are on the wire and their acks decide the outcome
+//   in-flight    an earlier push has not settled, so this run stood down
+//   undecodable  the frontier did not parse, so nothing was compared
+//   closed       the doc was freed before the handshake ran
+/** @internal */
+export type ResyncPushOutcome =
+  | 'covered'
+  | 'pushed'
+  | 'in-flight'
+  | 'undecodable'
+  | 'closed';
 
 // Element-wise max of two Loro version vectors. `VersionVector` exposes
 // no public join, so round-trip through its `Map<PeerID, number>` JSON
@@ -233,63 +273,192 @@ function mergeVersionVectors(
   return VersionVector.parseJSON(merged);
 }
 
-// Split half-open per-peer counter ranges into two halves by total op
-// count, splitting at most one range across the boundary. `total` must
-// be >= 2 so both halves are non-empty (the caller handles total === 1
-// as the irreducible single-op case). Order is preserved.
-function splitRangesByLength(
-  ranges: { peer: PeerID; from: number; to: number }[],
-  total: number,
-): [
-  { peer: PeerID; from: number; to: number }[],
-  { peer: PeerID; from: number; to: number }[],
-] {
-  const half = Math.floor(total / 2);
-  const first: { peer: PeerID; from: number; to: number }[] = [];
-  const second: { peer: PeerID; from: number; to: number }[] = [];
+type CounterRange = { peer: PeerID; from: number; to: number };
+
+function rangeOpCount(ranges: readonly CounterRange[]): number {
+  return ranges.reduce((n, r) => n + (r.to - r.from), 0);
+}
+
+// Split half-open per-peer counter ranges in two after `at` ops, splitting at
+// most one range across the boundary. Order is preserved.
+function splitRangesAt(
+  ranges: readonly CounterRange[],
+  at: number,
+): [CounterRange[], CounterRange[]] {
+  const first: CounterRange[] = [];
+  const second: CounterRange[] = [];
   let acc = 0;
   for (const r of ranges) {
     const len = r.to - r.from;
-    if (acc >= half) {
+    if (acc >= at) {
       second.push(r);
-    } else if (acc + len <= half) {
+    } else if (acc + len <= at) {
       first.push(r);
       acc += len;
     } else {
-      const splitAt = r.from + (half - acc);
+      const splitAt = r.from + (at - acc);
       first.push({ peer: r.peer, from: r.from, to: splitAt });
       second.push({ peer: r.peer, from: splitAt, to: r.to });
-      acc = half;
+      acc = at;
     }
   }
   return [first, second];
 }
 
-// The record store's page count off a doc's `meta` map, or 0 when
-// unpaged. `handles.ts` reads it to resolve which page a key hashes to
-// AND to decide whether the store is paged at all (on every root-map
-// read / edit). Read by PATH, not `getMap(META_KEY)`: `getMap` is
-// get-or-create and would materialize an empty `meta` root on every
-// unpaged document, polluting its wire shape; `getByPath` is a pure read
-// returning undefined when `meta` does not exist.
-function readStorePageCount(source: LoroDoc): number {
-  const pc = source.getByPath(`${META_KEY}/${PAGE_COUNT_KEY}`);
-  // Same "is paged" predicate as the formats/core readers, so the SDK
-  // handle path and the store readers cannot disagree on a malformed
-  // count (e.g. a non-finite value must read as unpaged everywhere).
-  return isPagedByPageCount(pc) ? (pc as number) : 0;
+// Split into two halves by op count. `total` must be >= 2 so both halves are
+// non-empty (the caller handles total === 1 as the irreducible single-op case).
+function splitRangesByLength(
+  ranges: readonly CounterRange[],
+  total: number,
+): [CounterRange[], CounterRange[]] {
+  return splitRangesAt(ranges, Math.floor(total / 2));
 }
 
-// The paging scheme a paged store was written under, off the same `meta` map
-// as the page count (read by path, not `getMap`, for the same reason: a pure
-// read that never materializes an empty `meta` root). A paged store predating
-// the stamp reports the current scheme, so it stays editable; a store written
-// under a newer scheme reports that number, and the edit path refuses it
-// rather than hashing a key into the wrong page.
-function readStorePagingScheme(source: LoroDoc): number {
-  const s = source.getByPath(`${META_KEY}/${PAGING_SCHEME_KEY}`);
-  return typeof s === 'number' && s > 0 ? s : CURRENT_PAGING_SCHEME;
+// Split into `parts` pieces of roughly equal op count, in order.
+//
+// A caller that already knows the whole range's byte size can name the number
+// of pieces it wants instead of discovering it by halving, which costs one
+// export per level and re-exports the same ops at every level: an 8 MB commit
+// takes 31 exports to reach sixteen chunks by halving and 16 by naming them.
+// The pieces are still measured afterwards, so an uneven commit that leaves a
+// piece over the cap is split further from there.
+function splitRangesEvenly(
+  ranges: readonly CounterRange[],
+  parts: number,
+): CounterRange[][] {
+  let rest = [...ranges];
+  let remaining = rangeOpCount(rest);
+  if (parts <= 1 || remaining <= parts) return [rest];
+  const out: CounterRange[][] = [];
+  for (let left = parts; left > 1; left -= 1) {
+    const at = Math.floor(remaining / left);
+    if (at < 1) break;
+    const [first, second] = splitRangesAt(rest, at);
+    out.push(first);
+    rest = second;
+    remaining -= at;
+  }
+  out.push(rest);
+  return out.filter((piece) => rangeOpCount(piece) > 0);
 }
+
+// The `meta` root a document's paged marker lives in, or `null` while the
+// document has none.
+//
+// The marker is read on every root-map read, edit and keyed lookup, and a
+// reader that answers from a copy taken earlier is what puts paged-shaped keys
+// into a store whose marker says unpaged, or reads a root a peer paged as its
+// raw page entries. Answering off the live container instead makes both
+// impossible: a peer's write lands in that same container, so the next read
+// sees it, with no invalidation to get right.
+//
+// What is remembered per document is the resolved CONTAINER, and only once the
+// root exists. A root handle reads through to the document's current state, so
+// holding one keeps the value live: a peer's import and a checkout both land
+// on the same container the cell already points at.
+//
+// Holding it is also what keeps this off the leak. Every `getMap` mints a new
+// wasm-bindgen handle that dropping does not reclaim (the same fact `pageValue`
+// and `entryExists` free around), and this resolves on every root-map read,
+// edit and keyed lookup, so minting per call retains ~145 bytes each for the
+// length of the session. One handle per document is a bounded cost instead.
+//
+// Resolution goes through `getByPath` rather than `getMap`, which is
+// get-or-create and would materialize an empty `meta` on a document that has
+// none (in the wire shape of every unpaged document, and as a local write on a
+// read-only open). Its cost tracks the document's container count, and it is
+// paid once per document.
+const metaRoots = new WeakMap<LoroDoc, { map: LoroMap | null }>();
+
+function metaRoot(source: LoroDoc): LoroMap | null {
+  let cell = metaRoots.get(source);
+  if (cell === undefined) {
+    cell = { map: null };
+    metaRoots.set(source, cell);
+  }
+  if (cell.map === null) {
+    const found = source.getByPath(META_KEY);
+    if (!(found instanceof LoroMap)) return null;
+    cell.map = found;
+  }
+  return cell.map;
+}
+
+/** The `meta` root, creating it if `source` has none, and remembering it so
+ *  later reads resolve without minting a second handle. */
+function metaRootOrCreate(source: LoroDoc): LoroMap {
+  const existing = metaRoot(source);
+  if (existing !== null) return existing;
+  const created = source.getMap(META_KEY);
+  metaRoots.set(source, { map: created });
+  return created;
+}
+
+/** Whether one root map is paged. Same predicate the record-store readers
+ *  use, so the SDK handle path and those readers cannot disagree. */
+function readRootPaged(source: LoroDoc, rootKey: string): boolean {
+  return isPagedMarker(metaRoot(source)?.get(pagedRootKey(rootKey)));
+}
+
+/** Whether a root's JSON is the keyed lookup a record store flattens. A root
+ *  that projects to a list or a scalar cannot hold pages whatever `meta`
+ *  says, so it is handed back untouched. */
+function isRootLookup(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// Mark `rootKey` paged, under a `meta` key of its own. Written ONCE and never
+// revised: pages are addressed by session and index, so nothing downstream
+// needs to know how many there are or how much the store grows afterwards.
+//
+// A key per root is what lets two peers page two different roots at the same
+// time. One entry naming every paged root would have to be read, extended and
+// written back whole, and the losing side of that race takes its root's marker
+// with it (see `PAGED_ROOT_PREFIX`); two keys merge.
+//
+// The marker commits on its own, under an origin the undo stack excludes, and
+// `commitPending` lands whatever the running mutation has written so far
+// first. Two properties ride on that. Peers and the server never see a page
+// without the marker that says how to read it, because the marker's op
+// precedes every op carrying a page. And nothing an app authored is taken out
+// of the undo stack with it: a commit carrying both would exclude the records
+// as well as the marker.
+function pageRoot(
+  source: LoroDoc,
+  rootKey: string,
+  commitPending: () => void,
+): void {
+  if (readRootPaged(source, rootKey)) return;
+  commitPending();
+  metaRootOrCreate(source).set(pagedRootKey(rootKey), true);
+  source.setNextCommitOrigin(PAGING_COMMIT_ORIGIN);
+  source.commit();
+}
+
+// Why a live Document refuses local writes. Each names a refusal the server
+// would make, so `mutate` can say which one applies rather than answering
+// every refusal with one message.
+/** @internal */
+export type ReadOnlyReason =
+  // Opened through a view-only share link.
+  | 'link'
+  // The reader's grant on this document does not carry write access.
+  | 'grant'
+  // The app acting on the reader's behalf may not edit this document.
+  | 'app'
+  // A change this copy holds was refused, so it shows something no other
+  // reader has. Editing on top of it builds more of the same, and `reload()`
+  // is what returns the copy to what the platform holds.
+  | 'unsaved';
+
+const READ_ONLY_MESSAGES: Record<ReadOnlyReason, string> = {
+  link: 'Document is read-only: it was opened via a view-only share link.',
+  grant: 'Document is read-only: you have view-only access to it.',
+  app: 'Document is read-only: this app is not permitted to edit it.',
+  unsaved:
+    'Document is read-only: a change could not be saved, so this copy holds ' +
+    'work the platform does not. Brass is replacing it with the platform copy.',
+};
 
 export interface DocumentOptions {
   // Root key the Document wraps. Defaults to `"entities"` to match the
@@ -307,6 +476,10 @@ export interface DocumentOptions {
   // True when opened at a historical version. A read-only Document
   // throws from `mutate` and carries no live WS transport.
   readOnly?: boolean;
+  // Why `readOnly` was set, which picks the message `mutate` throws.
+  // Defaults to the view-only link.
+  /** @internal */
+  readOnlyReason?: ReadOnlyReason;
   // The historical version materialized at, when opened via `{ version
   // }`; `null` for a live (head) open. The server's *effective* version,
   // which may round down when compaction has TTL'd the exact op.
@@ -361,13 +534,15 @@ export class Document {
   // leaves this `false`.
   private readonly _isFrozen: boolean;
   // Forced read-only on a LIVE head open (distinct from `_isFrozen`, which
-  // is a version-pinned open with no live channel). The anonymous
-  // link-guest open sets this: the Document keeps a live WS subscription
-  // and applies incoming remote ops, but local `mutate` is rejected, so a
-  // guest sees edits stream in while being unable to write.
-  private readonly _forcedReadOnly: boolean;
-  private readonly _root: LoroMap;
-  private readonly _entities: EntityProxy;
+  // is a version-pinned open with no live channel): the Document keeps a
+  // live WS subscription and applies incoming remote ops, but local
+  // `mutate` is rejected, so the reader sees edits stream in while being
+  // unable to write. Set at open from the join's `can_edit` (a viewer's
+  // grant, a view-only link), and latched on afterwards by
+  // `_markReadOnly` when the server refuses a write on the same grounds.
+  private _forcedReadOnly: boolean;
+  // Which refusal `_forcedReadOnly` stands for, so `mutate` names it.
+  private _readOnlyReason: ReadOnlyReason;
   // The UndoManager is constructed eagerly so the first call to
   // `doc.mutate(...)` lands in the undo stack. Lazy construction
   // (deferred to first `doc.undo()`) would miss every commit made
@@ -381,7 +556,9 @@ export class Document {
   // app reconciles by value and reads `origin.source` only when it has a
   // non-render reason to know the cause. A throwing subscriber is swallowed
   // so it cannot strand the others or the WS router.
-  private readonly _subs = createEmitter<unknown>({ onError: () => {} });
+  private readonly _subs = createEmitter<SyntheticSubscribeEvent>({
+    onError: () => {},
+  });
   // Subscribers registered via `subscribeUndoState`. Fired after
   // every underlying Loro event when `canUndo()` or `canRedo()`
   // changed value vs the last fire, so UI bound to undo/redo
@@ -532,18 +709,32 @@ export class Document {
   // Live = neither closed nor parked. This is the public-surface gate;
   // internal ingress (remote ops, status emits) deliberately checks
   // `_closed` alone, because a parked doc keeps applying remote state.
-  private get _isLive(): boolean {
+  // Readable from the SDK's own layers (the client's open-document set
+  // gates on it) rather than only from inside this class.
+  /** @internal */
+  get _isLive(): boolean {
     return !this._closed && !this._suspended;
   }
 
   private _assertOpen(): void {
     if (!this._isLive) throw new Error('Document is closed');
   }
+
+  // `close()` releases the CRDT state, so a read after it reaches released
+  // memory and fails with whatever the engine says about that. Reads are gated
+  // on this rather than on `_assertOpen` because a parked Document still holds
+  // its state and answers from it.
+  private _assertNotClosed(): void {
+    if (this._closed) throw new Error('Document is closed');
+  }
   // Server-pushed lifecycle signals: `_gone` is fire-once-then-cache
   // for `doc_gone` eviction; `_workStatus` is latest-retained,
   // re-emit-per-phase for `doc_status`.
   private readonly _gone = new GoneSignal();
   private readonly _workStatus = new WorkStatusSignal();
+  // Inbound work ended without delivering content, so this doc holds
+  // nothing and stays locked. See `_emitStatus` for how it is derived.
+  private _loadFailed = false;
   // Drive sync state, latest-retained. `null` until the open factory
   // seeds it (drive-linked docs only) and on docs with no drive link.
   private readonly _driveStatus = new DriveStatusSignal();
@@ -552,7 +743,11 @@ export class Document {
   // on, and on the offline / test path where there is no transport.
   presence: import('./presence.js').PresenceClient | null = null;
 
-  constructor(loroDoc: LoroDoc, options?: DocumentOptions) {
+  // A Document owns the LoroDoc it wraps, so it is built through the factories
+  // below (or `documentFromEngine`, for in-repo tooling that brings its own).
+  // Owning construction is what lets this class declare an engine-neutral
+  // surface: app code holds a Document, never the doc underneath it.
+  private constructor(loroDoc: LoroDoc, options?: DocumentOptions) {
     this._doc = loroDoc;
     this._rootKey = options?.rootKey ?? 'entities';
     this._docId = options?.docId ?? null;
@@ -574,12 +769,15 @@ export class Document {
       this._isFrozen = false;
       this._checkout = null;
     }
-    // `readOnly` on a live (non-version) open is a forced read-only: the
-    // guest link view. A version open is already frozen, so it does not
-    // also need the forced flag.
+    // `readOnly` on a live (non-version) open is a forced read-only: a
+    // reader the server will not accept writes from, whether because their
+    // grant is view-only or because the link they came through is. A
+    // version open is already frozen, so it does not also need the flag.
     this._forcedReadOnly = options?.readOnly === true && initialVersion === null;
-    this._root = loroDoc.getMap(this._rootKey);
-    this._entities = wrapLoroMapProxy(this._root) as EntityProxy;
+    this._readOnlyReason = options?.readOnlyReason ?? 'link';
+    // Materialize the root container, so a document nothing has written to
+    // still carries its root in the shape a reader opens it with.
+    loroDoc.getMap(this._rootKey);
     this._undo = new UndoController(this._doc, options?.undo);
   }
 
@@ -604,6 +802,15 @@ export class Document {
     | { kind: 'list'; key: string; handle: ListHandle<unknown> }
   >();
 
+  // Names the pages this Document's writes may occupy. A page is one value,
+  // so two writers appending to the same page container would resolve
+  // last-writer-wins and lose one writer's records; the token is what keeps
+  // their key spaces apart. Loro's peer id is already unique per open, which
+  // is exactly the scope wanted.
+  private get _pagingSessionToken(): string {
+    return this._doc.peerIdStr;
+  }
+
   // Get a handle for a top-level LoroMap at `key`. The container is
   // materialized in the underlying LoroDoc immediately (Loro's
   // `getMap` is "get or create"); mutations through the handle do
@@ -623,41 +830,32 @@ export class Document {
     // `instances` map present its page containers transparently as a
     // flat record map. It resolves the ACTIVE source at call time (not
     // the one captured at handle creation): a checkout rebinds the
-    // handle's anchor to the preview doc, and the page count must come
-    // from that same doc or keyed reads hash into the wrong page (and a
-    // closure pinned to a preview doc would read a freed LoroDoc after
-    // returnToHead).
+    // handle's anchor to the preview doc, and the page state must come
+    // from that same doc or a read takes the wrong path for the state it is
+    // looking at (and a closure pinned to a preview doc would read a freed
+    // LoroDoc after returnToHead).
     //
-    // Only the record store's paged root (`instances`) may report a page
-    // count. `readStorePageCount` reads the document-global
-    // `meta.page_count`, so handing it to every root map would make the
-    // sibling record-store roots (`meta`, `header`) and any app-owned
-    // root map read as paged once `instances` pages, routing their
-    // `get`/`has`/`mutate` through the page-hash path against a map that
-    // holds no page containers (`get` returns undefined for present keys;
-    // `mutate` writes a stray page container into a plain map). A non-
-    // record-store key gets a null provider and stays unpaged.
-    const handle = createRootMapHandle<unknown>(
-      loroMap,
-      this._handleOwner,
-      key === RECORDS_KEY
-        ? (): number =>
-            readStorePageCount(
-              this._checkout !== null ? this._checkout.previewDoc : this._doc,
-            )
-        : undefined,
-      key === RECORDS_KEY
-        ? (): number =>
-            readStorePagingScheme(
-              this._checkout !== null ? this._checkout.previewDoc : this._doc,
-            )
-        : undefined,
-    );
+    // EVERY root map gets the providers, because a `meta` key of its own is
+    // what names a paged root: a root with no such key reads as unpaged, which
+    // is the answer `meta` and `header` want anyway. Naming one root here
+    // instead would make paging a property of a reserved key rather than of a
+    // collection, so a map an app owns could never be paged however large it
+    // grew.
+    const activeSource = (): LoroDoc =>
+      this._checkout !== null ? this._checkout.previewDoc : this._doc;
+    const handle = createRootMapHandle<unknown>(loroMap, this._handleOwner, {
+      isPaged: (): boolean => readRootPaged(activeSource(), key),
+      page: (): void => {
+        pageRoot(this._doc, key, this._handleOwner.commitMutate);
+      },
+      sessionToken: (): string => this._pagingSessionToken,
+      stateVersion: (): StateVersion => activeSource().frontiers(),
+    });
     this._rootHandles.set(cacheKey, { kind: 'map', key, handle });
     return handle as unknown as MapHandle<T>;
   }
 
-  // Get a handle for a top-level LoroList at `key`.
+  // Get a handle for a top-level LoroMovableList at `key`.
   list<T = unknown>(key: string): ListHandle<T> {
     this._assertOpen();
     const cacheKey = `list:${key}`;
@@ -665,7 +863,7 @@ export class Document {
     if (existing) return existing.handle as unknown as ListHandle<T>;
     const source =
       this._checkout !== null ? this._checkout.previewDoc : this._doc;
-    const loroList = source.getList(key);
+    const loroList = source.getMovableList(key);
     const handle = createRootListHandle<unknown>(loroList, this._handleOwner);
     this._rootHandles.set(cacheKey, { kind: 'list', key, handle });
     return handle as unknown as ListHandle<T>;
@@ -710,6 +908,9 @@ export class Document {
   private get _handleOwner(): HandleOwner {
     if (this._handleOwnerCache) return this._handleOwnerCache;
     this._handleOwnerCache = {
+      assertReadable: (): void => {
+        this._assertNotClosed();
+      },
       assertWritable: (): void => {
         this._assertOpen();
         if (this._checkout !== null) {
@@ -718,9 +919,19 @@ export class Document {
               'Call `doc.returnToHead()` to edit.',
           );
         }
-        if (this._forcedReadOnly) {
+        if (this._versionBrowsing) {
           throw new Error(
-            'Document is read-only: it was opened via a view-only share link.',
+            'Document is read-only: the reader is browsing its versions. ' +
+              'Close the version bar to edit.',
+          );
+        }
+        if (this._forcedReadOnly) {
+          throw new Error(READ_ONLY_MESSAGES[this._readOnlyReason]);
+        }
+        if (this._loadFailed) {
+          throw new Error(
+            'Document is read-only: its content could not be prepared ' +
+              '(see `doc.status`). Reopen it to try again.',
           );
         }
         if (this._isLoadLocked()) {
@@ -760,11 +971,14 @@ export class Document {
     return this._branchId;
   }
 
-  // True when the Document is currently showing a historical version
-  // (a checkout): `mutate` throws and edit affordances should be
-  // disabled. Reactive: flips on `_checkoutVersion(v)` /
-  // `returnToHead()`. `subscribe` fires when this changes, so apps
-  // bind it directly inside the subscribe handler.
+  // True when this reader cannot write to the document right now:
+  // `mutate` throws and edit affordances should be disabled. It covers a
+  // view-only grant, a view-only share link, a historical version showing
+  // (a checkout), and a document whose content is still loading or could
+  // not be loaded. Reactive in every one of those: `subscribe` fires when
+  // it changes, so an app binds it directly inside the subscribe handler
+  // and follows a grant the server withdraws mid-session as well as a
+  // checkout the reader entered.
   get readOnly(): boolean {
     // A doc that is still loading its first content (a drive-linked
     // stub hydrating on first open) is read-only until the bytes
@@ -774,21 +988,51 @@ export class Document {
     // `reloadAfterHydration`); until then mutation is rejected. This is
     // also what stops an app's "seed an empty doc" path from clobbering
     // a doc that only looks empty because it has not loaded yet.
+    // Browsing versions locks the document at the live head as well as at an
+    // earlier one. Stepping moves between the points history KEEPS, and an
+    // edit at the head makes no such point, so an edit made under the open
+    // bar puts the reader's own newest work somewhere the bar cannot travel
+    // to: Back then steps past it to the newest marker, and the way forward
+    // is a different number of presses from the way back. Reading history
+    // and writing it are separate modes, and the bar carries the Close that
+    // leaves this one.
     return (
-      this._forcedReadOnly || this._checkout !== null || this._isLoadLocked()
+      this._forcedReadOnly ||
+      this._checkout !== null ||
+      this._versionBrowsing ||
+      this._isLoadLocked()
     );
   }
 
   // True when content-replacing work (hydration / extraction) is pending
   // and editing must be locked so incoming bytes do not clobber local
-  // ops. A pending PUSH is outbound (it writes the doc out to the drive,
-  // nothing replaces local content), so the server marks it
+  // ops, and true again once that work ends without content
+  // (`_loadFailed`): a doc nothing could prepare is empty, and an edit
+  // there writes ops into a document the app is about to be told could not
+  // be opened. A pending PUSH is outbound (it writes the doc out to the
+  // drive, nothing replaces local content), so the server marks it
   // `blocking: false` and the doc stays editable while the importer
   // runs. An older server omits `blocking`; absence is treated as
   // blocking so hydration stays locked.
   private _isLoadLocked(): boolean {
+    if (this._loadFailed) return true;
     const s = this._workStatus.status;
     return s?.pending === true && s.blocking !== false;
+  }
+
+  /**
+   * Whether inbound work on this document ended without content. The SDK's
+   * session reads it to report the open as failed rather than binding an
+   * empty document as ready.
+   * @internal
+   */
+  get _contentLoadFailed(): boolean {
+    return this._loadFailed;
+  }
+
+  /** @internal The `doc_gone` reason this Document has seen, or `null`. */
+  get _goneReason(): DocumentGoneReason | null {
+    return this._gone.reason;
   }
 
   /**
@@ -857,6 +1101,16 @@ export class Document {
     return new Document(new LoroDoc(), options);
   }
 
+  /**
+   * Wrap a LoroDoc the caller already holds. `documentFromEngine` is the typed
+   * entry point; this seam stays `unknown` so `documents.ts` declares an
+   * engine-neutral surface.
+   * @internal
+   */
+  static _fromEngine(engine: unknown, options?: DocumentOptions): Document {
+    return new Document(engine as LoroDoc, options);
+  }
+
   // Apply a remote op blob produced by another peer (delivered via the
   // WS `doc_op` server frame). Idempotent: Loro's import
   // path dedupes by lamport, so re-applying a self-originated op is
@@ -883,8 +1137,8 @@ export class Document {
 
   // Apply a snapshot blob over the top of an existing Document.
   // Internal: the SDK calls this when the server delivers a fresh
-  // snapshot mid-session (e.g. after a compaction cycle). Persistence
-  // is server-authoritative, so there is no app-facing snapshot import.
+  // snapshot mid-session. Persistence is server-authoritative: the server
+  // decides when a fresh snapshot supersedes the local history.
   /** @internal */
   _applySnapshot(snapshot: Uint8Array): void {
     // See `applyRemoteOp`: refuse the import on a closed (freed) doc so a late
@@ -994,9 +1248,9 @@ export class Document {
   // intentional escape hatch: `Brass.openDocumentById` wires the hook;
   // `Document.create()` and direct construction stay
   // hook-free so the class is usable without taking the WS dependency.
-  // `E` defaults to `EntityProxy` (the untyped Record<string, unknown>)
-  // for backwards-compat with existing callers. Apps with a typed
-  // entity shape pass it as a type argument:
+  // `E` defaults to `EntityProxy` (the untyped Record<string, unknown>) so an
+  // app that has not described its entity shape still gets a working mutate.
+  // Apps with a typed entity shape pass it as a type argument:
   //
   //   doc.mutate<MyEntity>((d) => {
   //     d.entities[id] = myTypedEntity;
@@ -1006,50 +1260,18 @@ export class Document {
   // regardless of `E`; the generic exists purely to widen the type at
   // the assignment site so closed interfaces don't need an
   // `as Record<string, unknown>` cast.
+  //
+  // `d.entities` is the root map's handle under a plain-object surface, so
+  // the two reach one collection: a record a paged store holds reads and
+  // edits here exactly as it does through `doc.map(rootKey)`, and a write
+  // large enough to cross the paging threshold takes the paged shape from
+  // either.
   mutate<E extends object = EntityProxy>(
     fn: (d: DocumentMutator<E>) => void,
   ): void {
-    this._assertOpen();
-    if (this._checkout !== null) {
-      throw new Error(
-        'Document is read-only: it is showing a historical version. ' +
-          'Call `doc.returnToHead()` to edit.',
-      );
-    }
-    // A view-only share-link (guest) open is a live head held read-only:
-    // remote ops still stream in, but a local edit must be refused. The
-    // `_checkout` guard above only covers the version-pinned case, so this
-    // is a separate branch.
-    if (this._forcedReadOnly) {
-      throw new Error(
-        'Document is read-only: it was opened via a view-only share link.',
-      );
-    }
-    if (this._isLoadLocked()) {
-      throw new Error(
-        'Document is still loading its content; wait for the load to ' +
-          'finish before editing (see `doc.onStatus`).',
-      );
-    }
-  this._ensureLocalUpdatesSubscribed();
-    // A fresh proxy for the call, because the batcher rides it: the
-    // long-lived `this._entities` must stay batcher-free for the reads
-    // that go through it outside a mutation.
-    const batcher = new MutateBatcher(() => {
-      this._doc.setNextCommitOrigin(MUTATE_COMMIT_ORIGIN);
-      this._doc.commit();
+    this.map<E>(this._rootKey).mutate((entities) => {
+      fn({ entities });
     });
-    fn({
-      entities: wrapLoroMapProxy(this._root, batcher) as unknown as Record<
-        string,
-        E
-      >,
-    });
-    // Stamp the commit so `subscribe`'s default path can identify
-    // and suppress the local-mutate echo. `setNextCommitOrigin`
-    // applies to the very next commit, and `commit()` consumes it.
-    this._doc.setNextCommitOrigin(MUTATE_COMMIT_ORIGIN);
-    this._doc.commit();
   }
 
   // Install / replace the local-op send hook; `null` detaches it.
@@ -1112,6 +1334,13 @@ export class Document {
     return this._checkout !== null;
   }
 
+  /** @internal Whether this Document is pinned to the version it was opened
+   * at, with no live channel behind it. Stepping and returning to the head
+   * both throw on that shape, so the SDK's version bar offers neither. */
+  get _isVersionPinned(): boolean {
+    return this._isFrozen;
+  }
+
   // Switch the Document to a historical version, in place. @internal
   // (the hosted `history` command drives this). After the promise
   // resolves, `doc.readOnly` is `true`,
@@ -1162,6 +1391,11 @@ export class Document {
     for (const blob of tailOpBlobs) previewDoc.import(blob);
     const previewRoot = previewDoc.getMap(this._rootKey);
     const old = this._checkout;
+    // Snapshot the handles' keys before the active-source pointer moves (see
+    // `_snapshotRootHandleKeys`). Nothing between here and `_rebindRootHandles`
+    // may return early, or the snapshot would outlive its swap and be diffed
+    // against an unrelated later one.
+    this._snapshotRootHandleKeys();
     this._checkout = {
       previewDoc,
       previewRoot,
@@ -1187,30 +1421,38 @@ export class Document {
         // ignore; already freed
       }
     }
-    this._fireSubscribers({ kind: 'checkout', version: effectiveVersion });
+    this._fireSubscribers({ kind: 'history', version: effectiveVersion });
     this._maybeFireUndoState();
     // Preview every opened stream at the same point in time, so a
     // partitioned document's history shows a consistent historical state
     // across streams rather than a historical default over live streams.
-    await this._checkoutOpenStreams();
+    await this._checkoutOpenStreams(generation);
   }
 
   // Re-materialize each opened non-default stream at its seq recorded by the
   // active preview's checkpoint. A stream with no recorded seq at this
   // version (opened after the checkpoint, or before any checkpoint recorded
-  // one) returns to its own head, so it shows its earliest-known rather than
-  // a mismatched live state. Best-effort per stream: a stream whose inner
+  // one) has no historical state it can show, so it is held read-only for the
+  // duration rather than left live and writable under a historical default. Best-effort per stream: a stream whose inner
   // has no checkout fetcher (a guest line, which has no token to fetch
   // at-version) stays live. Failures are swallowed so one stream cannot
   // break the doc-level preview.
-  private async _checkoutOpenStreams(): Promise<void> {
+  private async _checkoutOpenStreams(generation: number): Promise<void> {
     const seqs = this._checkoutStreamSeqs ?? {};
     for (const [name, openPromise] of this._streamOpens) {
       try {
         const stream = await openPromise;
+        // Every stream costs an await, so the reader can have stepped
+        // somewhere else, or back to the live head, since the previous one.
+        // The document's own swap is guarded the same way, and this loop
+        // running on past it is what leaves a partitioned document showing
+        // two moments at once: the document at the version the reader asked
+        // for, and whichever streams a superseded run still reached at its
+        // own.
+        if (generation !== this._checkoutGeneration) return;
         const lineId = this._streamManifest?.get(name)?.line_id;
         const seq = lineId !== undefined ? seqs[lineId] : undefined;
-        await stream._previewAt(seq);
+        await stream._previewAt(seq, true);
       } catch {
         // A stream that failed to open or preview is left as-is.
       }
@@ -1240,9 +1482,12 @@ export class Document {
     // Bump first, unconditionally: a checkout fetch may be in flight with
     // `_checkout` still null, and this is the signal that supersedes it when
     // it resolves.
-    this._checkoutGeneration += 1;
+    const generation = (this._checkoutGeneration += 1);
     if (this._checkout === null) return;
     const old = this._checkout;
+    // Symmetric with `_checkoutVersion`: snapshot before the active-source
+    // pointer moves, and return early nowhere between here and the rebind.
+    this._snapshotRootHandleKeys();
     this._checkout = null;
     // Re-point the app's handles back at the live doc and redraw them,
     // symmetrically with the checkout path, so the model returns to the live
@@ -1266,10 +1511,30 @@ export class Document {
     this._checkoutStreamSeqs = null;
     for (const openPromise of this._streamOpens.values()) {
       void openPromise
-        .then((stream) => stream._previewAt(undefined))
+        .then((stream) => {
+          // Each stream is reached a turn or more later, so a checkout the
+          // reader started in the meantime owns the document by now and this
+          // return would drag its streams back to the live head under it.
+          if (generation !== this._checkoutGeneration) return;
+          return stream._previewAt(undefined);
+        })
         .catch(() => {
           // A stream that failed to open has nothing to return.
         });
+    }
+  }
+
+  // Capture every root map handle's key set for the resync's removed-key diff,
+  // while the handles still describe the outgoing source. This is a phase of
+  // its own, ahead of `_rebindRootHandles`, because a handle resolves its
+  // container from its anchor but its paging state from this Document's active
+  // source: both must still name the outgoing source when the keys are read,
+  // and the caller moves the active-source pointer between the two calls.
+  // Callers must not return early in that window; a snapshot left unconsumed
+  // would be diffed against a later, unrelated swap.
+  private _snapshotRootHandleKeys(): void {
+    for (const entry of this._rootHandles.values()) {
+      if (entry.kind === 'map') snapshotRootMapKeys(entry.handle);
     }
   }
 
@@ -1289,7 +1554,7 @@ export class Document {
       if (entry.kind === 'map') {
         rebindRootMapAnchor(entry.handle, source.getMap(entry.key));
       } else {
-        rebindRootListAnchor(entry.handle, source.getList(entry.key));
+        rebindRootListAnchor(entry.handle, source.getMovableList(entry.key));
       }
     }
     for (const entry of this._rootHandles.values()) {
@@ -1419,11 +1684,8 @@ export class Document {
     this._sourceBlobFetcher = fetcher;
   }
 
-  // Publish this document's current state back to its drive source.
-  // Lets an app code one line on save / on a commit button to make its
-  // edits visible to people working outside Brass on the same source:
-  //
-  //   await doc.pushToDrive({ message: 'Wall move' });
+  // Publish this document's current state back to its drive source,
+  // driving the hosted toolbar's publish control.
   //
   // The platform publishes the doc's current state, overwriting the
   // source (unknown drive fields preserved), and marks its own write so
@@ -1431,6 +1693,7 @@ export class Document {
   // concurrent drive-side edits. Throws on auth / link / write
   // failures; resolves with the new external ref and the published
   // entity count.
+  /** @internal */
   async pushToDrive(
     input?: PushToDriveInput,
   ): Promise<PushToDriveResult> {
@@ -1447,10 +1710,9 @@ export class Document {
   }
 
   // Resolve a `behind` / `diverged` drive-linked doc by opening the
-  // hosted resolution surface, so an app can offer pull (take the source)
-  // / keep both alongside the publish-over that `pushToDrive` does:
-  //
-  //   if (doc.driveStatus?.state === 'diverged') await doc.resolveDrive();
+  // hosted resolution surface, which offers pull (take the source) / keep
+  // both alongside the publish-over that `pushToDrive` does. Driven by the
+  // hosted toolbar.
   //
   // Unlike `pushToDrive`, the resolution can mint a NEW mirror doc that
   // takes over the drive link (take-source trashes this doc, keep-both
@@ -1460,6 +1722,7 @@ export class Document {
   // returned `newDocId` lets a multi-doc app do its own switch. Resolves
   // with the outcome, or `null` when the user dismissed the dialog.
   // Throws when there is no doc identity or no resolver is attached.
+  /** @internal */
   async resolveDrive(): Promise<DriveResolveResult | null> {
     this._assertOpen();
     if (this._docId === null) {
@@ -1517,6 +1780,9 @@ export class Document {
   private _streamRuntime: StreamRuntime | null = null;
   private _streamManifest: Map<string, DocumentStreamInfo> | null = null;
   private readonly _streamOpens = new Map<string, Promise<DocumentStream>>();
+  // The subset of `_streamOpens` that has resolved, so a park reaches them
+  // without waiting on a microtask. Kept in step with the map above.
+  private readonly _openStreams = new Map<string, DocumentStream>();
   private _ownStream: DocumentStream | null = null;
   // Which stream this Document's own handles read. An open names a stream
   // and the usual one has a default, so `default` is a name here rather
@@ -1602,16 +1868,33 @@ export class Document {
       // the same point in time rather than showing it live under a
       // historical default.
       if (this._checkout !== null) {
-        await stream._previewAt(this._checkoutStreamSeqs?.[info.line_id]);
+        await stream._previewAt(this._checkoutStreamSeqs?.[info.line_id], true);
       }
       return stream;
     })();
     this._streamOpens.set(name, open);
-    // A failed open (network, deleted stream) must not poison the cache:
-    // drop it so the next call retries.
-    open.catch(() => {
-      if (this._streamOpens.get(name) === open) this._streamOpens.delete(name);
-    });
+    // Hold the RESOLVED stream too. A park has to reach the streams
+    // synchronously (an app's `close()` returns before any microtask runs, and
+    // a remote op landing in between would still call the app back), and a
+    // promise cannot be read that way. An open still in flight when the park
+    // happens resolves into a parked document, so it is parked on arrival.
+    void open.then(
+      (stream) => {
+        if (this._streamOpens.get(name) !== open) return;
+        this._openStreams.set(name, stream);
+        // `savingCount` counts this stream from here on, so an indicator bound
+        // to the document has to hear the stream's writes land.
+        stream._inner._observeSavingCount(() => {
+          this._fireSubscribers({ kind: 'saving-count' });
+        });
+        if (this._suspended) stream._suspend();
+      },
+      () => {
+        // A failed open (network, deleted stream) must not poison the cache:
+        // drop it so the next call retries.
+        if (this._streamOpens.get(name) === open) this._streamOpens.delete(name);
+      },
+    );
     return open;
   }
 
@@ -1683,13 +1966,43 @@ export class Document {
   // Close every opened stream's own transport + state. Streams opened
   // while this Document was live do not outlive it.
   private _closeStreams(): void {
+    // A stream that has already opened closes IN THIS CALL, for the reason the
+    // park reaches them through this map: `close()` returns to the app before
+    // any microtask runs, so a stream closed on a `.then` spends the rest of
+    // that turn taking writes and calling the app back while `doc.mutate` on
+    // the same document already refuses. A write in that window reaches a
+    // transport about to be torn down and is never persisted.
+    for (const stream of this._openStreams.values()) {
+      stream._inner._observeSavingCount(null);
+      stream._close();
+    }
+    // An open still in flight has no Document to close yet, so it closes on
+    // arrival. A stream reached both ways is closed twice, which is a no-op.
     for (const open of this._streamOpens.values()) {
       void open.then((s) => s._close()).catch(() => {
         // A failed open has nothing to close.
       });
     }
     this._streamOpens.clear();
+    this._openStreams.clear();
     this._streamManifest = null;
+  }
+
+  // Park / unpark the streams opened off this document, alongside the
+  // document's own park.
+  //
+  // A non-default stream is its own Document, which nothing else suspends: it
+  // keeps its transport, so an app holding `await doc.stream(name)` across
+  // `doc.close()` would go on receiving remote-op callbacks and could still
+  // write through the stream, while `doc.mutate` correctly throws. That is the
+  // cross-session callback a park exists to stop, plus a write path around the
+  // closed check. The default stream's inner IS this document, which owns its
+  // own lifecycle, so `_ownsInner` gates this exactly as it gates the close.
+  private _setStreamsSuspended(suspended: boolean): void {
+    for (const stream of this._openStreams.values()) {
+      if (suspended) stream._suspend();
+      else stream._resume();
+    }
   }
 
   // Seal a deliberate checkpoint on this document's version-
@@ -1767,6 +2080,14 @@ export class Document {
     else console.error('[Brass]', err);
   }
 
+  /** @internal Report a failure from the SDK's own chrome (the version
+   * bar's intents) through the same sink the built-in commands use, so a
+   * refused checkout reaches the app's `onError` rather than being dropped
+   * on the way back to a surface that only shows the reader a state. */
+  _reportChromeError(err: Error): void {
+    this._reportError(err);
+  }
+
   // Fire all `subscribe` listeners with a synthetic event. Used for
   // metadata-only changes (checkout, return-to-head, branch switch,
   // branches list update, saving count change, commands change)
@@ -1775,21 +2096,127 @@ export class Document {
   // call `toJSON()` in the handler; the discriminant is there for
   // the rare consumer that wants to branch on the reason.
   private _fireSubscribers(event: SyntheticSubscribeEvent): void {
+    // Every change to the outstanding-op map reports itself here, which
+    // makes this the one place the unload guard has to hear about un-acked
+    // work (`close()` releases the doc outright).
+    if (event.kind === 'saving-count') {
+      // Own ops rather than `savingCount`: a stream's inner Document registers
+      // itself, so the registry's total already carries one entry per stream.
+      trackUnsavedWork(this, this._outstandingByClientId.size);
+      this._savingCountObserver?.();
+    }
     this._ensureLoroSubscribed();
     this._subs.emit(event);
   }
 
-  // Saving indicator: number of locally-issued ops not yet acked by
-  // the server. Reactive: `subscribe` fires when this count changes
-  // (an op is sent or an `op_ack` lands). Apps bind directly inside
-  // the subscribe handler:
+  // Told when this Document's outstanding-op count moves, so a parent
+  // Document's `savingCount` covers the streams it has open and its
+  // subscribers fire when a stream's writes land. One observer, because a
+  // stream's inner Document is opened by, and belongs to, exactly one parent.
+  private _savingCountObserver: (() => void) | null = null;
+
+  /** @internal */
+  _observeSavingCount(observer: (() => void) | null): void {
+    this._savingCountObserver = observer;
+  }
+
+  // Saving indicator: number of locally-issued ops not yet acked by the
+  // server, across this document's own state and every stream it has open. A
+  // partitioned document keeps its bulk on its streams, so a count that named
+  // the default stream alone reports "All changes saved" over a stream still
+  // writing. Reactive: `subscribe` fires when this count changes (an op is
+  // sent or an `op_ack` lands, on any of them). Apps bind directly inside the
+  // subscribe handler:
   //
   //   doc.subscribe(() => {
   //     savingEl.textContent =
   //       doc.savingCount === 0 ? 'All changes saved'
   //                             : `Saving ${doc.savingCount} change${doc.savingCount === 1 ? '' : 's'}...`;
   //   });
+  //
+  // Only this count aggregates. `readOnly` and `atCapacity` gate `doc.mutate`,
+  // which writes this document's own state, so folding another stream's
+  // refusal into them would close an editor over a stream taking writes;
+  // `stream.readOnly` / `stream.atCapacity` answer for one stream.
+  // Supplied by the doc transport, which holds the sync state this reports.
+  // Absent until a transport is wired (a read-only or detached Document),
+  // where the honest answer is that nothing is outstanding.
+  private _diagnosticsProvider: (() => DocSyncDiagnostics) | null = null;
+
+  /** @internal */
+  _setDiagnosticsProvider(provider: () => DocSyncDiagnostics): void {
+    this._diagnosticsProvider = provider;
+  }
+
+  /**
+   * How this document's sync is going, as the client sees it: how much is
+   * outstanding, how long it has been, over which transport, across how many
+   * reconnects, and under which correlator, which is what separates a
+   * connection that is answering nothing from one that is merely behind.
+   *
+   * @internal Telemetry for Brass's own surfaces. An app reads `savingCount`
+   * to know a save is outstanding, and the SDK resolves a stuck one itself.
+   */
+  diagnostics(): DocSyncDiagnostics {
+    const own: DocSyncDiagnostics = this._diagnosticsProvider?.() ?? {
+      unackedOps: 0,
+      oldestUnackedMs: 0,
+      oldestClientOpId: null,
+      reconnects: 0,
+      lastAckAgeMs: null,
+      inFlightBytes: 0,
+      httpOpsInFlight: 0,
+      healRounds: 0,
+      hidden: false,
+    };
+    // Cover the streams this document opened, the way `savingCount` does: a
+    // reader watching a save waits on the document, and which line an op was
+    // written to is not something they can act on. The work counters add
+    // up and the waiting ones take the longest wait, so the answer is about
+    // the oldest edit anywhere in the document.
+    //
+    // The connection counters are the parent's alone rather than a fold,
+    // because every line rides one socket, so reconnects and page
+    // visibility are one fact about the client and not one per line.
+    for (const stream of this._openStreams.values()) {
+      const line = stream._inner.diagnostics();
+      own.unackedOps += line.unackedOps;
+      own.inFlightBytes += line.inFlightBytes;
+      own.httpOpsInFlight += line.httpOpsInFlight;
+      own.healRounds = Math.max(own.healRounds, line.healRounds);
+      // Take the stream's op when it waited longer, and also when this
+      // document has none of its own: a strict comparison against a zero
+      // wait leaves the fold reporting outstanding work while naming no op
+      // to go looking for, which is the field the rest hangs off.
+      if (
+        line.oldestClientOpId !== null &&
+        (own.oldestClientOpId === null ||
+          line.oldestUnackedMs > own.oldestUnackedMs)
+      ) {
+        own.oldestUnackedMs = line.oldestUnackedMs;
+        own.oldestClientOpId = line.oldestClientOpId;
+      }
+    }
+    return own;
+  }
+
   get savingCount(): number {
+    let total = this._ownSavingCount;
+    // `_openStreams` holds the streams that opened their own line. The stream
+    // this Document IS wraps `this`, and is not in it, so nothing is counted
+    // twice.
+    for (const stream of this._openStreams.values()) {
+      total += stream._inner.savingCount;
+    }
+    return total;
+  }
+
+  // The ops issued against THIS line, which is what a stream reports for
+  // itself: `doc.stream('default')` wraps this Document, so a default stream
+  // reading the aggregate would report a sibling stream's writes as its own
+  // and stand at "saving" while its own line has nothing outstanding.
+  /** @internal */
+  get _ownSavingCount(): number {
     return this._outstandingByClientId.size;
   }
 
@@ -1806,7 +2233,52 @@ export class Document {
     // once every chunk of the push has drained.
     this._resyncPushClientOpIds.delete(clientOpId);
     if (wasTracked) this._fireSubscribers({ kind: 'saving-count' });
+    // An ack is proof the branch is taking writes again, which is the only
+    // thing that can clear the capacity latch. A full branch refuses every
+    // op, so no ack can arrive while the refusal stands; that is what makes
+    // this evidence rather than a guess, and what keeps it from clearing a
+    // state the next write would re-enter.
+    if (this._atCapacity) {
+      this._atCapacity = false;
+      this._fireSubscribers({ kind: 'capacity' });
+    }
     return wasTracked;
+  }
+
+  // Internal: turn this Document read-only because the server refused a
+  // write on the reader's authority rather than on the op. It lands on
+  // `readOnly` because that is the gate an app already renders, so a grant
+  // withdrawn mid-session closes the editor with no new signal to learn.
+  // One-way: the socket resolves write authority when it subscribes, so a
+  // grant restored afterwards is refused by the server too until the
+  // connection recycles, and a reopen is what picks the wider grant up.
+  /** @internal */
+  _markReadOnly(reason: ReadOnlyReason): void {
+    if (this._forcedReadOnly) return;
+    this._forcedReadOnly = true;
+    this._readOnlyReason = reason;
+    this._fireSubscribers({ kind: 'commands' });
+    this._maybeFireUndoState();
+  }
+
+  /**
+   * Return this copy to what the platform holds, discarding anything it
+   * refused. A refused change stays drawn on the copy that made it and
+   * nowhere else, and no local operation removes it (a CRDT merges rather
+   * than replaces, and an undo inverts an operation instead of discarding
+   * it), so the only state holding exactly what the platform has is one
+   * built from it.
+   *
+   * The session closes this document and opens the same id again, so a
+   * `session.subscribe` handler rebinds the way it does on any document
+   * switch.
+   *
+   * @internal The SDK drives this itself on the one refusal that reaches it,
+   * telling the reader first, because an app that renders nothing for it is
+   * exactly the case that must not leave someone on a diverged copy.
+   */
+  reload(): void {
+    this._markGone('moved');
   }
 
   // Internal: forget an outstanding op the server TERMINALLY rejected (an
@@ -1817,14 +2289,75 @@ export class Document {
   // app can react (the optimistic local commit stays applied but never
   // persists, so the app's cue is to reload). Returns true if it was tracked.
   /** @internal */
-  _failOutstandingOp(clientOpId: string, message: string): boolean {
+  _failOutstandingOp(
+    clientOpId: string,
+    message: string,
+    // Whether the app hears about this one. A refusal that describes the
+    // DOCUMENT answers every op in flight at once, so reporting per op tells
+    // the reader the same thing as many times as they happened to have
+    // unacked writes, which on a bulk write is dozens. The caller reports it
+    // once instead; the op still leaves the tracker either way, because
+    // `savingCount` has to fall whether or not anyone is told.
+    opts: { report?: boolean } = {},
+  ): boolean {
     const wasTracked = this._outstandingByClientId.delete(clientOpId);
     this._resyncPushClientOpIds.delete(clientOpId);
     if (wasTracked) {
       this._fireSubscribers({ kind: 'saving-count' });
-      this._reportError(new Error(message));
+      if (opts.report !== false) this._reportError(new Error(message));
     }
     return wasTracked;
+  }
+
+  // Internal: whether this op is one the durability handshake pushed, rather
+  // than one the app wrote. The transport reads it to tell a refusal the heal
+  // itself provoked from one that arrived on its own, which is what keeps a
+  // refused heal chunk from re-arming the heal that sent it.
+  /** @internal */
+  _isResyncPushOp(clientOpId: string): boolean {
+    return this._resyncPushClientOpIds.has(clientOpId);
+  }
+
+  private _atCapacity = false;
+
+  /**
+   * Whether the document has stopped accepting new changes because it has
+   * reached the largest size the platform can keep.
+   *
+   * Read from the server's refusal of a write rather than predicted locally,
+   * so it turns true at the first edit that does not land, and back to false
+   * on the first edit that does. Both directions are evidence: a full branch
+   * refuses every op, so an ack cannot arrive while the refusal stands.
+   *
+   * Edits keep applying to the local copy while it is true, which is what
+   * lets the app show the reader what they did alongside the fact that it is
+   * not saved; the copy is discarded on reload.
+   *
+   * An app reads this to stop offering work that would only be refused (a
+   * bulk import, a generate pass) and to say so once, instead of surfacing one
+   * error per rejected op.
+   */
+  get atCapacity(): boolean {
+    return this._atCapacity;
+  }
+
+  // Internal: record the capacity verdict from a server refusal. Idempotent.
+  // Cleared again by `resolveOutstandingOp`, so a branch whose compaction
+  // seals it back under the ceiling reaches the open reader through the next
+  // write that lands rather than only through a reload.
+  /**
+   * Returns whether this call is the one that flipped it, which is what lets
+   * the transport report the refusal exactly once. Every op in flight draws
+   * the same refusal, and a bulk write has as many of those as it has unacked
+   * writes, so the flip is the only moment worth telling the app about.
+   *
+   * @internal
+   */
+  _markAtCapacity(): boolean {
+    if (this._atCapacity) return false;
+    this._atCapacity = true;
+    this._fireSubscribers({ kind: 'capacity' });
+    return true;
   }
 
   private _ensureLocalUpdatesSubscribed(): void {
@@ -1843,14 +2376,43 @@ export class Document {
       // actually flushes (the WS client may queue the frame).
       const copy = new Uint8Array(bytes.byteLength);
       copy.set(bytes);
-      const clientOpId = hook(copy);
-      this._outstandingByClientId.set(clientOpId, copy);
-      // The local mutate has already fired `subscribe` (the Loro
-      // event), but `savingCount` just incremented; fire one more
-      // synthetic event so a subscribe handler bound on `savingCount`
-      // sees the change.
-      this._fireSubscribers({ kind: 'saving-count' });
+      const chunks = this.splitLocalUpdate(copy);
+      if (chunks === null) {
+        this._shipLocalOp(copy);
+        return;
+      }
+      // In order: each chunk continues the one before it, so a peer applying
+      // them out of sequence holds the tail unapplied until the gap closes.
+      for (const chunk of chunks) this._shipLocalOp(chunk);
     });
+  }
+
+  // Hand one op blob to the transport and count it as unsaved, or keep it
+  // local when the server has evicted this document.
+  //
+  // A gone document still takes edits by design: it stays open so the app can
+  // render its own "no longer available" state, and the person may keep
+  // interacting until they navigate. Those edits have nowhere to land. The
+  // transport dropped its retry machinery on `doc_gone`, and the frame would
+  // ship onto a subscription the server evicted and come back as a `forbidden`
+  // that describes nothing the app did. Counting them is the part that shows:
+  // each one adds to `savingCount` for a save that cannot happen, so the doc
+  // reports "no longer available" and "Saving 3 changes..." together and
+  // re-arms the leave-site prompt `_markGone` just released.
+  //
+  // Returns the minted `client_op_id`, or null when the op stayed local.
+  private _shipLocalOp(copy: Uint8Array): string | null {
+    const hook = this._localOpHook;
+    if (!hook) return null;
+    if (this._gone.reason !== null) return null;
+    const clientOpId = hook(copy);
+    this._outstandingByClientId.set(clientOpId, copy);
+    // The local mutate has already fired `subscribe` (the Loro
+    // event), but `savingCount` just incremented; fire one more
+    // synthetic event so a subscribe handler bound on `savingCount`
+    // sees the change.
+    this._fireSubscribers({ kind: 'saving-count' });
+    return clientOpId;
   }
 
   // Lazy-attach the underlying LoroDoc subscriber. **Do not** wire this
@@ -1873,7 +2435,17 @@ export class Document {
       // One channel: every event reaches every subscriber, whatever
       // produced it. The app reconciles by value and reads the cause off
       // the event only when it has a non-render reason to.
-      this._subs.emit(event);
+      //
+      // What reaches a subscriber is this SDK's own `{ kind, source }`, not
+      // the engine's event object. An app that receives the engine's shape
+      // can read its internals (container ids, peer ids, the raw diff) and
+      // build on them, which pins the storage engine through a surface that
+      // never promised it. The cause survives as `source`, the same
+      // engine-neutral vocabulary the handle surface reports.
+      this._subs.emit({
+        kind: 'change',
+        source: changeSourceOf(event),
+      } satisfies SyntheticSubscribeEvent);
       const isLocalCommit = (event as { by?: unknown }).by === 'local';
       this._maybeFireUndoState();
       // A local commit (mutate / undo / redo) schedules a debounced
@@ -1897,12 +2469,12 @@ export class Document {
   // construction stays cheap.
   //
   // `cb` fires for EVERY change, whatever produced it: a local `mutate()`,
-  // a remote `import`, `undo`, `redo`, `checkout`, and the SDK's synthetic
-  // metadata events (saving-count, branches, commands). One channel; the
-  // app re-reads / reconciles in the handler and branches on the event only
-  // when it needs the cause. CRDT-origin events keep their Loro shape and
-  // carry `by` / `origin` so the cause is recoverable; the engine-neutral
-  // `origin.source` lives on the handle surface.
+  // a remote op, `undo`, `redo`, a history move, and the SDK's own metadata
+  // events (saving-count, branches, commands). One channel; the app re-reads
+  // / reconciles in the handler and branches on `event.kind` only when it
+  // needs the cause. A content change arrives as
+  // `{ kind: 'change', source }`, carrying the same engine-neutral `source`
+  // the handle surface reports.
   subscribe(cb: DocumentSubscriber): DocumentUnsubscribe {
     this._assertOpen();
     this._ensureLoroSubscribed();
@@ -1988,10 +2560,10 @@ export class Document {
   // The Document is NOT auto-closed; callers may want to render a
   // "the document was deleted" overlay before closing. Disable any
   // pending mutations in the listener and call `close()` when ready.
-  // Mutations after `_markGone` still mutate the local CRDT and call
-  // the `LocalOpHook`, but the server will reject those op frames
-  // (the SUB# row was evicted at fanout time); the SDK consumer
-  // sees the rejection via the underlying transport's error channel.
+  // Mutations after `_markGone` still mutate the local CRDT, and stay
+  // local: `_shipLocalOp` keeps them off the transport and out of
+  // `savingCount`, so this one notice is what the app hears about the
+  // eviction rather than a refusal per later edit.
   onGone(cb: DocumentGoneListener): DocumentGoneUnsubscribe {
     // Guard like `subscribe` / `subscribeUndoState`: `_suspend` clears these
     // signals' listeners so a stale handle from a parked session does not
@@ -2035,10 +2607,27 @@ export class Document {
   // false`) is retained so a late `onStatus` subscriber still sees the
   // final state.
   /** @internal */
-  _emitStatus(status: DocumentWorkStatus): void {
+  _emitStatus(
+    status: DocumentWorkStatus,
+    opts?: {
+      // The caller imported the document's content immediately before this
+      // emit, so the work delivered what it promised whatever the terminal
+      // frame says.
+      contentLoaded?: boolean;
+    },
+  ): void {
     // A late reload/reconcile closure that resolved after `close()` must not
     // re-emit onto a torn-down doc (its undo stack is freed below in `close`).
     if (this._closed) return;
+    // Terminal work that still reports itself as locking editing is inbound
+    // work that ended without content: the platform clears the status when
+    // hydration / extraction succeeds, so what it reports terminally is a
+    // failure. Anything else means the doc is either loading or holds what
+    // it has.
+    this._loadFailed =
+      opts?.contentLoaded !== true &&
+      status.pending === false &&
+      status.blocking === true;
     this._workStatus.emit(status);
     // A blocking work-status is one of the inputs to `canUndo` / `canRedo`
     // (via `_isLoadLocked`), so a status that engages or releases the load
@@ -2049,10 +2638,10 @@ export class Document {
   }
 
   // The current drive sync state of this document, or `null` when the
-  // doc is not linked to a drive source. The read-side companion to
-  // `doc.pushToDrive(...)`: an app reads `canPush` / `state` to decide
-  // whether to surface a "Publish" affordance, and renders the
-  // server-authored `label` / `detail` as the wording. Seeded on open
+  // doc is not linked to a drive source. An app reads `state` / `canPush`
+  // to tell the reader they have unpublished edits, and renders the
+  // server-authored `label` / `detail` as the wording; publishing itself
+  // is the hosted toolbar's control. Seeded on open
   // (for a drive-linked doc) and kept live as edits, refreshes, and
   // pushes move the state.
   get driveStatus(): DocumentDriveStatus | null {
@@ -2104,12 +2693,26 @@ export class Document {
 
   // Plain-JS projection of the current state.
   toJSON(): Record<string, unknown> {
+    this._assertNotClosed();
     // When in checkout, read from the preview LoroDoc so the app
     // renders the historical state. Returning to head clears
     // `_checkout` and reads go back to the live `_doc`.
     const source =
       this._checkout !== null ? this._checkout.previewDoc : this._doc;
-    return source.toJSON() as Record<string, unknown>;
+    const json = source.toJSON() as Record<string, unknown>;
+    // A paged root holds its records inside page entries beside the store's
+    // own edit bookkeeping, so flatten it to the same record lookup
+    // `doc.map(root).read()` hands back: a serializer and a whole-document
+    // renderer read this surface, and a store that crossed the paging
+    // threshold has to reach them as records. Every root is asked, because a
+    // root no handle was ever taken on is paged by the same rule as one that
+    // was; a root the marker does not name comes back as loro produced it.
+    for (const [rootKey, value] of Object.entries(json)) {
+      if (!isRootLookup(value)) continue;
+      if (!readRootPaged(source, rootKey)) continue;
+      json[rootKey] = flattenPagedLookup(value, true);
+    }
+    return json;
   }
 
   /**
@@ -2128,29 +2731,36 @@ export class Document {
   // in either caller. No-op when the durable frontier already covers the
   // local doc, while a prior resync push is still unacked, or when the
   // missing slice is too large to ship as one op (see the cap below).
+  //
+  // The return value says whether the caller may stop asking. `covered`
+  // means the durable frontier holds everything local does, so the
+  // handshake is finished; every other outcome leaves the doc diverged and
+  // is the caller's cue to run the handshake again once the push settles.
   /** @internal */
   maybeResyncPush(
     persistedSnapshotVersionVector: Uint8Array,
     durableTailBlobs: Uint8Array[],
-  ): void {
+  ): ResyncPushOutcome {
     // `computeResyncPush` reads `this._doc.version()` / `export()`; refuse on a
     // closed (freed) doc so a late `doc_ops_dropped` / periodic-reverify
     // closure can't touch freed WASM.
-    if (this._closed) return;
+    if (this._closed) return 'closed';
     // Loop guard: skip while any chunk of a prior push is still unacked,
     // so a flurry of reconnects cannot re-push the same missing slice.
     for (const id of this._resyncPushClientOpIds) {
-      if (this._outstandingByClientId.has(id)) return;
+      if (this._outstandingByClientId.has(id)) return 'in-flight';
     }
     const chunks = this.computeResyncPush(
       persistedSnapshotVersionVector,
       durableTailBlobs,
     );
-    if (chunks === null) return;
+    if (chunks === 'covered') return 'covered';
+    if (chunks === 'undecodable') return 'undecodable';
     for (const chunk of chunks) {
       const id = this.injectLocalUpdate(chunk);
       if (id !== null) this._resyncPushClientOpIds.add(id);
     }
+    return 'pushed';
   }
 
   // Given the server's persisted snapshot version vector and the op
@@ -2168,10 +2778,13 @@ export class Document {
   // case. `decodeImportBlobMeta` reads each blob's end vector from its
   // header without a full import, so this stays cheap.
   //
-  // Returns the chunks to resync-push, or null when the durable state
-  // already covers everything local holds (or a malformed vector / tail
-  // blob, which degrades the handshake to a no-op and warns rather than
-  // throwing out of the frame handler that drives the live transport).
+  // Returns the chunks to resync-push, `'covered'` when the durable state
+  // already holds everything local does, or `'undecodable'` for a malformed
+  // vector / tail blob, which degrades the handshake to a no-op and warns
+  // rather than throwing out of the frame handler that drives the live
+  // transport. `'undecodable'` is distinct from `'covered'` because it says
+  // nothing about whether the doc has diverged, so a caller healing a known
+  // divergence must keep asking.
   //
   // The common case is one chunk: an `update` export from the durable
   // frontier carries only the missing ops plus their dependencies, never
@@ -2183,11 +2796,47 @@ export class Document {
   // large divergence heals instead of being skipped. Import is idempotent
   // and order-independent (Loro buffers a chunk whose dependency is in a
   // sibling chunk until it arrives), so the chunks need no ordering.
+  /**
+   * Whether the durable snapshot holds changes by an author this doc has never
+   * heard from.
+   *
+   * Every author a client can hear from reaches it as ops, so a peer present
+   * in the durable frontier and absent from the local doc after the tail has
+   * applied is one whose changes exist only inside the snapshot. That is the
+   * platform having rewritten how the document stores what it stores
+   * (compaction's patch fold is the one thing that does this), which a client
+   * cannot merge with and cannot undo across: its undo stack inverts the
+   * operations it made, and the values those operations wrote now live
+   * somewhere else.
+   *
+   * The answer drives a re-import, which is the existing recovery for exactly
+   * this shape (`_applySnapshot` drops both stacks, so undo reports itself
+   * unavailable instead of silently reverting nothing).
+   *
+   * @internal
+   */
+  _snapshotHasUnseenAuthor(persistedSnapshotVersionVector: Uint8Array): boolean {
+    if (this._closed) return false;
+    let durable: VersionVector;
+    try {
+      durable = VersionVector.decode(persistedSnapshotVersionVector);
+    } catch {
+      // Undecodable says nothing, and the durability handshake already warns
+      // about it on the same frame.
+      return false;
+    }
+    const local = this._doc.version().toJSON();
+    for (const [peer, counter] of durable.toJSON()) {
+      if (counter > 0 && !local.has(peer)) return true;
+    }
+    return false;
+  }
+
   /** @internal */
   computeResyncPush(
     persistedSnapshotVersionVector: Uint8Array,
     durableTailBlobs: Uint8Array[],
-  ): Uint8Array[] | null {
+  ): Uint8Array[] | 'covered' | 'undecodable' {
     let durable: VersionVector;
     try {
       durable = VersionVector.decode(persistedSnapshotVersionVector);
@@ -2200,7 +2849,7 @@ export class Document {
         '[Brass] durability handshake skipped: could not decode the persisted version vector or a tail op blob',
         err,
       );
-      return null;
+      return 'undecodable';
     }
     const local = this._doc.version();
     const cmp = local.compare(durable);
@@ -2209,7 +2858,7 @@ export class Document {
     // undefined when the two are concurrent (local holds ops the server
     // lacks AND vice versa). Push in the ahead and concurrent cases; the
     // export from `durable` carries only the local-only ops either way.
-    if (cmp !== undefined && cmp <= 0) return null;
+    if (cmp !== undefined && cmp <= 0) return 'covered';
     // Common case: the whole missing slice fits in one frame. Keep this
     // path byte-identical to a plain `update` export so the no-chunking
     // case is unchanged.
@@ -2237,39 +2886,98 @@ export class Document {
   }
 
   // Recursively export the given ranges as one `updates-in-range` blob,
-  // splitting by op count until each blob is under the per-frame cap. An
-  // irreducible single op (one that alone exceeds the cap) is emitted up
-  // to the hard ceiling, or skipped with a warning beyond it so the loop
-  // never wedges on an un-sendable frame.
+  // splitting by op count until each blob is under the per-chunk cap.
+  //
+  // `dropOversizedSingle` decides what happens to an irreducible op (one that
+  // alone exceeds the cap and the hard ceiling). A resync drops it with a
+  // warning so the loop never wedges on an un-sendable frame while the rest
+  // of the slice heals. A local commit keeps it: it is an edit the app just
+  // made and nothing else will carry it, so it goes to the write path, which
+  // reports the refusal to the app rather than losing it silently.
+  private chunkRanges(
+    ranges: { peer: PeerID; from: number; to: number }[],
+    dropOversizedSingle: boolean,
+  ): Uint8Array[] {
+    const total = ranges.reduce((n, r) => n + (r.to - r.from), 0);
+    if (total === 0) return [];
+    const blob = this._doc.export({
+      mode: 'updates-in-range',
+      spans: ranges.map((r) => ({
+        id: { peer: r.peer, counter: r.from },
+        len: r.to - r.from,
+      })),
+    });
+    if (blob.byteLength <= RESYNC_PUSH_MAX_BYTES) return [blob];
+    if (total === 1) {
+      // A single op that cannot be split further.
+      if (blob.byteLength <= RESYNC_PUSH_HARD_MAX_BYTES) return [blob];
+      if (!dropOversizedSingle) return [blob];
+      console.warn(
+        `[Brass] durability resync skipped one op of ${blob.byteLength} bytes, over the ${RESYNC_PUSH_HARD_MAX_BYTES}-byte single-frame ceiling. The rest of the slice still heals; this op heals on a future snapshot-based recovery.`,
+      );
+      return [];
+    }
+    const [first, second] = splitRangesByLength(ranges, total);
+    return [
+      ...this.chunkRanges(first, dropOversizedSingle),
+      ...this.chunkRanges(second, dropOversizedSingle),
+    ];
+  }
+
   private chunkMissingSlice(
     local: VersionVector,
     durable: VersionVector,
   ): Uint8Array[] {
-    const pack = (
-      ranges: { peer: PeerID; from: number; to: number }[],
-    ): Uint8Array[] => {
-      const total = ranges.reduce((n, r) => n + (r.to - r.from), 0);
-      if (total === 0) return [];
-      const blob = this._doc.export({
-        mode: 'updates-in-range',
-        spans: ranges.map((r) => ({
-          id: { peer: r.peer, counter: r.from },
-          len: r.to - r.from,
-        })),
-      });
-      if (blob.byteLength <= RESYNC_PUSH_MAX_BYTES) return [blob];
-      if (total === 1) {
-        // A single op that cannot be split further.
-        if (blob.byteLength <= RESYNC_PUSH_HARD_MAX_BYTES) return [blob];
-        console.warn(
-          `[Brass] durability resync skipped one op of ${blob.byteLength} bytes, over the ${RESYNC_PUSH_HARD_MAX_BYTES}-byte single-frame ceiling. The rest of the slice still heals; this op heals on a future snapshot-based recovery.`,
-        );
-        return [];
+    return this.chunkRanges(this.missingRanges(local, durable), true);
+  }
+
+  // A local commit re-exported as several op blobs, or null to ship it whole.
+  //
+  // `mutate` bounds what one commit carries by committing as it goes, but a
+  // commit Loro makes for itself takes no such budget: `redo` replays a whole
+  // undo step, so a bulk write that correctly split into many ops comes back
+  // as one op the size of the entire write. Past `MAX_OP_BLOB_CHARS` that op
+  // is refused outright and the redone edit never persists, and below it, it
+  // still lands as a single large row on the document's one storage partition.
+  //
+  // The ops already exist, so the only lever left is which spans they ship in.
+  // The blob names the counter range it covers, and re-exporting a sub-range
+  // is what the durability resync already does, so the chunks are ordinary ops
+  // a peer applies in sequence.
+  //
+  // Splitting is abandoned unless EVERY chunk comes in under the cap. A commit
+  // holding one value nothing can split (a mesh, a large embedded body) would
+  // otherwise ship as a small chunk that lands and an irreducible one that the
+  // write path refuses, which puts a record on the server missing the field
+  // that made it large and leaves the two copies permanently apart. Whole, its
+  // refusal covers the whole edit and the app is told once.
+  private splitLocalUpdate(blob: Uint8Array): Uint8Array[] | null {
+    if (blob.byteLength <= RESYNC_PUSH_MAX_BYTES) return null;
+    let ranges: { peer: PeerID; from: number; to: number }[];
+    try {
+      const meta = decodeImportBlobMeta(blob, false);
+      const start = meta.partialStartVersionVector.toJSON();
+      ranges = [];
+      for (const [peer, to] of meta.partialEndVersionVector.toJSON()) {
+        const from = start.get(peer) ?? 0;
+        if (to > from) ranges.push({ peer, from, to });
       }
-      const [first, second] = splitRangesByLength(ranges, total);
-      return [...pack(first), ...pack(second)];
-    };
-    return pack(this.missingRanges(local, durable));
+    } catch {
+      // An undecodable blob is one this cannot describe in spans. Shipping it
+      // whole is what happens without this path at all.
+      return null;
+    }
+    const total = rangeOpCount(ranges);
+    if (total < 2) return null;
+    // The blob's own size names how many pieces to ask for, so the split does
+    // not rediscover that by halving.
+    const parts = Math.min(total, Math.ceil(blob.byteLength / RESYNC_PUSH_MAX_BYTES));
+    const chunks = splitRangesEvenly(ranges, parts).flatMap((piece) =>
+      this.chunkRanges(piece, false),
+    );
+    if (chunks.length < 2) return null;
+    if (chunks.some((c) => c.byteLength > RESYNC_PUSH_MAX_BYTES)) return null;
+    return chunks;
   }
 
   // Feed an op blob into the local-op send path as if it were a fresh
@@ -2283,14 +2991,9 @@ export class Document {
   /** @internal */
   injectLocalUpdate(blob: Uint8Array): string | null {
     this._ensureLocalUpdatesSubscribed();
-    const hook = this._localOpHook;
-    if (!hook) return null;
     const copy = new Uint8Array(blob.byteLength);
     copy.set(blob);
-    const clientOpId = hook(copy);
-    this._outstandingByClientId.set(clientOpId, copy);
-    this._fireSubscribers({ kind: 'saving-count' });
-    return clientOpId;
+    return this._shipLocalOp(copy);
   }
 
   // Internal: park the Document in the SDK cache. Clears app-side
@@ -2305,6 +3008,7 @@ export class Document {
   _suspend(): void {
     if (this._closed || this._suspended) return;
     this._suspended = true;
+    this._setStreamsSuspended(true);
     // A pending auto-checkpoint would otherwise fire against a parked
     // Document and silently no-op via the scheduler's guard.
     // Cancelling here keeps the timer count clean across long-lived
@@ -2347,6 +3051,7 @@ export class Document {
   /** @internal */
   _resume(): void {
     this._suspended = false;
+    this._setStreamsSuspended(false);
     // Pair of the `_suspend` presence gate: reopen the presence controller's
     // outbound path and re-advertise this client's cursor on the resumed open.
     // `_suspend` only closed the gate; without this the parked doc's presence
@@ -2387,6 +3092,7 @@ export class Document {
     this._currentSeqProvider = null;
     this._outstandingByClientId.clear();
     this._resyncPushClientOpIds.clear();
+    releaseUnsavedWork(this);
     this._subs.clear();
     this._undoStateSubs.clear();
     // Drop the signal listeners too, mirroring `_suspend()`. Their frames

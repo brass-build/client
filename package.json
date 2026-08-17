@@ -1,6 +1,6 @@
 {
   "name": "@brass-build/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Client SDK for Brass",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,7 +18,8 @@
     "./internal": {
       "types": "./dist/internal.d.ts",
       "import": "./dist/internal.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
@@ -40,7 +41,7 @@
   },
   "dependencies": {
     "fflate": "^0.8.3",
-    "loro-crdt": "^1.12.1"
+    "loro-crdt": "^1.13.0"
   },
   "devDependencies": {
     "typescript": "~6.0.0"
