@@ -17,7 +17,11 @@
 // 10-minute idle timeout (only client-originated frames do), and it is the
 // presence liveness signal (the server refreshes `last_seen` on each ping;
 // the staleness threshold is 3 missed heartbeats). The server replies
-// `pong`. A topic-less `{ type: 'error', reason: 'bad_message' }` is the
+// `pong`. The same interval notices a socket that has stopped carrying
+// anything at all (`SOCKET_SILENCE_LIMIT_MS`), since on an idle connection
+// it is the only thing running; such a socket is retired here so the
+// reconnect loop can replace it, because a dead path does not reliably close
+// itself. A topic-less `{ type: 'error', reason: 'bad_message' }` is the
 // server's catch-all rejection, so it is swallowed rather than surfaced (a
 // deploy without the `ping` handler answers a heartbeat with it) but never
 // counted as the connection working. Both are dropped.
@@ -103,6 +107,29 @@ const HEARTBEAT_INTERVAL_MS = 60_000;
 // rather than wrong: it parks, and returning to it clears the count. A
 // hidden page doing WORK is unaffected, because its ops draw `op_ack`.
 const HEARTBEAT_FIRST_MS = 10_000;
+// How long a socket may carry nothing at all before this client treats it as
+// gone. A dead path does not always close: when a phone changes network
+// neither end sends a FIN, so a socket that will never carry another byte
+// still reads as OPEN, and nothing downstream notices, because the reconnect
+// loop is driven by `close` and an op's resend goes out on the same socket.
+// ANY inbound frame answers this, not just the `pong` the reconnect count
+// credits: the question is whether the path still carries bytes. Two missed
+// replies plus slack, so one dropped `pong` is not enough.
+const SOCKET_SILENCE_LIMIT_MS = 150_000;
+// Spread added to that limit, because the condition is SHARED: the server
+// answers a `ping` after an awaited presence refresh and reap sweep, so its
+// replies slow under exactly the load that makes sockets fragile, and every
+// client goes silent at once. An unjittered threshold turns one degradation
+// into a synchronized wave of reconnects landing on a service already
+// shedding.
+//
+// Drawn PER SOCKET, not once per client. Clients that retire together
+// reconnect together, so their next silence window is tighter than the last;
+// a fixed per-client offset keeps its phase inside that convergence, where a
+// fresh draw on every open scatters the schedule the wave just aligned. Two
+// heartbeat intervals wide, since the check rides the 60s tick and a spread
+// under one tick is quantized away.
+const SOCKET_SILENCE_JITTER_MS = 120_000;
 // Cap on the frames held for one topic's unacked subscribe, matching the
 // `outboundQueue` bound. A disconnect rolls every wanted topic back to
 // `subscribing`, so both queues hold the same kind of mid-reconnect frame
@@ -218,6 +245,14 @@ export class BrassWsClient {
   // so a second outage after a recovery would go unreported for the life of
   // the process.
   private creditsThisSocket = 0;
+  // When this socket last carried anything inbound, set on open so a socket
+  // that never speaks is measured from the moment it opened. Zero while no
+  // socket is up, which stops a silence check firing against a connection
+  // that does not exist.
+  private lastInboundAt = 0;
+  // This socket's silence threshold, redrawn on every open. Held as state so
+  // one socket cannot move its own deadline every time the check looks at it.
+  private silenceLimitMs = SOCKET_SILENCE_LIMIT_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   // Sockets this client has opened. Every topic and every open document
   // rides this one socket, so the count is a fact about the client rather
@@ -617,6 +652,9 @@ export class BrassWsClient {
     this.connecting = false;
     this.socketsOpened += 1;
     this.creditsThisSocket = 0;
+    this.lastInboundAt = Date.now();
+    this.silenceLimitMs =
+      SOCKET_SILENCE_LIMIT_MS + Math.random() * SOCKET_SILENCE_JITTER_MS;
     // `socket_open` per topic: re-subscribes every wanted topic (in
     // subscription order) with a fresh retry grant, and prunes `tornDown`
     // leftovers. Runs before the outbound drain so the server sees the
@@ -649,6 +687,9 @@ export class BrassWsClient {
   }
 
   private onMessage(ev: MessageEvent): void {
+    // Stamped before the parse: garbage the server sent is still the server
+    // reaching us, and the path carrying bytes is the whole question.
+    this.lastInboundAt = Date.now();
     let frame: unknown;
     try {
       frame = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data));
@@ -757,6 +798,7 @@ export class BrassWsClient {
   private onClose(): void {
     this.stopHeartbeat();
     this.ws = null;
+    this.lastInboundAt = 0;
     // Held frames are tied to the connection's unacked subscribes;
     // `socket_closed` drops them and preserves wantedness for the replay.
     for (const topic of this.topics.keys()) {
@@ -917,11 +959,38 @@ export class BrassWsClient {
     // from the cadence without a second timer to keep in step.
     const arm = (delay: number): void => {
       this.heartbeatTimer = setTimeout(() => {
+        // The one thing running on an idle connection, so it is also what
+        // notices the socket stopped carrying anything.
+        if (this.socketHasGoneSilent()) {
+          this.dropSilentSocket();
+          return;
+        }
         this.sendIfOpen({ type: 'ping' });
         arm(HEARTBEAT_INTERVAL_MS);
       }, delay);
     };
     arm(HEARTBEAT_FIRST_MS);
+  }
+
+  private socketHasGoneSilent(): boolean {
+    if (!this.ws || this.lastInboundAt === 0) return false;
+    return Date.now() - this.lastInboundAt >= this.silenceLimitMs;
+  }
+
+  // Retire a socket the server has stopped answering on. `onClose` runs
+  // directly rather than being waited for: closing a dead path has nothing to
+  // complete the handshake with, so the socket can sit in CLOSING and never
+  // fire `close`, which is the state this exists to escape. Running the
+  // teardown first also lets the identity guard drop a late `close`, so the
+  // reconnect is scheduled once.
+  private dropSilentSocket(): void {
+    const dead = this.ws;
+    this.onClose();
+    try {
+      dead?.close();
+    } catch {
+      // Closing an already-dead socket is fine; the teardown already ran.
+    }
   }
 
   private stopHeartbeat(): void {

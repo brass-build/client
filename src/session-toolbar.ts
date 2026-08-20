@@ -19,7 +19,10 @@ import type { BrassUser } from './types.js';
 import type { Command, Document as BrassDocument } from './documents.js';
 import type { DocumentSession } from './session.js';
 import type { PresenceParticipant } from './presence.js';
-import type { DocumentDriveStatus } from './document-signals.js';
+import type {
+  DocumentDriveStatus,
+  DrivePublishTarget,
+} from './document-signals.js';
 import {
   createVersionBarFrame,
   type VersionBarDeps,
@@ -309,6 +312,10 @@ const CSS = `
 .b-drive-source { font-size:12px; color:var(--brass-accent); text-decoration:none; white-space:nowrap; }
 .b-drive-source:hover { text-decoration:underline; }
 .b-drive-detail { margin:0; padding:0 10px 6px; font-size:12px; color:var(--brass-fg-muted); }
+/* The drive rejecting a published file is the one line in this panel that
+   reports a problem, so it carries the danger tone rather than the muted one
+   every other line uses. */
+.b-drive-unreadable { margin:0; padding:0 10px 6px; font-size:12px; color:var(--brass-danger, #b3261e); }
 /* Historical-version preview bar: a full-width strip the toolbar shows below
    the bar whenever the active doc is previewing an earlier version. The strip
    itself is the platform-served version-bar iframe (the SDK owns only this
@@ -958,6 +965,7 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
   // document that was closed.
   let boundDoc: DocumentSession['document'] = null;
   let statusOff: (() => void) | null = null;
+  let publishOff: (() => void) | null = null;
 
   // A publish runs on a server worker and reaches `synced` only after the
   // worker (and, on a file-roundtrip, the drive's importer) confirms. In that
@@ -971,24 +979,111 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
   let publishing = false;
   let publishError = false;
   let publishTimer: ReturnType<typeof setTimeout> | null = null;
+  // Set on a click, cleared by the next publish-state frame. Between the two,
+  // the held state describes the PREVIOUS attempt, and rendering it would
+  // report the last failure over the publish just started.
+  let publishStateStale = false;
   let currentStatus: DocumentDriveStatus | null = null;
   const clearPublishing = (): void => {
     publishing = false;
+    // The stale mark is cleared with the hold it belongs to. It is otherwise
+    // cleared only by a publish-state frame, so a publish that draws none
+    // would leave the panel reading the target's resting sentence for the
+    // life of the document.
+    publishStateStale = false;
     if (publishTimer !== null) {
       clearTimeout(publishTimer);
       publishTimer = null;
     }
   };
 
+  // The panel for a document with no source item: the server's sentence about
+  // where the file lands, and the publish that puts it there. The first
+  // publish creates the artifact and makes the document its mirror, at which
+  // point the drive status arrives and the mirror panel above replaces this
+  // one.
+  const renderPublishOffer = (target: DrivePublishTarget): void => {
+    root.hidden = false;
+    // A document the drive has never received is as far out of sync as one
+    // whose edits have not been published, so the icon carries the same
+    // attention an `ahead` document's does. What separates them is what the
+    // panel offers, not how much the reader is told to look.
+    root.classList.add('has-changes');
+    root.classList.remove('is-broken');
+    const state = publishStateStale ? null : (boundDoc?._publishState ?? null);
+    const inFlight =
+      publishing || state?.publishing === true || target.publishing;
+    button.title = inFlight
+      ? 'Publishing...'
+      : state?.failed
+        ? `Publish to ${target.driveName} failed`
+        : `Publish to ${target.driveName}`;
+
+    const failed =
+      !inFlight && (state?.failed === true || target.publishFailed === true);
+
+    const rows: HTMLElement[] = [];
+    // One line, server-authored either way: the worker's phase copy while it
+    // runs, its account of the failure when it stopped, and the resting
+    // sentence otherwise. Marked as a problem when it is one, since nothing
+    // else in this panel distinguishes a document whose publish failed from
+    // one that has simply never published.
+    const p = el('p', failed ? 'b-drive-unreadable' : 'b-drive-detail');
+    p.textContent = inFlight
+      ? (state?.publishing === true ? (state.detail ?? 'Publishing...') : 'Publishing...')
+      : (state?.detail ?? target.detail);
+    rows.push(p);
+
+    const pub = el('button');
+    pub.type = 'button';
+    pub.disabled = inFlight;
+    pub.textContent = inFlight
+      ? 'Publishing...'
+      : publishError || failed
+        ? `Publish to ${target.driveName}, retry`
+        : `Publish to ${target.driveName}`;
+    pub.onclick = () => {
+      const doc = deps.session.document;
+      if (!doc) return;
+      publishError = false;
+      publishing = true;
+      publishStateStale = true;
+      // The same safety net the mirror panel keeps: a publish that neither
+      // errors nor lands leaves the panel offering the action again rather
+      // than held forever.
+      publishTimer = setTimeout(() => {
+        clearPublishing();
+        render(currentStatus);
+      }, PUBLISH_HOLD_MS);
+      render(currentStatus);
+      void doc.pushToDrive().catch(() => {
+        clearPublishing();
+        publishError = true;
+        render(currentStatus);
+      });
+    };
+    rows.push(pub);
+    pop.replaceChildren(...rows);
+  };
+
   const render = (status: DocumentDriveStatus | null): void => {
     currentStatus = status;
-    // Hidden only when the doc is not drive-linked.
+    // A document that mirrors nothing can still have somewhere to go: its
+    // project may be linked to a drive that takes it as a new file, which is
+    // what an upload into a linked project sits waiting for. Offer that
+    // publish here, so an app gets it by mounting this piece rather than by
+    // building a surface of its own.
     if (status === null) {
-      root.hidden = true;
-      menu.close();
-      clearPublishing();
-      root.classList.remove('has-changes', 'is-broken');
-      pop.replaceChildren();
+      const target = boundDoc?._publishTarget ?? null;
+      if (target === null) {
+        root.hidden = true;
+        menu.close();
+        clearPublishing();
+        root.classList.remove('has-changes', 'is-broken');
+        pop.replaceChildren();
+        return;
+      }
+      renderPublishOffer(target);
       return;
     }
     // The publish settles once the doc actually reaches synced; drop the
@@ -1054,6 +1149,15 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
       rows.push(p);
     }
 
+    // The drive could not read what the last publish delivered. Shown in the
+    // drive's own words, above the commands: the publish succeeded, so
+    // nothing else in this panel says anything is wrong.
+    if (status.sourceUnreadable) {
+      const warn = el('p', 'b-drive-unreadable');
+      warn.textContent = status.sourceUnreadable;
+      rows.push(warn);
+    }
+
     if (isPublishing) {
       // Held while the publish is in flight (a local click hold, or the doc's
       // pending work-status), until it reaches synced (see `isPublishing`).
@@ -1063,8 +1167,9 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
       pub.disabled = true;
       rows.push(pub);
     } else if (status.canPush) {
-      // `canPush` already encodes two-way + not broken + local edits, so this
-      // never offers a no-op publish.
+      // `canPush` already encodes two-way + not broken + local edits + a
+      // server-writable format, so this never offers a publish the server
+      // would refuse.
       const pub = el('button');
       pub.type = 'button';
       pub.textContent = publishError ? 'Publish failed, retry' : 'Publish changes';
@@ -1112,6 +1217,8 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
   function bind(): void {
     statusOff?.();
     statusOff = null;
+    publishOff?.();
+    publishOff = null;
     const doc = deps.session.document;
     if (!doc) {
       render(null);
@@ -1122,6 +1229,17 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
     // started from any surface (the dashboard card, the app) flips it and the
     // indicator holds "Publishing..." without a local click.
     statusOff = doc.onDriveStatus(render);
+    // The same signal for a document that mirrors nothing yet, which has no
+    // drive status to carry it: its first publish is the one that creates the
+    // artifact, and this is how its progress and its failure arrive.
+    publishOff = doc._onPublishState(() => {
+      publishStateStale = false;
+      // A publish the server has finished with ends the local click hold:
+      // holding "Publishing..." for the rest of it would report a push that
+      // is over as one still running.
+      if (!doc._publishState.publishing) clearPublishing();
+      render(currentStatus);
+    });
   }
 
   const onSession = (): void => {
@@ -1138,6 +1256,7 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
     destroy(): void {
       unsub();
       statusOff?.();
+      publishOff?.();
       clearPublishing();
       menu.destroy();
     },
@@ -1334,8 +1453,18 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       // left it checked out would leave an app read-only with nothing to
       // clear it. A document pinned to its version has no head to return to
       // and keeps showing it; `dismissedAt` is what keeps the bar dismissed.
+      // Once the return lands, the dismissal has nothing left to hold
+      // against: the doc is live, and a LATER pick of the same version in
+      // the history dialog is a fresh preview that must latch the bar (its
+      // pick sets only `version`, so a stale `dismissedAt` equal to it would
+      // otherwise leave the reader checked out, read-only, with no bar and
+      // no exit).
       if (doc && doc.version !== null) {
-        void attempt(doc, () => doc.returnToHead()).catch(() => {});
+        void attempt(doc, () => doc.returnToHead())
+          .then(() => {
+            if (session.document === doc) dismissedAt = undefined;
+          })
+          .catch(() => {});
       }
       hideBar();
     },

@@ -1,18 +1,17 @@
 // The ceilings an op can hit, measured before it is sent.
-//
-// Duplicated from the server's `frameExceedsWsLimit` / `op-blob.ts`
-// rather than imported: this package ships unbundled and can only import
-// its own relative files. The server owns the contract; these follow it.
 
-// A frame over this closes the connection, taking every other op and
-// presence down with it, and the reconnect re-sends the oversized frame, so
-// the document never saves anything. The transport also caps a message at
-// 128 KiB, but the frame binds first in a browser: it negotiates
+// The client's own SEND bound, deliberately smaller than the platform's
+// 128 KiB server-push bound: the two are different limits, not one shared
+// constant. A frame over this closes the connection, taking every other op
+// and presence down with it, and the reconnect re-sends the oversized
+// frame, so the document never saves anything. The transport also caps a
+// message at 128 KiB, but the frame binds first in a browser: it negotiates
 // `permessage-deflate` and Chromium sends a message as one frame, so what
 // gets through depends on how the op compresses (43,264 bytes for
 // incompressible base64, measured). Staying at the frame limit is what makes
 // the bound independent of the content.
-const WS_FRAME_MAX_BYTES = 32 * 1024;
+/** @internal Exported so a test can pin it against the server's bound. */
+export const WS_SEND_FRAME_MAX_BYTES = 32 * 1024;
 
 // Past this the blob is uploaded to storage and the write names the staged
 // object instead of carrying it. Set by what a request body delivers
@@ -43,7 +42,7 @@ export interface OpFrame {
  */
 export function opFrameExceedsWsLimit(frame: OpFrame): boolean {
   const envelopeChars = JSON.stringify({ ...frame, op_blob: '' }).length;
-  return envelopeChars + frame.op_blob.length > WS_FRAME_MAX_BYTES;
+  return envelopeChars + frame.op_blob.length > WS_SEND_FRAME_MAX_BYTES;
 }
 
 /** True when the blob is too large to ride in a request body, so it is

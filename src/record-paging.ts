@@ -232,16 +232,15 @@ const TOMBSTONE_PREFIX = `${RESERVED_KEY_PREFIX}x:`;
 
 /** Pack one stored value into a page triple. A `null` tag is what says the
  *  body IS the record: an app's map holds whatever the app assigned, which has
- *  no tag to split off. A codec's records arrive already split, and a codec
- *  tag is a string, so the two forms cannot be confused however a codec names
- *  its records. */
+ *  no tag to split off. A typed record arrives already split, and its tag is a
+ *  string, so the two forms cannot be confused whatever the tag says. */
 export function packWholeValue<B>(key: string, value: B): PackedRecord<B> {
   return [key, null, value];
 }
 
 /** Re-pack `value` in the same triple shape `packed` already uses, so a page
- *  rewritten in place keeps the form its readers expect: a codec's records
- *  stay a tag beside a body, and an app's stay one whole value. A streaming
+ *  rewritten in place keeps the form its readers expect: a typed record stays
+ *  a tag beside a body, and an app's stays one whole value. A streaming
  *  read visits a page's triples without unpacking them, so a rewrite that
  *  changed the shape would hand it the wrong half of the record. */
 export function repackRecord(
@@ -259,7 +258,7 @@ export function repackRecord(
 }
 
 /** The stored value a page triple carries: the value itself for a whole-value
- *  record, else the `{ type, params }` pair a codec split it into. */
+ *  record, else the `{ type, params }` pair a typed one was split into. */
 export function unpackRecord(packed: PackedRecord<unknown>): unknown {
   if (packed[1] === null) return packed[2];
   return { [TAG_FIELD]: packed[1], [BODY_FIELD]: packed[2] };
@@ -269,12 +268,12 @@ export function unpackRecord(packed: PackedRecord<unknown>): unknown {
  *  separately, or null when the triple packs a whole value that is not a
  *  record.
  *
- *  A page holds both forms: a codec packs a record it has already split into a
- *  tag and a body, and a map an app writes packs whatever the app assigned as
- *  one whole value. Both forms occur in ONE store, because an app's bulk add
- *  to a codec's record map seals its own pages, so a reader that took
- *  `packed[1]` for the tag would report every record those pages hold as
- *  having no type at all. */
+ *  A page holds both forms: a typed record is packed as the tag and body it
+ *  was already split into, and a map an app writes packs whatever the app
+ *  assigned as one whole value. Both forms occur in ONE store, because an
+ *  app's bulk add to a store of typed records seals its own pages, so a reader
+ *  that took `packed[1]` for the tag would report every record those pages
+ *  hold as having no type at all. */
 export function unpackRecordPair(
   packed: PackedRecord<unknown>,
 ): { tag: string; body: unknown } | null {
@@ -454,7 +453,7 @@ const WIDTH_SAMPLE = 256;
 /** Mean JSON bytes of a record body, over a stride sample of at most
  *  `WIDTH_SAMPLE` records, which is what `recordsPerPage` sizes a page
  *  against. `bodyOf` returns the value the caller will pack as the triple's
- *  body: a codec's records carry a tag beside a body, and an app's map packs
+ *  body: a typed record carries a tag beside a body, and an app's map packs
  *  its whole stored value (`packWholeValue`), so each caller weighs the bytes
  *  its own pages will hold.
  *
@@ -673,7 +672,7 @@ export function applyRecordPatches(
  * value and as the `(tag, body)` pair split out of it, and return all three
  * after the fold.
  *
- * A patch names the record's own fields, which for a codec record are
+ * A patch names the record's own fields, which for a typed record are
  * `type` and `params` together, so a reader that walks tag and body
  * separately has to re-split the result. Both readers of a paged store
  * (the flattening one and the streaming one) resolve patches through this

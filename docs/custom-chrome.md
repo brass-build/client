@@ -48,8 +48,10 @@ Each piece renders one cluster wired to `Brass.session` and returns
 - `Brass.mountPresenceRoster` renders the who's-here roster of
   coloured initials. It is the receiver half only: still publish your
   own presence state (see the README's "Presence").
-- `Brass.mountDriveSync` renders the drive-sync badge. It renders
-  nothing on a non-drive doc, so it is safe to mount in any header.
+- `Brass.mountDriveSync` renders the drive-sync badge: the sync state
+  and publish of a document linked to a drive, and the offer to publish
+  one its project's drive has not received yet. It carries the actions
+  the open document has, so it is safe in any header.
 - `Brass.mountAccountMenu` renders the account avatar menu (email, an
   Open Brass dashboard link, and sign out).
 

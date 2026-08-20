@@ -1,6 +1,7 @@
 import type { Document } from './documents.js';
 import type { DocumentSourceBlob } from './documents-namespace.js';
 import { BrassError } from './errors.js';
+import { whenSaved } from './when-saved.js';
 
 // The app's import half for a file Brass does not parse: given the stored
 // source file and the open document, parse the bytes and write the records
@@ -174,6 +175,7 @@ export function createImportRunner(deps: ImportRunnerDeps): ImportRunner {
         const stopWatchingWrites = doc.subscribe(() => {
           if (doc.savingCount > 0) wroteRecords = true;
         });
+        let saved = false;
         try {
           await run(source, doc);
           // The importer's ops are still in flight when it returns, and
@@ -181,19 +183,19 @@ export function createImportRunner(deps: ImportRunnerDeps): ImportRunner {
           // the head it lands on. Completing before they are acked stamps
           // a version below the records' own, which reads as a document
           // edited since it was uploaded from then on.
-          await whenSaved(doc);
+          saved = await whenSaved(doc);
         } finally {
           stopRefresh();
           stopWatchingWrites();
         }
-        // The wait above ends on the document going as well as on its writes
-        // draining, and only one of those means the records are stored. The
-        // completion stamps the document with the app's schema at the version
-        // it lands on, so running it over writes that never reached the server
-        // records an import of records the document does not hold. Abandoning
-        // instead leaves the claim to expire, and a client that is still open
-        // imports the file properly.
-        if (!doc._isLive) return;
+        // The wait ends on the document going, and on the acks stopping, as
+        // well as on the writes draining, and only the last of those means
+        // the records are stored. The completion stamps the document with the
+        // app's schema at the version it lands on, so running it over writes
+        // that never reached the server records an import of records the
+        // document does not hold. Abandoning instead leaves the claim to
+        // expire, and a client that is still open imports the file properly.
+        if (!saved) return;
         // An importer that returns without writing anything must not stamp the
         // document imported: the stamp is permanent, a later open reads
         // `already_imported`, and the file's records then have no path into a
@@ -268,53 +270,6 @@ export function createImportRunner(deps: ImportRunnerDeps): ImportRunner {
   }
 
   return runner;
-}
-
-// How often the wait below re-checks that the document is still live. A
-// closing document drops its subscribers without firing them, so this is the
-// only thing that ends the wait for one that goes mid-import; it runs solely
-// while an import's writes are draining.
-const SAVED_LIVENESS_POLL_MS = 1_000;
-
-// Resolves once the document has no locally-issued op waiting for its
-// server ack, or once the document is no longer live.
-//
-// The liveness half is not belt-and-braces. Closing a Document CLEARS its
-// subscribers rather than firing them, so a wait that watched the ack count
-// alone would never settle for a document closed with writes outstanding, and
-// the caller's `finally` (which stops renewing the platform's import claim)
-// would never run. Resolving here does not claim the writes landed: the
-// completion that follows is what asserts that, and it fails against a
-// document this client can no longer write.
-function whenSaved(doc: Document): Promise<void> {
-  if (doc.savingCount === 0) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    let off: (() => void) | undefined;
-    let poll: ReturnType<typeof setInterval> | undefined;
-    const settle = (): void => {
-      off?.();
-      if (poll !== undefined) clearInterval(poll);
-      resolve();
-    };
-    try {
-      off = doc.subscribe(() => {
-        if (doc.savingCount > 0) return;
-        settle();
-      });
-    } catch {
-      // The document closed, so nothing more is going to be acked.
-      resolve();
-      return;
-    }
-    poll = setInterval(() => {
-      if (doc._isLive && doc.savingCount > 0) return;
-      settle();
-    }, SAVED_LIVENESS_POLL_MS);
-    // Node keeps the process alive for a pending interval; this one is
-    // bookkeeping for a wait that ends on its own, so it must not.
-    (poll as { unref?: () => void }).unref?.();
-    if (doc.savingCount === 0) settle();
-  });
 }
 
 function asError(err: unknown): Error {

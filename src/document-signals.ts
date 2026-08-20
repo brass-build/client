@@ -45,8 +45,8 @@ export type DocumentStatusUnsubscribe = () => void;
 export type DocumentDriveTrackingState =
   | 'unhydrated'
   | 'synced'
-  | 'ahead'
   | 'behind'
+  | 'ahead'
   | 'diverged';
 
 // Which way the mirror flows. `two_way` links round-trip; `import_only` links
@@ -99,12 +99,43 @@ export interface DocumentDriveStatus {
   // the Publish affordance rather than re-deriving it. `detail` carries the
   // server-authored progress line while it is `true`.
   publishing: boolean;
+  /** The drive's own words about the file the last publish delivered, set
+   *  only where the drive answered that it could not read it. The publish
+   *  succeeded and the artifact exists; the drive's reader rejects it, which
+   *  a person otherwise meets as an error inside the drive. */
+  sourceUnreadable?: string;
 }
 
 export type DocumentDriveStatusListener = (
   status: DocumentDriveStatus,
 ) => void;
 export type DocumentDriveStatusUnsubscribe = () => void;
+
+// Where a document that mirrors nothing can be published: the drive its
+// project is linked to, which takes it as a NEW file. A drive-linked
+// document has `driveStatus` and no targets; this is the state before the
+// first publish, which is what a document added to a linked project (an
+// upload, or one an app created there) sits in.
+//
+// Words are server-authored (`detail`, rendered verbatim), as everywhere
+// else a drive is described.
+export interface DrivePublishTarget {
+  // Adapter type token; an app may key an icon off it.
+  driveType: string;
+  // The drive's user-facing name.
+  driveName: string;
+  // What the linked container is called on the drive, so a surface can say
+  // where the file lands.
+  containerName: string;
+  // The sentence a publish affordance renders, verbatim.
+  detail: string;
+  // True while a publish is in flight, so the affordance holds rather than
+  // inviting a second artifact.
+  publishing: boolean;
+  // The last publish attempt failed, in which case `detail` carries the
+  // server's account of why rather than the resting sentence.
+  publishFailed: boolean;
+}
 
 // Each signal is a `createEmitter` composed with the retain / attach / dedup
 // policy its wire event needs, wrapped in a small class only to keep the
@@ -208,6 +239,86 @@ export class DriveStatusSignal {
   }
 }
 
+// How the publish of a document that mirrors nothing is going. Server-
+// authored: `detail` replaces the target's resting sentence while present,
+// and is rendered verbatim.
+export interface DrivePublishState {
+  // A publish is running on the server.
+  publishing: boolean;
+  // The last publish attempt failed; `detail` says what the server made of
+  // it.
+  failed: boolean;
+  // The sentence to render, or null to fall back to the target's resting
+  // copy.
+  detail: string | null;
+}
+
+const RESTING_PUBLISH: DrivePublishState = {
+  publishing: false,
+  failed: false,
+  detail: null,
+};
+
+// Where an unlinked document can be published, and how its publish is going.
+//
+// The TARGETS are seeded from the join alone, because the set only changes
+// when the document becomes a mirror and the drive status arriving is that
+// event, so the open factory clears them when one does. The STATE moves
+// while the document is open: the first publish creates the artifact, so
+// until it lands there is no drive status to report progress or failure
+// through, and a `doc_drive_publish` frame carries it instead.
+export class DrivePublishTargetSignal {
+  private _target: DrivePublishTarget | null = null;
+  private _state: DrivePublishState = RESTING_PUBLISH;
+  private readonly _listeners = new Set<() => void>();
+
+  get target(): DrivePublishTarget | null {
+    return this._target;
+  }
+
+  get state(): DrivePublishState {
+    return this._state;
+  }
+
+  set(target: DrivePublishTarget | null): void {
+    this._target = target;
+    // The join states the same thing the frames do, so a reopen starts from
+    // the server's current answer rather than from the last frame's.
+    this._state = {
+      publishing: target?.publishing === true,
+      failed: target?.publishFailed === true,
+      detail: null,
+    };
+    this._notify();
+  }
+
+  setState(state: DrivePublishState): void {
+    this._state = state;
+    this._notify();
+  }
+
+  onState(cb: () => void): () => void {
+    this._listeners.add(cb);
+    return () => {
+      this._listeners.delete(cb);
+    };
+  }
+
+  // Paired with the other signals' method of the same name: a parked or
+  // closed Document must not reach an app callback registered by a session
+  // that is over.
+  clearListeners(): void {
+    this._listeners.clear();
+  }
+
+  // Both mutators notify. A reader renders the targets and the state
+  // together, so a change to either is a change to what it draws, and one
+  // silent mutator would leave that reader showing the other half.
+  private _notify(): void {
+    for (const cb of this._listeners) cb();
+  }
+}
+
 // Field-by-field equality for the drive status. The shape is flat (all
 // scalars), so a key compare suffices; explicit rather than JSON.stringify so
 // a future non-scalar field forces a conscious update here.
@@ -228,6 +339,7 @@ function driveStatusEqual(
     a.ref === b.ref &&
     a.refUpdatedAt === b.refUpdatedAt &&
     a.publishing === b.publishing &&
+    a.sourceUnreadable === b.sourceUnreadable &&
     a.itemName === b.itemName &&
     a.itemUrl === b.itemUrl
   );

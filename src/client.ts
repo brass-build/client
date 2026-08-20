@@ -76,6 +76,8 @@ import {
   createDocumentsNamespace,
   type DocumentsNamespace,
   type DocumentsInternalNamespace,
+  type PushToDriveInput,
+  type PushToDriveResult,
 } from './documents-namespace.js';
 import {
   createDocumentSession,
@@ -1133,6 +1135,40 @@ export class BrassClient {
     return null;
   }
 
+  // Publish a document to a drive, supplying the bytes when the platform has
+  // no writer for it.
+  //
+  // Where the export of this document runs in THIS app, the SDK runs the
+  // registered serializer in process and the push carries its bytes, rather
+  // than sending the reader through the hosted export frame. That is what
+  // makes a publish from inside an app one click, and it is the same on the
+  // publish that creates the drive file and on every push after it: the
+  // caller's own app either writes this document or it does not.
+  //
+  // Everything else is the route's, including refusing bytes from an app the
+  // exporter setting does not name, which it does by name rather than the
+  // client predicting it.
+  private async pushDocumentToDrive(
+    doc: Document,
+    input: PushToDriveInput,
+  ): Promise<PushToDriveResult> {
+    const docId = doc.id;
+    if (docId === null || !doc._exportRunsHere) {
+      return await this.docsInternal().pushToDrive(doc, input);
+    }
+    const serialized = await this.serializeForExport(docId);
+    if (!serialized.ok) {
+      throw new BrassError(
+        `This app could not write the document out to publish it: ${serialized.message}`,
+        { status: 400 },
+      );
+    }
+    return await this.docsInternal().pushToDrive(doc, {
+      ...input,
+      bytes: serialized.bytes,
+    });
+  }
+
   // Run the registered serializer for an export request from a hosted
   // surface. Resolves the doc from the open set (the active session doc is
   // the fallback for an app that drives it through the session), then hands
@@ -1218,8 +1254,7 @@ export class BrassClient {
         thumbnailUploader: (doc, image, width, height) =>
           docsNs.setThumbnail(doc, { image, width, height }),
         checkpointCreator: (doc) => docsInternal.createCheckpoint(doc),
-        drivePusher: (doc, input) =>
-          docsInternal.pushToDrive(doc, input),
+        drivePusher: (doc, input) => this.pushDocumentToDrive(doc, input),
         sourceBlobFetcher: (doc) => docsInternal.sourceBlob(doc),
         hostedUiProvider: {
           documentHistory: (docId, options) =>

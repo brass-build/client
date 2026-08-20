@@ -239,11 +239,25 @@ export function createVersionBarFrame(
     );
   }
 
+  // Intents still awaiting their answer. While one is in flight, `update()`
+  // stays quiet: the checkout it runs fires the host's subscribers before its
+  // promise resolves, so a render lands here ahead of `confirmIntent`, and an
+  // uncorrelated `version-changed` posted then reaches the embed as a phantom
+  // external move one message before the answer to its own step. The answer
+  // reads the live version at settle time, so nothing the quiet window saw is
+  // lost.
+  let intentsInFlight = 0;
+
   function runIntent(requestId: unknown, intent: () => Promise<void>): void {
-    void intent().then(
-      () => confirmIntent(requestId, true),
-      () => confirmIntent(requestId, false),
-    );
+    intentsInFlight += 1;
+    const settle = (ok: boolean) => (): void => {
+      // Decremented in every outcome. A count this leaves above zero silences
+      // `update()` for the life of the bar, so an external version change
+      // would never reach the embed again.
+      intentsInFlight -= 1;
+      confirmIntent(requestId, ok);
+    };
+    void intent().then(settle(true), settle(false));
   }
 
   function onMessage(event: MessageEvent): void {
@@ -336,7 +350,9 @@ export function createVersionBarFrame(
       }
       // Only an actual version change reaches the embed (dedup), so a
       // re-render that didn't move the version can't clobber the bar's state.
-      if (ready && next.version !== deliveredVersion) {
+      // A change while an intent is in flight is that intent's own doing and
+      // is delivered by its answer instead.
+      if (ready && intentsInFlight === 0 && next.version !== deliveredVersion) {
         deliveredVersion = next.version;
         iframe.contentWindow?.postMessage(
           { [EMBED_ENVELOPE]: EMBED_PROTOCOL_VERSION, type: 'version-changed', version: next.version },
@@ -346,6 +362,9 @@ export function createVersionBarFrame(
     },
     destroy(): void {
       destroyed = true;
+      // A bar torn down mid-intent leaves the count standing; a rebuilt bar
+      // gets a fresh closure, but this keeps the teardown total.
+      intentsInFlight = 0;
       if (readyTimer !== undefined) {
         clearTimeout(readyTimer);
         readyTimer = undefined;

@@ -6,6 +6,17 @@ and the package follows [semantic versioning](https://semver.org/spec/v2.0.0.htm
 While the version is below `1.0.0`, minor releases may introduce
 breaking changes.
 
+## 0.3.0
+
+### Added
+
+- Imported documents generate a thumbnail on first open. Apps already calling
+  `useCanvas` need no change.
+- Documents can be published into a connected project's drive, creating the
+  file there. Apps already mounting `Brass.mountDriveSync` get the action.
+- `doc.driveStatus.sourceUnreadable` carries the drive's own words when it
+  received a file it cannot read.
+
 ## 0.2.0
 
 ### Added

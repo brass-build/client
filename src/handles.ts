@@ -816,9 +816,10 @@ function wrapLoroListProxy(
 // reading / editing `doc.map('instances')` works unchanged. Only a root
 // the `meta` markers name reaches here.
 
-// A flattened entry: whatever the map stores under one key. A codec's record
-// store holds `{ type, params }`; an app's map holds whatever the app assigns,
-// which is any JSON value and which the paged path carries through unchanged.
+// A flattened entry: whatever the map stores under one key. A store of typed
+// records holds `{ type, params }`; an app's map holds whatever the app
+// assigns, which is any JSON value and which the paged path carries through
+// unchanged.
 // Deliberately not narrowed to an object: a write path that assumes fields is
 // what turns `5` into an empty container and `'hello'` into one entry per
 // character.
@@ -2034,8 +2035,8 @@ function rewritePage(
   const page = plainEntry(m, pageKey);
   if (page === undefined) return false;
   // The RAW triples, not the memo's unpacked records: a triple carries either
-  // a codec's tag beside its body or one whole value, and `repackRecord` needs
-  // the original to keep each one in the shape its readers expect.
+  // a tag beside a body or one whole value, and `repackRecord` needs the
+  // original to keep each one in the shape its readers expect.
   const held = decodePageRecords(page);
   if (held.length === 0) return false;
   const next = new Map(group);

@@ -94,10 +94,9 @@ export interface DocumentRecord extends DocumentSummary {
   // `organization_id`, so the hierarchy above the document can evolve
   // (folders / teams) without a client change.
   location_label: string | null;
-  // Whether someone can produce a file from this document: a platform
-  // codec, an opaque blob's stored bytes, or an app installed on the
-  // document's organization that declares an output for it. The server
-  // resolves it, so a newly exportable format needs no client change.
+  // Whether anything can produce a file from this document. The server
+  // resolves who would write it, so a newly exportable format needs no
+  // client change.
   downloadable: boolean;
 }
 
@@ -177,6 +176,11 @@ export interface DocumentCheckpoint {
 // changed" can read it). Omitted means no message.
 export interface PushToDriveInput {
   message?: string;
+  // The file's bytes, for a document the platform has no writer for: its
+  // own app serializes it. The SDK supplies these from the registered
+  // serializer, so nothing an app calls has to.
+  /** @internal */
+  bytes?: Uint8Array;
 }
 
 // Outcome of a successful push.
@@ -278,11 +282,11 @@ export interface DocumentsInternalNamespace {
     doc: Document,
     input?: PushToDriveInput,
   ): Promise<PushToDriveResult>;
-  // Fetch a presigned GET + descriptor for the original file behind an
-  // opaque-blob document, so an app that knows the format can download
-  // and parse it in-browser. Rejects with a `BrassError` when the doc is
-  // not a stored opaque blob or the caller cannot reach it (404). The
-  // per-doc instance method `doc.sourceBlob()` routes through this.
+  // Fetch a presigned GET + descriptor for the file a document was uploaded
+  // as, so an app that knows the format can download and parse it
+  // in-browser. Rejects with a `BrassError` when the document holds no such
+  // file or the caller cannot reach it (404). The per-doc instance method
+  // `doc.sourceBlob()` routes through this.
   sourceBlob(doc: Document): Promise<DocumentSourceBlob>;
   // The import-claim protocol behind `Brass.registerImporter`. The SDK
   // (never the app) claims the right to run the import of a stored
@@ -432,8 +436,14 @@ export function createDocumentsNamespace(
           { status: 400 },
         );
       }
-      const body: { message?: string } = {};
+      const body: {
+        message?: string;
+        content_base64?: string;
+      } = {};
       if (input?.message !== undefined) body.message = input.message;
+      if (input?.bytes !== undefined) {
+        body.content_base64 = bytesToBase64(input.bytes);
+      }
       const res = await apiFetch<PushToDriveResult>({
         method: 'POST',
         path: `/documents/${encodeURIComponent(docId)}/drive-sync/push`,

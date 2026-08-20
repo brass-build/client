@@ -57,6 +57,7 @@ import {
   GoneSignal,
   WorkStatusSignal,
   DriveStatusSignal,
+  DrivePublishTargetSignal,
   type DocumentGoneListener,
   type DocumentGoneReason,
   type DocumentGoneUnsubscribe,
@@ -68,6 +69,8 @@ import {
   type DocumentDriveStatusUnsubscribe,
   type DocumentDriveTrackingState,
   type DriveMirrorDirection,
+  type DrivePublishTarget,
+  type DrivePublishState,
 } from './document-signals.js';
 import {
   ThumbnailCapture,
@@ -78,6 +81,7 @@ import {
   CheckpointScheduler,
   type CheckpointCreator,
 } from './document-checkpoints.js';
+import { whenSaved } from './when-saved.js';
 import {
   BranchController,
   type BranchProvider,
@@ -120,6 +124,7 @@ export type {
   DocumentDriveStatusUnsubscribe,
   DocumentDriveTrackingState,
   DriveMirrorDirection,
+  DrivePublishTarget,
 };
 
 // The proxy callback receives an object with the root map (`entities`)
@@ -612,10 +617,25 @@ export class Document {
       this._fireSubscribers({ kind: 'branches' });
     },
   });
+  // The version of the newest picture the server holds of this document, or
+  // `null` for none. Seeded from the join and moved by this instance's own
+  // uploads; a picture older than the document's head is what arms the seed
+  // trigger, so a placeholder taken before the content arrived is replaced
+  // once it does.
+  private _thumbnailVersion: number | null = null;
   private readonly _thumbnails = new ThumbnailCapture({
+    // `_forcedReadOnly` and not the whole `readOnly`: the server refuses a
+    // thumbnail from a reader it will not take writes from, so a capture
+    // there costs a request and a warn to be told so. The load lock is the
+    // other half of `readOnly` and must NOT gate this, because a document
+    // still hydrating is exactly the one the seed watch is armed for, and
+    // the arm happens while that lock is still on.
     isCaptureAllowed: (): boolean =>
-      this._isLive && this._checkout === null,
+      this._isLive && this._checkout === null && !this._forcedReadOnly,
     isAttached: (): boolean => this._isLive,
+    onCaptured: (): void => {
+      this._thumbnailVersion = this.currentSeq ?? 0;
+    },
   });
   private readonly _checkpoints = new CheckpointScheduler({
     docId: (): string | null => this._docId,
@@ -626,6 +646,7 @@ export class Document {
     sealUndoStep: (): void => {
       if (this._undo) this._undo.sealStep();
     },
+    whenLocalOpsSaved: (): Promise<boolean> => whenSaved(this),
   });
   // Drive push hook. `null` on the offline / test path; `pushToDrive`
   // then throws with a clear message rather than silently dropping.
@@ -738,6 +759,9 @@ export class Document {
   // Drive sync state, latest-retained. `null` until the open factory
   // seeds it (drive-linked docs only) and on docs with no drive link.
   private readonly _driveStatus = new DriveStatusSignal();
+  // Where this document could be published when it mirrors nothing yet.
+  // Seeded from the open, emptied once it becomes a mirror.
+  private readonly _drivePublishTarget = new DrivePublishTargetSignal();
 
   // Document-scoped presence. `null` until the WS transport is wired
   // on, and on the offline / test path where there is no transport.
@@ -1145,6 +1169,11 @@ export class Document {
     // reload/resync closure can't touch freed WASM. `_closed` only; a parked
     // doc still imports.
     if (this._closed) return;
+    // Arm the seed BEFORE the import, because this is the moment the content
+    // arrives and the Loro subscriber cannot be relied on to report it: it is
+    // attached lazily, so a document whose content lands before the session has
+    // bound its canvas has nobody subscribed and the import fires nothing.
+    this._armSeedIfPictureIsStale();
     this._doc.import(snapshot);
     // The undo stack pre-snapshot referenced ops the new snapshot
     // supersedes. Drop both stacks so undo doesn't try to revert
@@ -1651,6 +1680,23 @@ export class Document {
     this._thumbnails.setUploader(uploader);
   }
 
+  // Tell the document which version the server's picture of it depicts, from
+  // the join, and start a seed watch when that picture is behind the content.
+  /** @internal */
+  _setThumbnailVersion(version: number | null): void {
+    this._thumbnailVersion = version;
+    this._armSeedIfPictureIsStale();
+  }
+
+  // A picture at or above the head depicts what the document currently holds.
+  private _armSeedIfPictureIsStale(): void {
+    const head = this.currentSeq ?? 0;
+    if (this._thumbnailVersion !== null && this._thumbnailVersion >= head) {
+      return;
+    }
+    this._thumbnails.armSeed();
+  }
+
   // Install the checkpoint-create hook; `null` detaches.
   /** @internal */
   setCheckpointCreator(creator: CheckpointCreator | null): void {
@@ -1736,11 +1782,11 @@ export class Document {
     return await this._driveResolver();
   }
 
-  // Fetch the original file behind an opaque-blob document: a short-lived
-  // presigned GET plus the file's name / content type / size. An app that
-  // knows the format fetches the bytes from `url`, parses them, and writes
-  // the structured content into this document through the normal handle
-  // surface (`doc.map('instances').mutate(...)`):
+  // Fetch the file a document was uploaded as: a short-lived presigned GET
+  // plus the file's name / content type / size. An app that knows the format
+  // fetches the bytes from `url`, parses them, and writes the structured
+  // content into this document through the normal handle surface
+  // (`doc.map('instances').mutate(...)`):
   //
   //   const src = await doc.sourceBlob();
   //   const bytes = new Uint8Array(await (await fetch(src.url)).arrayBuffer());
@@ -1752,9 +1798,8 @@ export class Document {
   // each with its own URL, so a multi-stream format (a glTF with its
   // `.bin` buffer) fetches only the streams it needs.
   //
-  // Rejects with a `BrassError` when the document is not a stored opaque
-  // blob (it has no original file to hand back) or the caller cannot
-  // reach it (both 404).
+  // Rejects with a `BrassError` when the document holds no such file, or
+  // the caller cannot reach it (both 404).
   async sourceBlob(): Promise<DocumentSourceBlob> {
     this._assertOpen();
     if (this._docId === null) {
@@ -2450,9 +2495,9 @@ export class Document {
       this._maybeFireUndoState();
       // A local commit (mutate / undo / redo) schedules a debounced
       // thumbnail capture, when the app has registered a canvas via
-      // `useCanvas`. Remote ops never trigger a capture: a viewer or
-      // a passive collaborator must not re-upload a screenshot of
-      // someone else's edit.
+      // `useCanvas`. The debounce is for the peer that drew the change, so
+      // it is local-only: a passive collaborator re-uploading a screenshot
+      // of someone else's edit is what a per-op capture would be.
       if (isLocalCommit) {
         this._thumbnails.schedule();
         // Same reasoning for the implicit auto-checkpoint: only the
@@ -2460,6 +2505,17 @@ export class Document {
         // N-way session would write N redundant CHECKPOINT# rows per
         // idle period.
         this._checkpoints.scheduleAuto();
+      } else {
+        // Content arriving with no local commit behind it is what an import
+        // looks like from here, and it moves the head past whatever picture
+        // the document has. This DOES reach a reader who drew none of it,
+        // which the debounce above deliberately does not: an import runs on
+        // whichever client claimed it, so gating the seed on local authorship
+        // would leave the documents that most need a picture without one.
+        // Every such reader captures the same document at the same version,
+        // and the targeted snapshot each upload enqueues is idempotent on
+        // that version, so the concurrent seeds resolve themselves.
+        this._armSeedIfPictureIsStale();
       }
     });
   }
@@ -2671,6 +2727,55 @@ export class Document {
   _emitDriveStatus(status: DocumentDriveStatus): void {
     if (this._closed) return;
     this._driveStatus.emit(status);
+    // A document that has become a mirror publishes through its link from
+    // now on, so the create-an-artifact offer goes with the arrival of the
+    // status that replaces it.
+    this._drivePublishTarget.set(null);
+  }
+
+  // Whether this document's export runs in THIS app, which is what decides
+  // whether a push carries bytes. Not on `driveStatus`: it is a fact about
+  // the caller rather than about the document, and it is all an app is told
+  // about the exporter, never which app it is when it is not this one.
+  private _exportsHere = false;
+
+  /** @internal */
+  get _exportRunsHere(): boolean {
+    return this._exportsHere;
+  }
+
+  /** @internal */
+  _setExportRunsHere(runsHere: boolean): void {
+    this._exportsHere = runsHere;
+  }
+
+  // Internal: where this document can be published while it mirrors nothing.
+  /** @internal */
+  get _publishTarget(): DrivePublishTarget | null {
+    return this._drivePublishTarget.target;
+  }
+
+  /** @internal */
+  _setPublishTarget(target: DrivePublishTarget | null): void {
+    if (this._closed) return;
+    this._drivePublishTarget.set(target);
+  }
+
+  // Internal: how the publish of a document that mirrors nothing is going.
+  /** @internal */
+  get _publishState(): DrivePublishState {
+    return this._drivePublishTarget.state;
+  }
+
+  /** @internal */
+  _emitPublishState(state: DrivePublishState): void {
+    if (this._closed) return;
+    this._drivePublishTarget.setState(state);
+  }
+
+  /** @internal */
+  _onPublishState(cb: () => void): () => void {
+    return this._drivePublishTarget.onState(cb);
   }
 
   // Internal: mark the doc evicted. Idempotent (multiple frames arrive
@@ -3019,6 +3124,7 @@ export class Document {
     this._gone.clearListeners();
     this._workStatus.clearListeners();
     this._driveStatus.clearListeners();
+    this._drivePublishTarget.clearListeners();
     // Presence subscribes its OWN WS topic and keeps it alive across a park
     // (resume does not re-create the controller), so drop its app-side
     // change listeners here the same way as the sets above: a parked doc
@@ -3086,7 +3192,7 @@ export class Document {
       this._undo.free();
       this._undo = null;
     }
-    this._thumbnails.cancel();
+    this._thumbnails.destroy();
     this._checkpoints.cancelAuto();
     this._localOpHook = null;
     this._currentSeqProvider = null;
@@ -3102,6 +3208,7 @@ export class Document {
     this._gone.clearListeners();
     this._workStatus.clearListeners();
     this._driveStatus.clearListeners();
+    this._drivePublishTarget.clearListeners();
     // Detach handle subscriptions before freeing the doc (below): a handle's
     // per-container Loro subscription outlives the cache reference, and
     // `_doc.free()` must not run with subscriptions still attached.

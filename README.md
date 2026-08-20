@@ -273,10 +273,10 @@ A multi-pane app that builds its own header takes the standard pieces
 account menu) individually rather than re-implementing them. See
 "Composable header pieces" in
 [`docs/custom-chrome.md`](./docs/custom-chrome.md). Mount the
-drive-sync badge (`Brass.mountDriveSync(el)`) unconditionally: on a
-document linked to a connected drive it carries the user's pull,
-publish, and reconcile actions, and on any other document it renders
-nothing.
+drive-sync badge (`Brass.mountDriveSync(el)`) unconditionally: it
+carries the drive actions the open document has, the pull, publish, and
+reconcile of a linked document, and the offer to publish one its
+project's drive has not received yet.
 
 ## Document lifecycle
 
@@ -663,8 +663,11 @@ after each burst of local edits settles. Tune that to your app's shape:
 | Text editor / fast bursts               | `doc.setAutoCheckpointIntervalMs(2000)` at boot. | Each typing pause becomes a boundary.      |
 | Explicit-only                           | `doc.setAutoCheckpointIntervalMs(0)`             | Only deliberate `createCheckpoint` calls.  |
 
-`createCheckpoint()` can reject on a rate limit, and a missed seal is
-harmless, so call it fire-and-forget.
+`createCheckpoint()` waits for the edits your app has just made to save
+before it marks the point, so the marker describes the state you asked to
+save rather than one those edits are missing from. It rejects on a rate
+limit, and when those edits do not save. A missed seal is harmless, so
+call it fire-and-forget.
 
 The SDK renders version preview itself: while an earlier version is
 showing, `mountToolbar` / `mountHeader` show the "viewing an earlier
@@ -705,12 +708,13 @@ thumbnail on its dashboard card:
 Brass.session.useCanvas(() => document.querySelector('canvas'));
 ```
 
-The SDK debounces 1.5s after each local edit, screenshots
-the canvas, downscales, and uploads. **WebGL canvases must set
-`preserveDrawingBuffer: true`** (Three.js:
-`new THREE.WebGLRenderer({ preserveDrawingBuffer: true })`). Without
-it the read-back is a blank PNG, and the SDK warns once about the
-missing flag.
+The SDK debounces 1.5s after each local edit, screenshots the canvas,
+downscales, and uploads.
+
+**WebGL canvases must set `preserveDrawingBuffer: true`** (Three.js:
+`new THREE.WebGLRenderer({ preserveDrawingBuffer: true })`). Without it
+the read-back is a blank PNG, and the SDK warns once about the missing
+flag.
 
 ## Presence (live cursors and who's here)
 

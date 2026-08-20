@@ -11,6 +11,7 @@ import {
   type DocumentOptions,
   type DocumentWorkStatus,
   type DocumentDriveStatus,
+  type DrivePublishTarget,
   type DocumentDriveTrackingState,
   type DriveMirrorDirection,
   type HostedUiProvider,
@@ -214,6 +215,33 @@ export interface DocumentSnapshotResponse {
   // Drive provenance + tracking state, present only on drive-linked docs.
   // Seeds `doc.driveStatus`; live changes stream in via `doc_drive_status`.
   drive?: DocumentDriveSummaryWire;
+  // Whether this document's export runs in the app this client acts as.
+  // Server-answered per caller, so it says only that this app is the one to
+  // serialize, never which app is if it is not. Absent for a caller carrying
+  // no app assertion.
+  calling_app_exports?: boolean;
+  // The version of the document's current picture, absent when it has none.
+  // Only the version is read (a picture behind the head is what makes this
+  // open seed one), so the shape is deliberately narrow: the full wire record
+  // is the thumbnail routes' surface, not the join's.
+  thumbnail?: { version?: number } | null;
+  // Where a document that mirrors nothing can be published, present only
+  // while it mirrors nothing and its project is linked to a drive that
+  // takes a new file. The hosted drive badge offers the publish off this.
+  drive_publish_target?: DrivePublishTargetWire;
+}
+
+// Wire shape of a publish target on the join response. Snake_case,
+// mirroring the server's `DocumentDrivePublishTarget` (CONTRACT.md "Where
+// a document with no drive item can publish").
+export interface DrivePublishTargetWire {
+  drive_type?: unknown;
+  drive_name?: unknown;
+  container_name?: unknown;
+  detail?: unknown;
+  source_unreadable?: unknown;
+  publishing?: unknown;
+  publish_failed?: unknown;
 }
 
 // Wire shape of the `drive` block carried on the join response and the
@@ -237,6 +265,7 @@ export interface DocumentDriveSummaryWire {
   // Optional: a frame from an older server omits it, treated as not
   // publishing (the `canPush` affordance then behaves as before).
   publishing?: boolean;
+  source_unreadable?: string;
 }
 
 // Wire-protocol-pinned response shape from
@@ -620,6 +649,21 @@ interface DocDriveStatusFrame {
   drive: DocumentDriveSummaryWire;
 }
 
+// Server-pushed publish state for a document that mirrors nothing on a drive
+// yet. Wire shape pinned in CONTRACT.md "Server-pushed `doc_drive_publish`".
+// The first publish creates the artifact, so until it lands the document has
+// no drive summary and `doc_drive_status` carries nothing about the push it
+// started.
+interface DocDrivePublishFrame {
+  type: 'doc_drive_publish';
+  topic: string;
+  publish: {
+    publishing?: unknown;
+    failed?: unknown;
+    detail?: unknown;
+  };
+}
+
 // Server-pushed frame fired when the platform discards ops it cannot apply.
 // The prompt half of the durability
 // handshake: the SDK re-checks durability against ground truth now rather
@@ -651,7 +695,9 @@ function toDriveStatus(wire: DocumentDriveSummaryWire): DocumentDriveStatus {
     // update) must not be treated as unbroken and offered a push the server
     // would reject. Require an explicit `false` to enable, and an explicit
     // `true` to flag broken. Behaviour is unchanged for today's frames, which
-    // always carry the boolean.
+    // always carry the boolean. Whether the file is written server-side or
+    // from the app's own serializer is a REQUEST SHAPE the push path resolves
+    // for itself, so it says nothing about whether this document can publish.
     canPush:
       wire.broken === false &&
       mirrorDirection === 'two_way' &&
@@ -666,6 +712,31 @@ function toDriveStatus(wire: DocumentDriveSummaryWire): DocumentDriveStatus {
     itemName: wire.item_name,
     itemUrl: wire.item_url,
     publishing: wire.publishing === true,
+    // Spread rather than assigned, because `exactOptionalPropertyTypes`
+    // separates an absent optional field from one holding `undefined`.
+    ...(wire.source_unreadable !== undefined
+      ? { sourceUnreadable: wire.source_unreadable }
+      : {}),
+  };
+}
+
+// Map the wire target to the public shape, dropping one that does not carry
+// what a publish needs. A malformed target is skipped rather than failing
+// the open: the document is readable whatever its publish offer says.
+function toPublishTarget(
+  wire: DrivePublishTargetWire | undefined,
+): DrivePublishTarget | null {
+  if (typeof wire !== 'object' || wire === null) return null;
+  const driveName = wire.drive_name;
+  if (typeof driveName !== 'string' || driveName === '') return null;
+  return {
+    driveName,
+    driveType: typeof wire.drive_type === 'string' ? wire.drive_type : '',
+    containerName:
+      typeof wire.container_name === 'string' ? wire.container_name : '',
+    detail: typeof wire.detail === 'string' ? wire.detail : '',
+    publishing: wire.publishing === true,
+    publishFailed: wire.publish_failed === true,
   };
 }
 
@@ -967,6 +1038,15 @@ function isDocMetaFrame(frame: unknown): frame is DocMetaFrame {
     typeof f.topic === 'string' &&
     typeof f.name === 'string'
   );
+}
+
+function isDocDrivePublishFrame(frame: unknown): frame is DocDrivePublishFrame {
+  if (typeof frame !== 'object' || frame === null) return false;
+  const f = frame as Record<string, unknown>;
+  if (f.type !== 'doc_drive_publish' || typeof f.topic !== 'string') {
+    return false;
+  }
+  return typeof f.publish === 'object' && f.publish !== null;
 }
 
 function isDocDriveStatusFrame(frame: unknown): frame is DocDriveStatusFrame {
@@ -1738,10 +1818,19 @@ export function createOpenDocument(
     // (a stub opened mid-hydration returns `snapshot: null` + a `pending`
     // status).
     if (parsed.status !== undefined) doc._emitStatus(parsed.status);
+    // Whether this app is the one to serialize the document, which is what
+    // decides whether a push carries bytes. Answered by the server for the
+    // caller's own app and only on the join, since the fanout frame is one
+    // payload for every subscriber and has no caller to answer for.
+    doc._setExportRunsHere(parsed.calling_app_exports === true);
     // Seed `doc.driveStatus` from the join before the first
     // `doc_drive_status` frame.
     if (parsed.drive !== undefined) {
       doc._emitDriveStatus(toDriveStatus(parsed.drive));
+    } else {
+      // Only for a document that mirrors nothing: a mirror publishes through
+      // its link, and `_emitDriveStatus` clears any targets anyway.
+      doc._setPublishTarget(toPublishTarget(parsed.drive_publish_target));
     }
     // Highest seq seen; later `doc_op` / `op_ack` frames advance it. Kept in
     // a closure, not on the Document: it is a transport concern, not CRDT
@@ -2161,6 +2250,7 @@ export function createOpenDocument(
         await uploader(doc, image, width, height);
       });
     }
+    doc._setThumbnailVersion(parsed.thumbnail?.version ?? null);
     if (opts.checkpointCreator) {
       const creator = opts.checkpointCreator;
       doc.setCheckpointCreator(() => creator(doc));
@@ -4298,6 +4388,15 @@ function wireDocTransport(args: WireDocTransportArgs): void {
       if (isDocDriveStatusFrame(frame)) {
         // The signal de-dupes a no-op re-emit, so forwarding every frame is safe.
         args.doc._emitDriveStatus(toDriveStatus(frame.drive));
+        return;
+      }
+      if (isDocDrivePublishFrame(frame)) {
+        args.doc._emitPublishState({
+          publishing: frame.publish.publishing === true,
+          failed: frame.publish.failed === true,
+          detail:
+            typeof frame.publish.detail === 'string' ? frame.publish.detail : null,
+        });
         return;
       }
       if (isDocOpsDroppedFrame(frame)) {

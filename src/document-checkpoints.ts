@@ -29,6 +29,9 @@ export interface CheckpointSchedulerHost {
   currentSeq(): number | null;
   // Seal the current undo step. Safe to call when undo is absent.
   sealUndoStep(): void;
+  // Resolve `true` once every op this client has committed locally has been
+  // acked; `false` when the document went, or the acks stopped arriving.
+  whenLocalOpsSaved(): Promise<boolean>;
 }
 
 export class CheckpointScheduler {
@@ -65,6 +68,26 @@ export class CheckpointScheduler {
     // arriving during the await start a fresh undo step rather than
     // folding into the pre-checkpoint one.
     this.host.sealUndoStep();
+    // The anchor is a SERVER seq, and an op the app just committed holds one
+    // only once it is acked, so a checkpoint sealed with writes outstanding
+    // sits below the work the caller is saving: an app that writes and then
+    // saves a version (the file importer's one-undo-step seal is this shape)
+    // marks a point its own edits are missing from, and restoring it loses
+    // them. Waiting for the acks is what makes the marker describe the state
+    // the caller has.
+    const saved = await this.host.whenLocalOpsSaved();
+    if (!this.host.isAttached()) {
+      throw new Error('Document is closed');
+    }
+    // Sealing anyway is the failure this wait exists to prevent, and it fails
+    // quietly: the marker looks like a saved version and restores to a state
+    // missing the work the caller asked to save. Refusing hands the app a
+    // state it can act on instead.
+    if (!saved) {
+      throw new Error(
+        'createCheckpoint: the document has changes that are not saved yet',
+      );
+    }
     const result = await this._creator();
     // Record the seq so a pending auto-checkpoint at the same version
     // skips its fire. The server Put is unconditional (last-write-wins),
@@ -116,6 +139,13 @@ export class CheckpointScheduler {
   private async _fireAuto(): Promise<void> {
     if (!this.host.isAutoAllowed()) return;
     if (this._creator === null) return;
+    // Same anchor rule as `create`. The debounce usually outlasts the acks,
+    // so this ordinarily resolves at once; what it covers is a burst whose
+    // last ops are still draining when the timer fires. Best-effort here, so
+    // a seal that cannot confirm the writes skips and the next local edit
+    // reschedules it.
+    if (!(await this.host.whenLocalOpsSaved())) return;
+    if (!this.host.isAutoAllowed()) return;
     const seq = this.host.currentSeq();
     if (seq === null) return;
     // Already checkpointed at this exact version (manual seal a moment

@@ -21,4 +21,10 @@ export {
   type TokenSet,
 } from './auth-flow.js';
 export { decodeIdToken } from './jwt.js';
+export {
+  fetchWithRetry,
+  RETRY_READ,
+  type RetryOptions,
+  type RetryPolicy,
+} from './fetch-retry.js';
 export { BRASS_INIT_ARG_KEYS, type BrassInitArgKey } from './init-keys.js';

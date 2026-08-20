@@ -22,9 +22,9 @@ export interface StoredList<T = unknown> extends ListHandle<T> {
 /**
  * The document as a serializer sees it: the same containers, readable whole.
  *
- * A `Document` satisfies this, which is what keeps a built-in codec and a
- * third-party one on one surface. The difference between them is where they
- * run, not what they are allowed to reach.
+ * A `Document` satisfies this, which is what keeps a serializer the platform
+ * ships and one an app registers on one surface. The difference between them
+ * is where they run, not what they are allowed to reach.
  */
 export interface StoredDocument {
   readonly id: string | null;
