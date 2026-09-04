@@ -13,6 +13,7 @@
 // (framer -> guest carries the snapshot; guest -> framer the bytes).
 
 import { Document } from './documents.js';
+import { ensureWasmReady } from './wasm-runtime.js';
 import type { DocumentStreamInfo } from './documents-namespace.js';
 import type { StreamRuntime } from './document-streams.js';
 import type { DocumentSerializer, StoredDocument } from './serializer.js';
@@ -120,6 +121,7 @@ export function startExportGuest(): ExportGuestController {
         return res.streams;
       },
       openLine: async (lineId: string) => {
+        await ensureWasmReady();
         const res = (await fetchFromFramer(hostOrigin, 'stream-snapshot-request', {
           lineId,
         })) as { snapshot: Uint8Array | null; tailOps: Uint8Array[] };
@@ -161,6 +163,9 @@ export function startExportGuest(): ExportGuestController {
       // partitioned document's other streams (`doc.stream(name)`) resolves
       // them over the bridge through the runtime below, so a partitioned
       // document exports in full headless, not just its default stream.
+      // The engine runs for the first time here, and `Brass.init` only starts
+      // its fetch, so a guest that has just booted waits for it once.
+      await ensureWasmReady();
       const doc = snapshot
         ? Document.openFromSnapshot(snapshot, identity)
         : Document.create(identity);

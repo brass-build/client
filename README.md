@@ -30,6 +30,7 @@ npm install @brass-build/client
 - [Presence](#presence-live-cursors-and-whos-here)
 - [Streams](#streams-partitioning-large-documents)
 - [Imported files](#imported-files)
+- [Calling an outside service](#calling-an-outside-service)
 - [Reference](#reference)
 - [Guides](#guides)
 
@@ -45,37 +46,36 @@ integration.
 Build a shared checklist on @brass-build/client (NPM).
 ```
 
-**Or wire it by hand.**
+**Or wire it by hand.** Six calls, and your own code around them:
 
 ```ts
 import { Brass } from '@brass-build/client';
-import type { BrassUser, Document } from '@brass-build/client';
+import type { Document } from '@brass-build/client';
 
-// Register listeners before init so validation failures reach onError.
+// Register before init, so a bad app id reaches your handler.
 Brass.onError((err) => console.error('[Brass]', err.message));
 
-// Swap your two shells as auth settles. Both start hidden, so nothing
-// paints before the first onUserChange fire.
-Brass.onUserChange((user: BrassUser | null) => {
-  document.getElementById('signed-out')!.hidden = !!user;
-  document.getElementById('signed-in')!.hidden = !user;
-});
-document.getElementById('sign-in')!.onclick = () => Brass.signIn();
+// Fires when init resolves, then on every sign-in and sign-out. Show
+// your app unless `Brass.authStatus` is 'signed-out': someone opening a
+// share link has no user and still gets the document, read-only.
+Brass.onUserChange(renderAuthState);
+signInButton.onclick = () => Brass.signIn();
 
 // The whole file menu in one call: document title, undo / redo,
 // account menu, presence roster.
-Brass.mountToolbar(document.getElementById('app-bar')!);
+Brass.mountToolbar(appBar);
 
-// Attach your editor to each document the session opens. Compare the
-// Document instance, never the id (a version preview reuses the id).
+// Rebind your editor to whichever document the session opens. Compare
+// the instance, not the id: a version preview reuses the id.
 let bound: Document | null = null;
 Brass.session.subscribe((session) => {
-  if (session.document !== bound) {
-    bound = session.document;
-    if (bound) bindEditor(bound);   // see Editing documents
-  }
+  if (session.document === bound) return;
+  bound = session.document;
+  if (bound) bindEditor(bound);   // see Editing documents
 });
 
+// Reported by your first `brass publish` (as `app_id` under --json), or
+// on your app's page in the dashboard.
 await Brass.init('brass_app_...');
 ```
 
@@ -85,8 +85,7 @@ to paint your list, and call `.mutate` from a click.
 [Document lifecycle](#document-lifecycle) and
 [Editing documents](#editing-documents) show the loop in full.
 
-Set up your bundler for the SDK's WebAssembly module
-([Bundler setup](#bundler-setup)), then build and publish:
+Then build and publish:
 
 ```sh
 npm run build
@@ -95,27 +94,34 @@ npx @brass-build/cli publish ./dist
 ```
 
 The first publish creates the app, hosts it at
-`https://<slug>.onbrass.app` where your users sign in, and writes the
-app id (the `brass_app_...` above) to `.brass/project.json`.
+`https://<slug>.onbrass.app` where your users sign in, and reports the
+app id (the `brass_app_...` above).
 
 ## Setup
 
 To take the [quickstart](#quickstart) from source to a
 signed-in, hosted app:
 
-1. **Set up the bundler.** The SDK ships a WebAssembly module, and your
-   bundler needs to know how to load it. See
-   [Bundler setup](#bundler-setup).
-2. **Ship it.** `npx @brass-build/cli publish ./dist` creates the app,
+1. **Ship it.** `npx @brass-build/cli publish ./dist` creates the app,
    hosts it, and returns its sign-in URL. See [Ship it](#ship-it).
-3. **Pass an app id unless Brass hosts your bundle.** Brass resolves
-   the id from its own hosting origins, so a published bundle calls
-   `Brass.init()` with no argument. Pass the id everywhere else, in
-   local development and on your own origin:
-   `Brass.init('brass_app_...')`. Read it from `.brass/project.json`,
-   which the first publish writes, or copy it from your app's page in
-   the dashboard. A new app already allows sign-in from `localhost` /
-   `127.0.0.1` on any port; add your own origin on that same page.
+2. **Pass an app id unless Brass hosts your bundle.** A published bundle
+   resolves its id from the slot it is served on, so it calls
+   `Brass.init()` with no argument. Pass the id everywhere else, in local
+   development and on your own origin: `Brass.init('brass_app_...')`.
+   `brass publish --json` reports it as `app_id`, or copy it from your
+   app's page in the dashboard.
+
+   One bundle covers both origins, because the id argument accepts
+   `undefined`. Pass whatever your build resolved to
+   (`Brass.init(import.meta.env.VITE_BRASS_APP_ID)`) and Brass falls back
+   to the serving slot. Set the variable for local development as well:
+   `localhost` has no slot to fall back to, and an absent id fails init.
+3. **Allow your development origin.** An app you create in the dashboard
+   already allows sign-in from `localhost` / `127.0.0.1` on any port. One
+   a first `brass publish` created for you carries only the origin it is
+   served from, so add `http://localhost:5173/*` on your app's page before
+   signing in locally. A missing entry answers that the origin is not on
+   the app's allowlist.
 
 **CSP.** If (and only if) your app sends a `Content-Security-Policy`,
 extend it: `script-src` needs `'wasm-unsafe-eval'` for the SDK's
@@ -124,35 +130,41 @@ picker and share dialog, and `img-src` needs
 `https://*.s3.<region>.amazonaws.com` if you render document thumbnails
 (they are presigned S3 URLs).
 
-### Bundler setup
+### Modules and assets
 
 `@brass-build/client` ships as ES modules, loaded by a bundler (Vite,
-webpack) or Node's ESM loader with `import`.
+webpack 5) or Node's ESM loader with `import`.
 
-Without a WASM loader, `vite dev` fails with `"ESM integration proposal
-for Wasm" is not supported currently`. Install one plugin and add the
-SDK's own helper:
+The SDK runs a WebAssembly engine, which your bundler emits as its own
+asset of about 3 MB, an order of magnitude larger than your JavaScript.
+Serve it as `application/wasm`: browsers compile it while it streams,
+and fall back to a slower path when the content type is something else.
 
-```sh
-npm install --save-dev vite-plugin-wasm
+Boot also requests `/.well-known/brass-runtime.json`. Brass serves that
+file from its own hosting to tell a bundle which app and environment it
+is being served as. Your own origin has no reason to, so it answers
+either a 404 (which the console logs in red) or, if it falls back to
+`index.html` the way a dev server does, that page. Both are expected,
+and the SDK carries on with the app id and origins you gave it.
+
+### Vite dev server
+
+Vite pre-bundles your dependencies for its dev server, which copies this
+package into `node_modules/.vite/deps/` without moving the engine's binary
+alongside it. The request for the binary then resolves inside that
+directory, finds nothing, and the dev server answers with `index.html`, so
+the engine is handed a page to compile and the app fails when it first
+opens a document. Keep this package out of that step:
+
+```js
+// vite.config.js
+export default {
+  optimizeDeps: { exclude: ['@brass-build/client'] },
+};
 ```
 
-```ts
-// vite.config.ts
-import { defineConfig } from 'vite';
-import wasm from 'vite-plugin-wasm';
-import { brassVite } from '@brass-build/client/vite';
-
-export default defineConfig({
-  plugins: [wasm(), brassVite()],
-  build: { target: 'es2022' },
-});
-```
-
-`brassVite()` configures Vite's dep-prebundling step so the SDK's WASM
-runtime loads on first `vite dev`, and it names the SDK's WebAssembly
-dependencies for you, so your config keeps working as they change.
-Webpack 5 loads them with no extra configuration.
+`vite build` emits the binary as an asset and needs nothing, so this
+setting is only for the dev server.
 
 ### Init
 
@@ -169,10 +181,12 @@ covers when you need one). The second is a typed options object,
 | `syncDocToTitle` | `true` (set the page title to `Doc name · App name` while a document is open) |
 | `openIncompatibleDocuments` | `false` (Brass refuses to open a document your schema cannot read, and asks the person whether to go ahead) |
 
-`Brass.init` resolves after one auth round-trip. Register `onError`
-and `onUserChange` BEFORE calling `init`, so that validation failures
-fire through your listener instead of dying as unhandled rejections. A
-bad `app_id` still resolves, with `Brass.user === null`.
+`Brass.init` resolves once it knows who the reader is, which takes one
+auth round-trip for someone who has signed in to your app before and no
+request at all for a first-time visitor. Register `onError` and
+`onUserChange` BEFORE calling `init`, so that validation failures fire
+through your listener instead of dying as unhandled rejections. A bad
+`app_id` still resolves, with `Brass.user === null`.
 
 ### Ship it
 
@@ -217,11 +231,10 @@ changes. It fires once when `init` resolves (with the real user or
 `null`), then on every sign-in and sign-out. A listener registered
 before `init` does not fire on registration. One registered after does.
 
-The plain-DOM sample in the [quickstart](#quickstart) gets this
-right with no extra code, because both shells start `hidden` and
-nothing shows until the first `onUserChange`. A framework app (React, Vue, Svelte) paints its
-initial state synchronously, before that first fire, so it renders the
-three states explicitly:
+The [quickstart](#quickstart) sample gates on `'signed-out'` for exactly
+this reason. A framework app (React, Vue, Svelte) paints its initial
+state synchronously, before the first `onUserChange` fire, so it renders
+the three states explicitly:
 
 ```ts
 // Vue
@@ -349,7 +362,20 @@ document to its drive, and does other work while the document is open.
 `doc.onStatus(cb)` fires on every phase. Render `status.message`
 verbatim and read `status.pending` for whether the work is still
 running. The message is prose written for the reader, so show it rather
-than parsing it or inferring a phase from it.
+than parsing it or inferring a phase from it. Both are readable
+synchronously, so a fresh bind renders the current state without waiting
+for a fire.
+
+`doc.savingCount` is the count of this app's own writes that have not yet
+been acknowledged, which is what a "Saving..." indicator reads. It ticks
+through `doc.subscribe`, alongside the rest of what is not tied to one
+container:
+
+```ts
+doc.subscribe(() => {
+  saving.textContent = doc.savingCount > 0 ? `Saving ${doc.savingCount}...` : 'Saved';
+});
+```
 
 **Where new documents land.** The `new` command (and
 `session.create()`) places the document for you: a sibling of the open
@@ -359,6 +385,12 @@ document, or a platform-chosen home from the empty state.
 ```ts
 await Brass.session.create({ name: 'Scheme B' });
 ```
+
+`session.pick()` is the same call for opening an existing document: it
+raises the hosted picker and binds what the reader chooses, resolving
+`null` if they cancel. Both back the toolbar's own New and Open, so reach
+for them when your app renders those buttons itself (an empty state
+offering somewhere to start, a shortcut).
 
 **Keyboard shortcuts** route through `session.run`, which drives the
 same undo / redo commands the toolbar buttons use. `session.commands`
@@ -427,6 +459,10 @@ that container. A large document stays cheap because your editor
 touches the slice it cares about instead of walking the whole
 document.
 
+The SDK exports each accessor's return type, for a signature or a field
+that has to hold one: `MapHandle<T>`, `OrderedMapHandle<T>`,
+`ListHandle<T>` and `TextHandle`.
+
 **Make an item the smallest thing two people edit independently.** Two
 people editing different items always keep both edits. Two editing the
 same item keep one of the two, not a blend, so a grid where people edit
@@ -440,11 +476,17 @@ type Wall = { type: 'wall'; x: number; z: number };
 const walls = doc.map<Wall>('walls');
 
 walls.mutate((m) => { m[id] = { type: 'wall', x: 0, z: 0 }; }); // add
-walls.mutate((m) => { m[id].x = 42; });                          // field edit
-walls.mutate((m) => { delete m[id]; });                          // remove
+walls.mutate((m) => { const w = m[id]; if (w) w.x = 42; });     // field edit
+walls.mutate((m) => { delete m[id]; });                         // remove
 
 const one = walls.get(id);     // Wall | undefined
 ```
+
+The draft indexes as `Record<string, T>`, so a read is `T | undefined`
+and the field edit checks it: under `noUncheckedIndexedAccess` that is
+the only form that compiles, and either way a peer may have deleted the
+record between your render and your click. A record you hold that way is
+live, so writing through it writes to the document.
 
 Handles are cached per key (`doc.map('walls') === doc.map('walls')`),
 so they compare stable across renders. `doc.list<T>(key)` is the same
@@ -476,7 +518,7 @@ Read the collection in order with `ordered()` or `keys()`.
 ```ts
 const notes = doc.orderedMap<Note>('notes', 'note_order');
 notes.mutate((m) => { m[id] = { text: '' }; });   // appends to the order
-notes.mutate((m) => { m[id].text = 'hi'; });       // field edit; order untouched
+notes.mutate((m) => { const n = m[id]; if (n) n.text = 'hi'; });  // order untouched
 for (const { key, value } of notes.ordered()) renderRow(key, value);
 ```
 
@@ -528,6 +570,54 @@ first undoable edit. Don't seed a baseline from the client: a faked
 "initial state" write is an ordinary edit, so Ctrl-Z deletes it and the
 user sees content vanish they never wrote. Persist what the user asked
 for, and nothing else.
+
+### Prose several people edit
+
+For prose several people edit at once (a description, a report, a comment
+body), use `doc.text(key)` rather than storing the string in a map. A map
+record is the merge unit, so two people editing one string keep one of the
+two and the other's typing is gone. A text container merges inside the
+string: `update(next)` diffs against what is stored and applies the
+smallest edit that reaches it, so a peer's edit elsewhere in the same
+paragraph survives.
+
+Pass the whole new string every time. Diffing it is the handle's job, and
+that is what makes a full-string assignment safe here where the same
+assignment into a map is not.
+
+```ts
+const report = doc.text('report');
+let painted = report.read();
+field.value = painted;
+
+field.addEventListener('input', () => {
+  painted = field.value;
+  report.update(painted);
+});
+
+report.subscribe((value, origin) => {
+  if (origin?.source === 'local') { painted = value; return; }
+  paintPeerEdit(value);   // see docs/text-fields.md
+});
+```
+
+`origin` says who wrote the change, the way a map subscriber's does. The
+app's own write comes back through the subscriber too, and it is the one
+fire that must not touch the field: the reader is already looking at what
+they typed. Every other fire has to paint without throwing away the caret
+of whoever is typing, which is what `paintPeerEdit` above stands for.
+
+**A text container is a top-level root of the document**, so take one per
+document-shaped thing: a body, a section, a summary. Prose that belongs to
+each row of a repeated collection stays in the row's record, where the row
+is the merge unit and the record store's paging holds the cost flat as the
+collection grows. A root per row opts out of that paging, and loro prices a
+container against how many the document holds, so the cost climbs steeply
+with the collection.
+
+[`docs/text-fields.md`](./docs/text-fields.md) carries the caret-preserving
+paint, the IME window, what a keystroke costs against the field's length,
+and the measurements behind the root-per-row rule.
 
 ### Subscribing
 
@@ -596,7 +686,7 @@ item owns anything.** Rebuilding is correct and costs whatever the item
 holds: a DOM node loses its focus, its selection and its scroll
 position, and a view built on it starts over. As you apply a splice you
 know which of your own items it removed, so match them against what the
-same change inserts and move the one you already have.
+same change inserts and move the existing item rather than rebuilding it.
 
 ```ts
 const stop = steps.subscribe((change) => {
@@ -653,12 +743,12 @@ edits stay untouched. Outside the session, call `doc.undo()` /
 
 A **checkpoint** (`doc.createCheckpoint()`) is both the Ctrl-Z
 boundary and a marker on the document's version-history timeline, so
-checkpoint timing sets both granularities. Auto-seals fire 60 seconds
-after each burst of local edits settles. Tune that to your app's shape:
+checkpoint timing sets both granularities. Automatic checkpoints land 60
+seconds after each burst of local edits settles. Tune that to your app's shape:
 
 | Your app shape                          | What to do                                       | Result                                     |
 | --------------------------------------- | ------------------------------------------------ | ------------------------------------------ |
-| Default / no opinion                    | Nothing.                                         | Auto-seal every 60s of idle.               |
+| Default / no opinion                    | Nothing.                                         | A checkpoint every 60s of idle.            |
 | Drag / brush / tool-stroke (3D, canvas) | `void doc.createCheckpoint()` on `pointerup`.    | One drag = one Ctrl-Z.                     |
 | Text editor / fast bursts               | `doc.setAutoCheckpointIntervalMs(2000)` at boot. | Each typing pause becomes a boundary.      |
 | Explicit-only                           | `doc.setAutoCheckpointIntervalMs(0)`             | Only deliberate `createCheckpoint` calls.  |
@@ -666,8 +756,8 @@ after each burst of local edits settles. Tune that to your app's shape:
 `createCheckpoint()` waits for the edits your app has just made to save
 before it marks the point, so the marker describes the state you asked to
 save rather than one those edits are missing from. It rejects on a rate
-limit, and when those edits do not save. A missed seal is harmless, so
-call it fire-and-forget.
+limit, and when those edits do not save. A missed checkpoint is harmless,
+so call it fire-and-forget.
 
 The SDK renders version preview itself: while an earlier version is
 showing, `mountToolbar` / `mountHeader` show the "viewing an earlier
@@ -866,6 +956,67 @@ goes, what each key does, and how to confirm your build carries it.
 record store an imported file becomes, and
 [`docs/schemas.md`](./docs/schemas.md) covers declaring its schema.
 
+## Calling an outside service
+
+Your app can call a paid or authenticated third-party API without ever
+holding its credential. Declare the host in `brass-app.json`, and Brass adds
+the key to each request:
+
+```json
+{
+  "services": [{ "host": "api.anthropic.com", "headers": { "x-api-key": "{secret}" } }]
+}
+```
+
+Whoever owns the account enters the secret in Brass, either as one key of
+yours that serves every install, or as a request for whoever runs your app to
+connect their own account. `Brass.callService` returns the service's response unchanged:
+
+```js
+const res = await Brass.callService('api.anthropic.com', 'v1/messages', {
+  body: JSON.stringify({
+    model: 'claude-sonnet-5',
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: prompt }],
+  }),
+  headers: {
+    'content-type': 'application/json',
+    'anthropic-version': '2023-06-01',
+  },
+});
+const message = await res.json();
+```
+
+`options.method` defaults to `'POST'`. The response must be text, under 5 MB,
+and arrive within 25 seconds. Brass does not follow redirects: a `3xx` is
+returned as `response_redirected`, with the service's `location` in the body.
+
+`Brass.listServices()` tells you which hosts have a credential, so you can
+show or hide a feature before anyone clicks it.
+`Brass.connectService(host)` opens the dialog that collects a missing one:
+
+```js
+const services = await Brass.listServices();
+const ai = services?.find((s) => s.host === 'api.anthropic.com');
+if (ai?.ready) showSummariseButton();
+else upgradeButton.onclick = () => Brass.connectService('api.anthropic.com');
+```
+
+When Brass refuses a call rather than sending it, the response body has a
+`code` for what to do about it:
+
+```js
+if (!res.ok) {
+  const { code } = await res.json();
+  if (code === 'credential_required') await Brass.connectService('api.anthropic.com');
+}
+```
+
+[`docs/services.md`](./docs/services.md) lists every code, and covers values
+only the user knows and services split across several addresses.
+[`docs/app-manifest.md`](./docs/app-manifest.md) covers declaring a host,
+including services that sign a request or exchange a credential for a token.
+
 ## Reference
 
 `Brass` is the top-level namespace your app calls. The package's
@@ -886,6 +1037,9 @@ above show them in use.
 | `Brass.onUserChange(cb)`                                     | `() => void` (unsubscribe)              |
 | `Brass.onError(cb)`                                          | `() => void` (unsubscribe)              |
 | `Brass.getAccessToken()`                                     | `Promise<string \| null>`               |
+| `Brass.callService(host, path, options?)`                    | `Promise<Response>`                     |
+| `Brass.listServices()`                                       | `Promise<AppServiceState[] \| null>`    |
+| `Brass.connectService(host)`                                 | `Promise<boolean>`                      |
 | `Brass.session`                                              | `DocumentSession` (see above)           |
 | `Brass.mountToolbar(el, options?)`                           | `SessionToolbarHandle` (`{ tools, destroy }`) |
 | `Brass.createDocument(options?)`                             | `Promise<OpenedDocument>` (`session.create` drives this) |
@@ -922,5 +1076,7 @@ with `.status === 401` before it reaches the network.
 - [`docs/schemas.md`](./docs/schemas.md): declaring a schema, creating a stream, what lets an app open a document, and what breaks that.
 - [`docs/streams.md`](./docs/streams.md): partitioning a document for lazy loading, per-stream undo, and reading a document spread across streams.
 - [`docs/custom-chrome.md`](./docs/custom-chrome.md): composable header pieces, and rendering `session.commands` yourself for a fully custom shell.
+- [`docs/text-fields.md`](./docs/text-fields.md): binding a field to `doc.text(key)`, painting a peer's edit without losing the caret, the IME window, what a keystroke costs, and where a text container belongs in a document.
+- [`docs/services.md`](./docs/services.md): calling a declared outside service, every refusal code, values only the user knows, and a service split across addresses.
 - [`docs/presence.md`](./docs/presence.md): remote cursors, roster rendering, coordinate conventions, full types.
 - [`docs/hosted-ui-advanced.md`](./docs/hosted-ui-advanced.md): the hosted launchers (`Brass.selectDocument`, `Brass.shareDocument`), their redirect behavior in browsers that block the iframe, theming, CSP.

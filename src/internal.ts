@@ -22,6 +22,10 @@ export {
 } from './auth-flow.js';
 export { decodeIdToken } from './jwt.js';
 export {
+  readDocumentContents,
+  type DocumentContents,
+} from './document-contents.js';
+export {
   fetchWithRetry,
   RETRY_READ,
   type RetryOptions,

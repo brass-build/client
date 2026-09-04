@@ -18,6 +18,7 @@ import {
   type ReadOnlyReason,
   type ResyncPushOutcome,
 } from './documents.js';
+import { ensureWasmReady } from './wasm-runtime.js';
 import { createPresenceController } from './presence.js';
 import type { WsTopicCallback } from './ws-client.js';
 import { applyAppAssertionHeader, applyClientVersionHeader } from './api-headers.js';
@@ -372,10 +373,10 @@ export interface OpenDocumentFactoryOptions {
   // Backs the Document's built-in 'history' / 'manage' / 'share'
   // commands. When absent (tests), those commands render disabled.
   hostedUiProvider?: HostedUiProvider;
-  // The organization this page was launched from (`?brass_org=`), read
-  // through a getter because `init` resolves it after the factory's
-  // options are written. See `createDocumentId`.
-  launchOrganizationId?: () => string | null;
+  // The organization this app is already acting in, read through a getter
+  // because `init` resolves it after the factory's options are written and
+  // because it moves as the reader works. See `createDocumentId`.
+  preferredOrganizationId?: () => string | null;
   // Who is signed in, as the park cache's ownership stamp (see
   // `ParkedDocEntry.identity`). Read at park and at take, so a Document only
   // ever comes back to the person it was opened for. Absent (tests, the
@@ -1192,16 +1193,16 @@ export function createOpenDocument(
     // open on something that clears on its own.
     //
     // Longer than the default handful of attempts because of what a 503 means
-    // on this route: the document is intact and its storage is busy. Every op
-    // row a document has shares one partition, so the document most likely to
-    // answer 503 is one that was just written hard, which is exactly the
+    // on this route: the document is intact and its storage is busy. A
+    // document's own writes contend with each other, so the one most likely
+    // to answer 503 is one that was just written hard, which is exactly the
     // moment a person reloads to see their work. That pressure clears over
     // tens of seconds, not the one second the default budget spans, and the
     // cost of giving up early is telling someone their document will not open
     // when waiting would have opened it.
     //
     // A thrown request gets a short budget of its own: it never reached the
-    // API, so the busy partition is not what is wrong, and a blocked origin
+    // API, so busy storage is not what is wrong, and a blocked origin
     // or a host that does not resolve answers the seventh attempt as it
     // answered the first, with the reader watching a loading surface
     // throughout.
@@ -1344,7 +1345,7 @@ export function createOpenDocument(
   // piped through `open` to materialise the editable Document.
   // What the app hears when an op the socket could not carry also failed
   // over HTTP. The server's message is preferred where it has one, since it
-  // names the actual refusal (too large for the durable row, a revoked
+  // names the actual refusal (too large to store inline, a revoked
   // role); the status-shaped fallbacks cover a response that carries none.
   function opWriteFailureMessage(status: number, parsed: unknown): string {
     const serverMessage = (parsed as { error?: unknown } | undefined)?.error;
@@ -1356,12 +1357,12 @@ export function createOpenDocument(
     return `This change could not be saved (${status}).`;
   }
 
-  // Write one op over HTTP. The socket carries an op only up to API
-  // Gateway's message cap; past it the message is not delivered and the
-  // connection is closed, so `wireDocTransport` sends the large ones here.
+  // Write one op over HTTP. The socket carries an op only up to its own
+  // message cap; past it the message is not delivered and the connection is
+  // closed, so `wireDocTransport` sends the large ones here.
   // Not retried on a transient failure: the caller holds the op in its
   // outstanding tracker and re-asserts it, and a blind replay would write a
-  // second durable row for the same edit.
+  // second stored copy of the same edit.
   // Mint a presigned PUT and upload the blob to it, returning the staging
   // key the op write names. The PUT carries no Brass headers: the URL is
   // signed, and an extra header falls outside that signature.
@@ -1433,9 +1434,9 @@ export function createOpenDocument(
     };
     applyClientVersionHeader(headers);
     await applyAppAssertionHeader(headers, opts.getAppAssertion);
-    // Past what a durable row holds, the blob goes to storage directly
-    // and the write names the staged object, so a multi-megabyte op
-    // never travels through a request body.
+    // Past the size an op can carry inline, the blob is uploaded first and
+    // the write names what was staged, so a multi-megabyte op never travels
+    // through a request body.
     let stagedKey: string | undefined;
     if (opBlobNeedsStaging(opBlobB64)) {
       stagedKey = await stageOpBlob(docId, opBlobB64, token);
@@ -1525,32 +1526,36 @@ export function createOpenDocument(
   // a needed destination / organization before showing a loading state; any
   // other non-2xx throws.
   //
-  // A create that names no placement of its own inherits the organization
-  // the page was launched from, so a member of several organizations who
-  // opened this app from one of them is not asked to name a destination
-  // they already chose. An explicit `siblingOf` / `destination` outranks it:
-  // placing a document beside the open one is the more specific answer.
+  // A create that names no placement of its own lands in the organization the
+  // app is already acting in: the one a launch named, the one a document the
+  // reader just closed lives in, or the one they chose in the account menu's
+  // switch. Without it a member of several organizations is asked to name a
+  // destination they have already answered, once per create. An explicit
+  // `siblingOf` / `destination` outranks it: placing a document beside the
+  // open one is the more specific answer.
   const createDocumentId = async (
     args: CreateDocumentArgs,
   ): Promise<CreateDocumentResult> => {
-    const launchOrganizationId =
+    const preferred =
       args.siblingOf === undefined && args.destination === undefined
-        ? (opts.launchOrganizationId?.() ?? null)
+        ? (opts.preferredOrganizationId?.() ?? null)
         : null;
-    if (launchOrganizationId === null) return postAndClassify(args);
+    if (preferred === null) return postAndClassify(args);
     try {
       return await postAndClassify({
         ...args,
-        destination: { organization_id: launchOrganizationId },
+        destination: { organization_id: preferred },
       });
     } catch (err) {
-      // The launch organization is a hint carried on a URL, so it can name
-      // an organization the person has since left, which the server answers
-      // with a plain 404. Drop the hint and let the server resolve the
-      // destination on its own, which routes a multi-organization caller to
-      // the picker. A coded rejection (`app_not_installed`) belongs to the
-      // caller's own consent flow and passes through untouched, as does the
-      // 404 for an organization that exists but denies the app.
+      // Every source of this value is a preference rather than an answer: a
+      // URL parameter, a document open in an organization reached through a
+      // shared project, a choice made before the person left. Each can name
+      // an organization the caller no longer has, which the server answers
+      // with a plain 404. Drop it and let the server resolve the destination
+      // on its own, which routes a multi-organization caller to the picker. A
+      // coded rejection (`app_not_installed`) belongs to the caller's own
+      // consent flow and passes through untouched, as does the 404 for an
+      // organization that exists but denies the app.
       if (err instanceof BrassError && err.status === 404 && !err.code) {
         return postAndClassify(args);
       }
@@ -1792,6 +1797,7 @@ export function createOpenDocument(
         resyncFromSnapshot,
         skipPresence: true,
         parkable: false,
+        capacityReloadsDocument: false,
       });
     }
     return doc;
@@ -2307,6 +2313,11 @@ export function createOpenDocument(
       }
     }
     if (opts.reportError) doc.setErrorReporter(opts.reportError);
+    // No socket on a document the caller can write to: the write path reaches
+    // no server, so the document reports the first attempt rather than
+    // discarding it. Outside tests this is `wsBaseUrl` left unset, which
+    // naming any other base URL does.
+    if (!opts.wsClient && !doc.readOnly) doc.markTransportUnavailable();
     return doc;
   }
 
@@ -2594,7 +2605,12 @@ export function createOpenDocument(
     canEdit: boolean,
   ): void {
     const wsClient = opts.wsClient;
-    if (!wsClient) return;
+    if (!wsClient) {
+      // No socket: a write would change local state and reach no server, so
+      // the document reports the first one instead of discarding it quietly.
+      if (canEdit) doc.markTransportUnavailable();
+      return;
+    }
     const topic = `doc:${docId}:${lineId}`;
 
     // Ops on the socket awaiting an answer, keyed by `client_op_id`. An
@@ -2932,11 +2948,12 @@ export function createOpenDocument(
   // create + obtain the doc_id, then `open(docId)`); they aren't fused
   // because the create response is metadata-only and the open path already
   // handles the empty-snapshot case via `Document.create()`. This is the
-  // low-level path (`Brass.createDocument`): the server places the doc in
-  // the caller's single organization; a caller with none is routed to the
-  // hosted acquire-organization surface and the create retries; a multi-org
-  // caller rejects with a 409 (no hosted picker here, that is the session's
-  // `create()`).
+  // low-level path (`Brass.createDocument`): the doc lands in the
+  // organization the app is acting in, and otherwise in the caller's single
+  // organization; a caller with none is routed to the hosted
+  // acquire-organization surface and the create retries; a multi-org caller
+  // whose app is acting nowhere rejects with a 409 (no hosted picker here,
+  // that is the session's `create()`).
   const create: CreateDocumentFn = async (options) => {
     const args: CreateDocumentArgs = { name: options?.name ?? 'Untitled' };
     if (options?.app_metadata !== undefined) args.app_metadata = options.app_metadata;
@@ -3031,6 +3048,13 @@ interface WireDocTransportArgs {
   // by the parent Document (closed on parent close), so it bypasses the
   // park cache and `close()` tears down immediately.
   parkable?: boolean;
+  // True for the session-owned top-level document: an unhealable capacity
+  // refusal tells the user and reloads, because the session reopens the id
+  // and rebinds the app to the platform's copy. False for a stream line,
+  // which has no such owner and is only one part of a document: it marks
+  // itself read-only at capacity and surfaces `stream.atCapacity` instead
+  // of alerting the reader and reloading a document the stream is part of.
+  capacityReloadsDocument?: boolean;
   // The branch the caller REQUESTED (`options.branch`), undefined for a
   // default-branch open. Distinct from `branchId`, which is the branch the
   // server RESOLVED. The park cache keys on this (symmetric with
@@ -3808,6 +3832,18 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     if (gapTimer !== null) {
       clearTimeout(gapTimer);
       gapTimer = null;
+    }
+    // A stream line reaches this only at capacity, and it has no owner to
+    // reopen it: the session reopens the top-level id, but a stream is one
+    // part of a document nothing reloads on its behalf. So it stops the
+    // divergence (above) and marks itself read-only at capacity, which
+    // `stream.readOnly` / `stream.atCapacity` already surface to the app,
+    // rather than alerting the reader and reloading a document it is part
+    // of. The diverged edit stays visible until the app reopens the stream;
+    // it reached no other reader, so nothing is lost by leaving it.
+    if (args.capacityReloadsDocument === false) {
+      args.doc._markReadOnly('capacity');
+      return;
     }
     args.doc._markReadOnly('unsaved');
     // The user is told by the SDK, not by each app, because an app that
@@ -4762,6 +4798,11 @@ async function materialise(
   documentOptions?: DocumentOptions,
   onSnapshotProgress?: (loaded: number, total: number | null) => void,
 ): Promise<OpenedDocument> {
+  // Constructing the document is the first thing in this package that runs the
+  // WASM, and `Brass.init` only starts the fetch, so this is where it is
+  // waited on. Usually it resolved during the auth round-trip and this costs
+  // nothing.
+  await ensureWasmReady();
   // Stamp the server-minted doc_id onto the Document (via DocumentOptions, so
   // it threads through the LoroDoc constructor without changing the static
   // factory signatures) so callers can read `doc.id` to correlate.

@@ -19,8 +19,10 @@
 //     document picker).
 //
 // Bridge protocol (envelope `__brass_embed: 1`):
-//   iframe -> host:  ready | resize{height} | result{payload} | cancel |
-//                    error{code,message}
+//   iframe -> host:  ready | booted | resize{height} | result{payload} |
+//                    cancel | error{code,message}
+// `ready` says the frame is alive and answers the timeout below; `booted`
+// says the embed page has drawn something and is what takes the loader off.
 //   host -> iframe:  init{surface,params}
 // The host validates `event.origin === dashboardOrigin` and
 // `event.source === iframe.contentWindow` on every inbound message; the embed
@@ -36,16 +38,27 @@ import { EMBED_ENVELOPE, EMBED_PROTOCOL_VERSION } from './embed-protocol.js';
 //
 // Only a plain `redirect` can afford the short window: the surface returns
 // nothing, the standalone page finishes the same job, and the user keeps
-// their place, so eating ten seconds of blank modal is the bigger cost.
+// their place, so eating four seconds of blank modal is the bigger cost.
 //
 // `reject` and `redirect-with-value` both end with the caller worse off (a
 // thrown error, or the user navigated out of the host app with the value
-// routed home through a URL round trip), so they wait long enough that only
-// a genuinely unusable iframe times out. The embed page is a full
-// application boot behind a cross-origin request, so a merely slow link
-// clears the short window while the iframe is perfectly capable.
+// routed home through a URL round trip), so they wait longer.
+//
+// The embed page answers from a script that runs before its application, so
+// what either window measures is a round trip to the dashboard origin rather
+// than a boot. That is what keeps a slow link on the iframe path: the reader
+// waits out the load inside the app they are in, which is the point of the
+// iframe, instead of being handed a fallback on the strength of how long the
+// embed took to render.
 const READY_TIMEOUT_LONG_MS = 10_000;
 const READY_TIMEOUT_SHORT_MS = 4_000;
+
+// How long a frame that answered `ready` gets to draw something before the
+// spinner comes off anyway. `booted` is what normally takes it off; this
+// covers a boot that dies after the script that pings, and an embed page
+// older than that message. Long, because the cost of being early here is the
+// blank panel the spinner exists to prevent, and the reader can dismiss.
+const REVEAL_TIMEOUT_MS = 10_000;
 
 // What a launcher does when the handshake never completes. See the timeout
 // constants above for the window each one gets.
@@ -106,6 +119,15 @@ export interface AcquireOrganizationResult {
   organization_id: string;
 }
 
+// Result of the internal select-organization launcher: the organization the
+// person chose, and the name to show for it. The surface answers the question
+// on its own, so a caller that needs the app installed there raises the
+// install dialog after this one settles.
+export interface SelectOrganizationResult {
+  organization_id: string;
+  name: string;
+}
+
 // Result of the internal document-history launcher (opened by the
 // session's `history` file-menu command). Three outcomes:
 //   - `{ branch_id }`: forked a NEW branch; open editable with
@@ -141,6 +163,14 @@ export interface InstallAppResult {
   installed_at: string;
   scopes: string[];
   app_name: string | null;
+}
+
+// Result of the internal service-credential launcher: the hosts that became
+// usable, so a caller retries the call the refusal interrupted only when the
+// host it named is among them. A reader may settle one host of two and leave
+// the other, so a plain "the dialog closed" says less than this.
+export interface ServiceCredentialResult {
+  ready: string[];
 }
 
 // Result of the `drive-resolve` surface (from `Document.resolveDrive()`):
@@ -223,6 +253,16 @@ export interface HostedUiLauncher {
     docId: string,
     options?: { branch?: string },
   ): Promise<{ branch_id: string } | null>;
+  // Hosted organization picker: one row per organization the caller belongs
+  // to, plus an entry that creates or joins one. It asks which organization
+  // and nothing else, so a caller whose act then needs an install raises the
+  // install dialog against the answer. `currentOrganizationId` marks the one
+  // the app is acting in now, where there is one. Resolves with the choice or
+  // `null` on cancel. Iframe-only with a `BrassError` reject (the caller needs
+  // the id back).
+  selectOrganization(
+    currentOrganizationId?: string,
+  ): Promise<SelectOrganizationResult | null>;
   // Hosted install-consent UI: the org admin reviews the requested scopes in
   // plain language and confirms / rejects; on confirm the backend writes the
   // `ORGANIZATION#/INSTALL#` row. Resolves with the row or `null` on cancel.
@@ -236,12 +276,26 @@ export interface HostedUiLauncher {
   // switch onto); publish-over resolves in place (`newDocId: null`). Resolves
   // with the outcome or `null`. Iframe-only with a `BrassError` reject.
   driveResolve(docId: string): Promise<DriveResolveResult | null>;
+  // Hosted surface for a service credential this app is waiting on. Whoever
+  // can supply it connects the account and admits this app to it; anyone else
+  // is told who to ask. Resolves with the hosts that became usable, or `null`
+  // on cancel.
+  // Iframe-only with a `BrassError` reject (the caller needs the hosts back).
+  serviceCredential(
+    organizationId: string,
+    host: string,
+  ): Promise<ServiceCredentialResult | null>;
 }
 
 export interface HostedUiLauncherOptions {
   // Origin the embed pages are served from. `Brass.init`'s `dashboardBaseUrl`,
   // defaulted by the client.
   dashboardBaseUrl: string;
+  // The organization the app is working in, read at launch time rather than
+  // captured, since a document opening moves it. Scopes the picker's opening
+  // list; absent leaves it on everything the caller can reach, which is what
+  // an app that has not resolved one yet should show.
+  actingOrganizationId?: () => string | null;
   // Threaded into param payloads for surfaces that need it (`installApp`).
   // Every Brass app shares one sign-in client, so the JWT can't
   // disambiguate the asking app; the embed page reads `appId` off the bridge.
@@ -407,6 +461,21 @@ export function trackHostedUiActivations(): void {
   document.addEventListener('keydown', trackActivation, true);
 }
 
+// Whether this surface is the one on top. An app can open a second surface
+// over the first (a toolbar command while a picker is up, a trigger pressed
+// twice), and each one listens for Escape on `window`, where
+// `stopPropagation` does not reach a sibling listener on the same target, so
+// one Escape would dismiss every surface at once and resolve `null` to
+// callers whose dialog the reader never touched. Read off the document rather
+// than a registry the launcher maintains: the surfaces are appended in the
+// order they open, so the last one in document order is the last one in the
+// top layer, and an overlay removed by anything at all stops counting the
+// moment it leaves.
+function isTopmostSurface(overlay: HTMLElement): boolean {
+  const open = document.querySelectorAll('[data-brass-hosted-ui]');
+  return open[open.length - 1] === overlay;
+}
+
 // Who a dismissal should put the keyboard back on: whatever holds focus when
 // the surface opens, or the last control the reader pressed when nothing does.
 function resolveOpener(): HTMLElement | null {
@@ -555,11 +624,11 @@ function openEmbed(
     card.appendChild(closeButton);
     card.appendChild(iframe);
 
-    // Loading spinner over the iframe until the `ready` handshake. Without it
-    // the user sees a blank panel for ~300-1000ms while the iframe boots,
-    // reading as "the click did nothing". It can't sit BEHIND the iframe
-    // because the iframe paints its own background synchronously (the
-    // OS-color-flash defense above), so it goes on top and hides on `ready`.
+    // Loading spinner over the iframe until the embed page reports `booted`.
+    // Without it the user sees a blank panel while the iframe boots, reading
+    // as "the click did nothing". It can't sit BEHIND the iframe because the
+    // iframe paints its own background synchronously (the OS-color-flash
+    // defense above), so it goes on top.
     const loader = document.createElement('div');
     Object.assign(loader.style, {
       position: 'absolute',
@@ -596,6 +665,8 @@ function openEmbed(
 
     let settled = false;
     let readyTimer: ReturnType<typeof setTimeout> | undefined;
+    let revealTimer: ReturnType<typeof setTimeout> | undefined;
+    let revealed = false;
 
     // Where to put the reader back. Dismissal detaches the dialog rather than
     // closing it in place, so this is the launcher's job; a reader left on
@@ -624,9 +695,29 @@ function openEmbed(
       window.removeEventListener('keydown', onKeydown, true);
       overlay.removeEventListener('cancel', onCancel);
       if (readyTimer !== undefined) clearTimeout(readyTimer);
+      if (revealTimer !== undefined) clearTimeout(revealTimer);
       if (overlay.open) overlay.close();
       overlay.remove();
       restoreFocus();
+    }
+
+    // Hand the frame to the reader: the embed page has drawn something, so
+    // the spinner comes off and the keyboard goes in.
+    function revealFrame(): void {
+      if (revealed) return;
+      revealed = true;
+      if (revealTimer !== undefined) clearTimeout(revealTimer);
+      // Delayed removal so the last 120ms is a fade, not a snap.
+      loader.style.opacity = '0';
+      window.setTimeout(() => {
+        loader.style.display = 'none';
+      }, 150);
+      // Opening the dialog leaves focus on the close button, which is the
+      // right place to wait out the load and the wrong place to stay once
+      // there is something inside to receive the keyboard. Only when the
+      // reader has not moved in the meantime, since taking focus back off a
+      // control they tabbed to during the load is worse than leaving it.
+      if (document.activeElement === closeButton) iframe.focus();
     }
 
     function settleResolve(value: EmbedOutcome | null): void {
@@ -653,24 +744,26 @@ function openEmbed(
 
       switch (data['type']) {
         case 'ready': {
+          // The frame is alive, which is the whole of what the window above
+          // asks. The embed page posts this from a pre-boot script, so it
+          // arrives while the application behind it is still loading and
+          // there is nothing to look at yet.
           if (readyTimer !== undefined) clearTimeout(readyTimer);
           iframe.contentWindow?.postMessage(
             { [EMBED_ENVELOPE]: EMBED_PROTOCOL_VERSION, type: 'init', surface, params },
             dashboardOrigin,
           );
-          // Embed page mounted; fade the loader out (delayed removal so the
-          // last 120ms is a fade, not a snap).
-          loader.style.opacity = '0';
-          window.setTimeout(() => {
-            loader.style.display = 'none';
-          }, 150);
-          // Hand the keyboard to the embed now that there is something inside
-          // to receive it: opening the dialog leaves focus on the close
-          // button, which is the right place to wait while the frame boots and
-          // the wrong place to stay once it has. Only when the reader has not
-          // moved in the meantime, since taking focus back off a control they
-          // tabbed to during the load is worse than leaving it where it is.
-          if (document.activeElement === closeButton) iframe.focus();
+          if (revealTimer === undefined && !revealed) {
+            // A frame that comes alive and then draws nothing (a boot that
+            // dies past its first script) would otherwise sit under the
+            // spinner for as long as the reader waits. Show them what is
+            // there instead, and let them close it.
+            revealTimer = setTimeout(revealFrame, REVEAL_TIMEOUT_MS);
+          }
+          break;
+        }
+        case 'booted': {
+          revealFrame();
           break;
         }
         case 'resize': {
@@ -765,10 +858,9 @@ function openEmbed(
     // page relays it as a `cancel` over the bridge. Capture phase so the
     // foreground modal wins over any Escape handler the host app registered.
     function onKeydown(event: KeyboardEvent): void {
-      if (event.key === 'Escape' && !settled) {
-        event.stopPropagation();
-        settleResolve(null);
-      }
+      if (event.key !== 'Escape' || settled || !isTopmostSurface(overlay)) return;
+      event.stopPropagation();
+      settleResolve(null);
     }
     window.addEventListener('keydown', onKeydown, true);
 
@@ -778,6 +870,7 @@ function openEmbed(
     // the backstop for an Escape it does not see.
     function onCancel(event: Event): void {
       event.preventDefault();
+      if (!isTopmostSurface(overlay)) return;
       settleResolve(null);
     }
     overlay.addEventListener('cancel', onCancel);
@@ -904,6 +997,14 @@ export function createHostedUiLauncher(
       // this app can open" filter.
       const params: Record<string, unknown> = {};
       if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
+      // Where the app is working, so the picker opens there rather than on
+      // every document the person can reach. Without it the first list an app
+      // shows spans organizations the app is not installed on, and picking
+      // one of those moves the app somewhere the person did not choose to be.
+      // The picker's own Go-to still reaches everywhere, including work
+      // shared directly from an organization they do not belong to.
+      const actingOrganizationId = opts.actingOrganizationId?.();
+      if (actingOrganizationId) params['organizationId'] = actingOrganizationId;
       // Where the iframe can't be hosted (cookie-partitioning browsers), the
       // picker falls back to a full-page redirect: the standalone page returns
       // the pick on these one-shot params, which the SDK consumes on boot to
@@ -999,6 +1100,20 @@ export function createHostedUiLauncher(
       if (options?.branch !== undefined) params['branch'] = options.branch;
       return launch<{ branch_id: string }>('select-branch', params, 'reject');
     },
+    async selectOrganization(
+      currentOrganizationId?: string,
+    ): Promise<SelectOrganizationResult | null> {
+      // The list is read on the dashboard origin and never crosses the
+      // bridge; only the chosen organization comes back. `appId` rides it for
+      // the same reason the install dialog needs it: one sign-in client
+      // serves every app, so the JWT cannot say which app is asking.
+      const params: Record<string, unknown> = {};
+      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
+      if (currentOrganizationId !== undefined) {
+        params['organizationId'] = currentOrganizationId;
+      }
+      return launch<SelectOrganizationResult>('select-organization', params, 'reject');
+    },
     async installApp(organizationId?: string): Promise<InstallAppResult | null> {
       // Thread the caller's `appId` over the bridge so the embed page renders
       // the right app's name + scopes (every Brass app shares one sign-in
@@ -1011,6 +1126,17 @@ export function createHostedUiLauncher(
     },
     async driveResolve(docId: string): Promise<DriveResolveResult | null> {
       return launch<DriveResolveResult>('drive-resolve', { docId }, 'reject');
+    },
+    async serviceCredential(
+      organizationId: string,
+      host: string,
+    ): Promise<ServiceCredentialResult | null> {
+      // `appId` rides the bridge for the same reason the install dialog needs
+      // it: one sign-in client serves every app, so the JWT cannot say which
+      // app is asking, and this screen grants that app in particular.
+      const params: Record<string, unknown> = { organizationId, host };
+      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
+      return launch<ServiceCredentialResult>('service-credential', params, 'reject');
     },
   };
 }

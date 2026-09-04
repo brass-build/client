@@ -78,6 +78,12 @@ export interface PresenceState {
   /** Entity ids the user has selected. Use to highlight remote
    * selections so collaborators see what each other is working on. */
   selection?: string[];
+  /** Where the user's caret sits in a text container. `key` names the
+   * container (`doc.text(key)`), and both offsets count UTF-16 code
+   * units into its value: `anchor` where the selection began, `head`
+   * where it is now, equal for a plain caret. Use it to draw remote
+   * carets in prose, the way `selection` highlights picked entities. */
+  textCaret?: { key: string; anchor: number; head: number };
 }
 
 // A live participant on a presence topic. Keyed on `connectionId` (one

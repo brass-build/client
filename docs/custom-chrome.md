@@ -130,6 +130,9 @@ hook for keyboard shortcuts).
 Reading the list and calling `run()` wires all of it. You render and
 invoke, and the SDK owns the behavior:
 
+- **`new`** creates a document and binds it, asking the platform where
+  to put it (`Brass.session.create()` under the hood).
+- **`open`** opens the hosted picker and binds what the user chooses.
 - **`history`** drives version preview end to end. During a preview
   `doc.readOnly` is `true`, so gate your own edit controls on it;
   returning to live is the chrome's job (the `mountVersionPreview`

@@ -73,6 +73,17 @@ export interface AccountMenuDeps {
   // dashboard" link. The client's resolved dashboard origin (picks the
   // environment), with no trailing slash.
   dashboardBaseUrl: string;
+  // The organization this app is currently acting in, or null while none has
+  // been resolved or the one resolved has no name yet.
+  getActingOrganization?: () => { id: string; name: string } | null;
+  // Push-based, because the value is resolved lazily at the first act that
+  // needs it and can change when the reader switches.
+  subscribeActingOrganization?: (
+    listener: (organization: { id: string; name: string } | null) => void,
+  ) => () => void;
+  // Opens the hosted surface that picks the organization to act in, which is
+  // also where one gets created.
+  switchOrganization?: () => void;
 }
 
 export type SessionToolbarDeps = FileMenuDeps &
@@ -200,7 +211,8 @@ const CSS = `
   margin:4px 2px; }
 /* [hidden] must beat the block rule above (the account menu swaps its body
    between signed-in actions and the guest's "Sign in"). */
-.b-pop button[hidden], .b-pop a[hidden], .b-pop .b-email[hidden] { display:none; }
+.b-pop button[hidden], .b-pop a[hidden], .b-pop .b-email[hidden],
+.b-pop .b-account-org[hidden] { display:none; }
 .b-identity { display:flex; flex-direction:column; align-items:flex-start;
   gap:1px; min-width:0; }
 /* Cancels the horizontal padding the title and location carry for their focus
@@ -267,9 +279,12 @@ const CSS = `
 /* minmax(0,1fr) so a long name or email ellipsizes instead of widening the
    menu: a grid item's default min-width is its content's intrinsic size. */
 .b-account-id { display:grid; grid-template-columns:minmax(0,1fr); gap:1px; min-width:0; }
-.b-account-name, .b-email { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.b-account-name, .b-email, .b-account-org {
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .b-account-name { font-size:13px; font-weight:600; line-height:1.3; }
-.b-email { color:var(--brass-fg-muted); font-size:12px; line-height:1.3; }
+/* The organization line qualifies the identity rather than naming it, so it
+   sits at the address's quiet tier and never competes with the name above. */
+.b-email, .b-account-org { color:var(--brass-fg-muted); font-size:12px; line-height:1.3; }
 .b-account .b-pop button, .b-account .b-pop a {
   display:flex; align-items:center; gap:10px; font-size:13px; }
 .b-account .b-pop svg { flex:0 0 auto; color:var(--brass-fg-muted); }
@@ -1272,22 +1287,25 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     align: 'end',
   });
   // The menu opens on the identity it acts for: the avatar at reading size,
-  // the display name, and the email under it. The name line drops out when the
-  // user has none, leaving the email as the single identifying line.
+  // the display name, the email under it, and the organization the app acts in
+  // under that. The name line drops out when the user has none, leaving the
+  // email as the single identifying line.
   const head = el('div', 'b-account-head');
   const headFace = buildAvatarFace();
   const faceEl = el('span', 'b-account-face');
   faceEl.append(...headFace.nodes);
   const nameEl = el('div', 'b-account-name');
   const emailEl = el('div', 'b-email');
+  const orgEl = el('div', 'b-account-org');
   const identity = el('div', 'b-account-id');
-  identity.append(nameEl, emailEl);
+  identity.append(nameEl, emailEl, orgEl);
   head.append(faceEl, identity);
   const headSep = el('hr', 'b-sep');
   headSep.setAttribute('role', 'separator');
   // Opens the dashboard in a new tab, so the user keeps the app open in the
-  // current one. `/home` is the authenticated landing (resolves the active
-  // org); the bare origin is the sign-in page.
+  // current one, and lands in the organization the app is working in rather
+  // than wherever the dashboard was left. `/home` is the authenticated
+  // landing and stands in when the app is working in none.
   const dashboardLink = el('a');
   dashboardLink.append(
     strokeIcon(
@@ -1301,6 +1319,23 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
   dashboardLink.target = '_blank';
   dashboardLink.rel = 'noopener noreferrer';
   dashboardLink.onclick = () => menu.close();
+  // Sits directly above the dashboard link, so the organization the header
+  // names and the action that changes it read as one block.
+  const switchOrgBtn = el('button');
+  switchOrgBtn.type = 'button';
+  switchOrgBtn.append(
+    strokeIcon(
+      'm17 2 4 4-4 4',
+      'M3 11v-1a4 4 0 0 1 4-4h14',
+      'm7 22-4-4 4-4',
+      'M21 13v1a4 4 0 0 1-4 4H3',
+    ),
+    'Switch organization...',
+  );
+  switchOrgBtn.onclick = () => {
+    menu.close();
+    deps.switchOrganization?.();
+  };
   const signOutBtn = el('button');
   signOutBtn.append(
     strokeIcon('M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4', 'm16 17 5-5-5-5', 'M21 12H9'),
@@ -1323,12 +1358,18 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     menu.close();
     deps.signIn();
   };
-  menu.pop.append(head, headSep, dashboardLink, signOutBtn, signInBtn);
+  menu.pop.append(head, headSep, switchOrgBtn, dashboardLink, signOutBtn, signInBtn);
 
   const triggerFace = buildAvatarFace();
   menu.trigger.append(...triggerFace.nodes);
 
-  const renderUser = (user: BrassUser | null): void => {
+  // The menu acts for a (user, organization) pair, and each half arrives on
+  // its own listener, so both are held here and one render draws them.
+  let currentUser = deps.getUser();
+  let organization = deps.getActingOrganization?.() ?? null;
+
+  const render = (): void => {
+    const user = currentUser;
     triggerFace.render(user);
     headFace.render(user);
     nameEl.textContent = user?.display_name ?? '';
@@ -1346,13 +1387,40 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     dashboardLink.hidden = !signedIn;
     signOutBtn.hidden = !signedIn;
     signInBtn.hidden = signedIn;
+    // The organization line names what the app is acting in, so it is drawn
+    // only when there is something to name: an app that has not needed an
+    // organization yet has not resolved one, and resolving one to fill this
+    // line is the boot-time question the platform refuses.
+    const organizationName = signedIn ? (organization?.name ?? '') : '';
+    orgEl.textContent = organizationName;
+    orgEl.title = organizationName;
+    orgEl.hidden = organizationName === '';
+    dashboardLink.href =
+      signedIn && organization
+        ? `${deps.dashboardBaseUrl}/organizations/${encodeURIComponent(organization.id)}`
+        : `${deps.dashboardBaseUrl}/home`;
+    // Offered to every signed-in reader, including one the line has nothing
+    // to name and one who belongs to a single organization. The surface
+    // behind it both moves the app and creates an organization, so gating it
+    // on already having somewhere else to go would withhold it from exactly
+    // the person it is for; and an app reached by its own URL has resolved
+    // nothing to name, which is the state a deliberate choice settles.
+    switchOrgBtn.hidden = !signedIn || deps.switchOrganization === undefined;
   };
-  renderUser(deps.getUser());
-  const unsub = deps.onUserChange(renderUser);
+  render();
+  const unsub = deps.onUserChange((user) => {
+    currentUser = user;
+    render();
+  });
+  const unsubOrganization = deps.subscribeActingOrganization?.((next) => {
+    organization = next;
+    render();
+  });
   return {
     root: menu.root,
     destroy(): void {
       unsub();
+      unsubOrganization?.();
       menu.destroy();
     },
   };

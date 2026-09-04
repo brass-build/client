@@ -12,10 +12,11 @@
 import {
   LoroDoc,
   LoroMap,
+  type LoroText,
   type PeerID,
   VersionVector,
   decodeImportBlobMeta,
-} from 'loro-crdt';
+} from './wasm-runtime.js';
 
 import { PAGING_COMMIT_ORIGIN, UndoController } from './undo.js';
 import type { DocSyncDiagnostics, UndoControllerOptions } from './types.js';
@@ -31,11 +32,14 @@ import {
   type StateVersion,
 } from './handles.js';
 import type {
+  ChangeOrigin,
   ChangeSource,
   HandleOwner,
   ListHandle,
   MapHandle,
   OrderedMapHandle,
+  TextHandle,
+  TextSubscriber,
 } from './handle-types.js';
 import {
   flattenPagedLookup,
@@ -153,6 +157,46 @@ export type EntityProxy = Record<string, unknown>;
 export type DocumentSubscriber = (event: SyntheticSubscribeEvent) => void;
 export type DocumentUnsubscribe = () => void;
 
+/**
+ * Which handle reads a collection: `map` for `doc.map(key)`, `list` for
+ * `doc.list(key)`, `text` for `doc.text(key)`.
+ *
+ * An ordered map is a pairing of a `map` and a `list` rather than a kind of
+ * its own, so both halves are listed under their own keys.
+ *
+ * Read it as an open set and render an unrecognised kind as one you cannot
+ * name, so a kind added later reaches your app as a value rather than as a
+ * break. This set grew from two to three when `doc.text` arrived.
+ */
+export type RootKind = KnownRootKind | (string & {});
+
+// The kinds this build resolves, kept narrow so the producer below is still
+// checked against them: the public type is open, which on its own would let a
+// misspelt kind through as an ordinary string.
+type KnownRootKind = 'map' | 'list' | 'text';
+
+// Loro names a container's type in its id (`cid:root-notes:Map`), so the kind
+// comes off the enumeration itself and costs no read. A type this package
+// cannot hand anyone a handle for, and cannot describe as text either, is
+// left out rather than guessed at, so every entry a reader gets is one they
+// can act on.
+function rootKindOf(containerId: string): KnownRootKind | null {
+  const type = containerId.slice(containerId.lastIndexOf(':') + 1);
+  if (type === 'Map') return 'map';
+  if (type === 'MovableList' || type === 'List') return 'list';
+  if (type === 'Text') return 'text';
+  return null;
+}
+
+// Maps count entries, lists and text count length. Both are the container's
+// own counter rather than a projection of what it holds.
+function rootIsEmpty(container: unknown): boolean {
+  const sized = container as { size?: number; length?: number };
+  if (typeof sized.size === 'number') return sized.size === 0;
+  if (typeof sized.length === 'number') return sized.length === 0;
+  return false;
+}
+
 // The discriminated event `doc.subscribe` fires. Every event the document
 // produces arrives in this shape, whether a content change or one of the
 // SDK's own metadata ticks, so an app can ignore the argument and re-read in
@@ -213,6 +257,24 @@ function changeSourceOf(event: unknown): ChangeSource {
   return 'local';
 }
 
+// Whether a text container stores `value` unchanged. Loro's text is UTF-8, so
+// an unpaired surrogate is stored as U+FFFD and what the document holds is
+// not the string that was written. Scanned here rather than through
+// `String.prototype.isWellFormed`, which is younger than the browsers this
+// package runs in.
+function storedVerbatim(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const unit = value.charCodeAt(i);
+    if (unit < 0xd800 || unit > 0xdfff) continue;
+    // A trailing surrogate reached before its lead is unpaired by itself.
+    if (unit > 0xdbff) return false;
+    i += 1;
+    const low = i < value.length ? value.charCodeAt(i) : 0;
+    if (low < 0xdc00 || low > 0xdfff) return false;
+  }
+  return true;
+}
+
 // Per-chunk cap on a blob this Document pushes as several ops: a durability
 // resync's missing slice (`computeResyncPush`) and a local commit no write
 // budget bounded (`splitLocalUpdate`).
@@ -222,11 +284,10 @@ function changeSourceOf(event: unknown): ChangeSource {
 // the HTTP op write. Sizing the chunk to a WebSocket frame instead is what
 // makes a heal the most expensive write the SDK performs: the slice a bulk
 // write leaves behind is the whole document, and at frame size that is
-// thousands of ops, each one landing on the document's single storage
-// partition at exactly the size that stays inline on its row. Measured, a
-// 40 MB divergence healed in 16 KB chunks throttled the partition and left
-// the join a tail it refused to serve. The same divergence at this size is
-// tens of ops whose bytes go to the bucket instead.
+// thousands of ops written one after another against the same document.
+// Measured, a 40 MB divergence healed in 16 KB chunks overwhelmed that
+// document's write path and left the join a tail it refused to serve. The
+// same divergence at this size is tens of ops.
 const RESYNC_PUSH_MAX_BYTES = 512 * 1024;
 
 // Hard ceiling for a single irreducible op (one Loro op, unsplittable),
@@ -454,7 +515,15 @@ export type ReadOnlyReason =
   // A change this copy holds was refused, so it shows something no other
   // reader has. Editing on top of it builds more of the same, and `reload()`
   // is what returns the copy to what the platform holds.
-  | 'unsaved';
+  | 'unsaved'
+  // A stream reached the largest size the platform can keep, so it refuses
+  // further writes. Unlike `unsaved`, no reload follows: a stream is one
+  // part of a document, and the rest keeps taking writes, so the app reads
+  // `stream.atCapacity` and stops offering the bulk work on this stream.
+  | 'capacity'
+  // The document opened with no live connection to write through, so a
+  // change would stay on this device.
+  | 'no_connection';
 
 const READ_ONLY_MESSAGES: Record<ReadOnlyReason, string> = {
   link: 'Document is read-only: it was opened via a view-only share link.',
@@ -463,6 +532,12 @@ const READ_ONLY_MESSAGES: Record<ReadOnlyReason, string> = {
   unsaved:
     'Document is read-only: a change could not be saved, so this copy holds ' +
     'work the platform does not. Brass is replacing it with the platform copy.',
+  capacity:
+    'Stream is read-only: it reached the largest size the platform can keep. ' +
+    'Reopen it to keep working from the saved state.',
+  no_connection:
+    'Document is read-only: it opened with no live connection, so a change ' +
+    'would stay on this device.',
 };
 
 export interface DocumentOptions {
@@ -504,6 +579,15 @@ type LocalOpSendHook = (opBlob: Uint8Array) => string;
 // Public Document class. Wraps a LoroDoc; exposes mutate / subscribe /
 // toJSON / close. Construction is cheap: the Loro subscriber attaches
 // lazily (see `_ensureLoroSubscribed`).
+// A root text handle, plus the three hooks the Document drives on it. A text
+// container's subscription anchors to one LoroDoc, so a version checkout has
+// to move it the way it moves a map's or a list's anchor.
+interface RootTextHandle extends TextHandle {
+  _rebind(next: LoroText): void;
+  _resync(): void;
+  _teardown(): void;
+}
+
 export class Document {
   private readonly _doc: LoroDoc;
   private readonly _rootKey: string;
@@ -715,6 +799,11 @@ export class Document {
   // surfaces a terminally-rejected op here so a "could not be saved" outcome
   // reaches the app instead of being a silent forever-retry.
   private _errorReporter: ((err: Error) => void) | null = null;
+  // Set when this document was opened expecting a live transport that was not
+  // available. A write then changes local state and reaches no server, so the
+  // first one is reported rather than dropped in silence.
+  private _transportExpected = false;
+  private _transportUnavailableReported = false;
   private _closed = false;
   // Set true when the Document is parked in the SDK's per-(docId, branchId)
   // cache after an app-level `close()`. The underlying LoroDoc, UndoController,
@@ -727,6 +816,14 @@ export class Document {
   // next session). `_resume()`
   // flips the flag back when the SDK hands the Doc to a new open() call.
   private _suspended = false;
+  // How many times this instance has been handed to an open. The park cache
+  // hands the SAME Document back on a reopen, so "this document is open" is
+  // not one interval per instance and a per-instance mark cannot say which
+  // open it was made in. Anything that spends a once-per-open budget on a
+  // Document (the import runner's one attempt) records this alongside its
+  // mark and re-reads it, so a reopen is a new open rather than the old one
+  // continuing.
+  private _openEpoch = 0;
   // Live = neither closed nor parked. This is the public-surface gate;
   // internal ingress (remote ops, status emits) deliberately checks
   // `_closed` alone, because a parked doc keeps applying remote state.
@@ -824,6 +921,7 @@ export class Document {
     string,
     | { kind: 'map'; key: string; handle: MapHandle<unknown> }
     | { kind: 'list'; key: string; handle: ListHandle<unknown> }
+    | { kind: 'text'; key: string; handle: RootTextHandle }
   >();
 
   // Names the pages this Document's writes may occupy. A page is one value,
@@ -905,6 +1003,125 @@ export class Document {
     string,
     OrderedMapHandle<unknown>
   >();
+  /**
+   * A handle on the top-level text container at `key`, which `roots()` reports
+   * as kind `'text'`.
+   *
+   * Cached per key, so `doc.text('x') === doc.text('x')` holds as it does for
+   * `doc.map`, and a subscriber registered through one keeps firing across a
+   * version checkout.
+   */
+  text(key: string): TextHandle {
+    this._assertOpen();
+    const cacheKey = `text:${key}`;
+    const existing = this._rootHandles.get(cacheKey);
+    if (existing) return existing.handle as TextHandle;
+    const owner = this._handleOwner;
+    const activeSource = (): LoroDoc =>
+      this._checkout !== null ? this._checkout.previewDoc : this._doc;
+    // Reads and writes resolve the active source per call, so a checkout
+    // needs no rebinding for them. A SUBSCRIPTION cannot work that way: it
+    // anchors a listener to one container, and a checkout preview is a
+    // different LoroDoc, so the anchor has to be moved. That is what makes
+    // this handle cached and registered like a map or a list, rather than a
+    // fresh object per call: the app holds the object the rebind reaches.
+    let anchor: LoroText = activeSource().getText(key);
+    const subscribers = new Set<TextSubscriber>();
+    let detach: (() => void) | null = null;
+    // The string this handle's own `update` has just written, armed only
+    // across the synchronous window in which `commit` fires the Loro
+    // subscriber. Materializing a text container is the one cost here that
+    // grows with a document's accumulated edit history rather than with its
+    // length, and `update` has already paid it once to diff against, so a
+    // fanout that materialized again would double the per-keystroke cost of
+    // exactly the field the README teaches. Anything else, a remote op or a
+    // checkout, finds it null and materializes.
+    let justWrote: string | null = null;
+    const fanout = (origin?: ChangeOrigin): void => {
+      // Read for the local write alone. A change from any other source
+      // describes a container this handle did not write, so its value comes
+      // from the container even while a local write is arming one.
+      const value =
+        (origin?.source === 'local' ? justWrote : null) ?? anchor.toString();
+      // Fired off a snapshot: a subscriber may unsubscribe (or register
+      // another) while it runs, and the set it is iterating is the one that
+      // changes underneath it.
+      const current = Array.from(subscribers);
+      for (const cb of current) cb(value, origin);
+    };
+    const attach = (): void => {
+      if (detach !== null || subscribers.size === 0) return;
+      detach = anchor.subscribe((event) => {
+        fanout({ source: owner.originOf(event) });
+      });
+    };
+    const handle: RootTextHandle = {
+      read: (): string => {
+        owner.assertReadable();
+        return activeSource().getText(key).toString();
+      },
+      update: (next: string): void => {
+        owner.assertWritable();
+        owner.ensureLocalUpdatesSubscribed();
+        activeSource().getText(key).update(next);
+        // Armed after the write, so the container already holds `next` for
+        // every subscriber the commit reaches, and cleared however the
+        // commit returns: outside this window the fanout has no way to know
+        // the value is still current, and reads it. Armed only for a string
+        // the container holds verbatim, so a subscriber is never handed a
+        // value the document and its peers disagree with.
+        justWrote = storedVerbatim(next) ? next : null;
+        try {
+          owner.commitMutate();
+        } finally {
+          justWrote = null;
+        }
+      },
+      subscribe: (cb: TextSubscriber): (() => void) => {
+        owner.assertReadable();
+        subscribers.add(cb);
+        attach();
+        // No origin: a registration fire describes no authored transition,
+        // matching what a map subscriber's first fire carries.
+        cb(anchor.toString(), undefined);
+        return (): void => {
+          subscribers.delete(cb);
+          if (subscribers.size === 0 && detach !== null) {
+            detach();
+            detach = null;
+          }
+        };
+      },
+      _rebind: (next: LoroText): void => {
+        if (detach !== null) {
+          detach();
+          detach = null;
+        }
+        anchor = next;
+        attach();
+      },
+      // A checkout or a return to head swaps the container rather than
+      // writing into it, so the catch-up fire carries no origin.
+      _resync: (): void => {
+        fanout(undefined);
+      },
+      // Detach the container subscription and forget the callbacks behind it,
+      // as a map or a list handle does: the Document drops its handle cache
+      // here, so an app still holding this one subscribes onto a handle
+      // nothing else reaches, and every callback registered before the park
+      // would come back with it.
+      _teardown: (): void => {
+        if (detach !== null) {
+          detach();
+          detach = null;
+        }
+        subscribers.clear();
+      },
+    };
+    this._rootHandles.set(cacheKey, { kind: 'text', key, handle });
+    return handle;
+  }
+
   orderedMap<T = unknown>(
     mapKey: string,
     orderKey: string,
@@ -1582,12 +1799,15 @@ export class Document {
     for (const entry of this._rootHandles.values()) {
       if (entry.kind === 'map') {
         rebindRootMapAnchor(entry.handle, source.getMap(entry.key));
-      } else {
+      } else if (entry.kind === 'list') {
         rebindRootListAnchor(entry.handle, source.getMovableList(entry.key));
+      } else {
+        entry.handle._rebind(source.getText(entry.key));
       }
     }
     for (const entry of this._rootHandles.values()) {
-      resyncRootHandle(entry.handle);
+      if (entry.kind === 'text') entry.handle._resync();
+      else resyncRootHandle(entry.handle);
     }
   }
 
@@ -1909,11 +2129,23 @@ export class Document {
       }
       const inner = await runtime.openLine(info.line_id);
       const stream = new DocumentStream(name, inner, true);
-      // Opened while a version preview is active: bring the new stream to
-      // the same point in time rather than showing it live under a
-      // historical default.
-      if (this._checkout !== null) {
-        await stream._previewAt(this._checkoutStreamSeqs?.[info.line_id], true);
+      try {
+        // Opened while a version preview is active: bring the new stream to
+        // the same point in time rather than showing it live under a
+        // historical default.
+        if (this._checkout !== null) {
+          await stream._previewAt(this._checkoutStreamSeqs?.[info.line_id], true);
+        }
+      } catch (err) {
+        // The line is joined and subscribed by now, and a rejected open is
+        // dropped from the cache so the next call opens a second one. Nothing
+        // else holds this Document, and nothing else would ever close it: the
+        // parent closes the streams it has, and a stream whose open failed is
+        // not one of them. So the failure disposes what it is abandoning,
+        // rather than leaving a line applying remote ops for the life of the
+        // page.
+        stream._close();
+        throw err;
       }
       return stream;
     })();
@@ -2120,6 +2352,41 @@ export class Document {
     this._commandMenu.setErrorReporter(reporter);
   }
 
+  // Called by the factory when a document is opened with no live transport,
+  // which outside tests means `wsBaseUrl` was left unset. Marking it is what
+  // separates that from the snapshot reads and test stubs that legitimately
+  // have no transport and must stay quiet.
+  /** @internal */
+  markTransportUnavailable(): void {
+    this._transportExpected = true;
+  }
+
+  // A write on such a document reaches nothing: local state changes, the
+  // reader sees their edit, and no server ever hears about it, so the edit is
+  // gone on the next open with no failure anywhere. This is what makes that
+  // observable. Once per document, because the condition holds for as long as
+  // the document is open and repeating it per keystroke buries it.
+  private _reportTransportUnavailable(): void {
+    if (!this._transportExpected) return;
+    if (this._transportUnavailableReported) return;
+    this._transportUnavailableReported = true;
+    // Lock the document as well as reporting it. The write that reached this
+    // point stays local, exactly as `unsaved` describes for a refused one, so
+    // the same gate closes: an app that disables on `readOnly` stops offering
+    // an editor that cannot save, and a later `mutate` throws a sentence
+    // naming the reason instead of succeeding into nothing. The lock lands
+    // after this write's own gate has passed, so the first one still runs
+    // locally and only what follows it is refused.
+    this._markReadOnly('no_connection');
+    this._reportError(
+      new Error(
+        'This document has no live connection, so edits stay on this device and ' +
+          'reach no one else. Pass wsBaseUrl to Brass.init alongside the other ' +
+          'base URLs: naming any one of them leaves wsBaseUrl unset.',
+      ),
+    );
+  }
+
   private _reportError(err: Error): void {
     if (this._errorReporter) this._errorReporter(err);
     else console.error('[Brass]', err);
@@ -2199,8 +2466,9 @@ export class Document {
    * reconnects, and under which correlator, which is what separates a
    * connection that is answering nothing from one that is merely behind.
    *
-   * @internal Telemetry for Brass's own surfaces. An app reads `savingCount`
-   * to know a save is outstanding, and the SDK resolves a stuck one itself.
+   * @internal Read on demand by Brass's own surfaces. An app reads
+   * `savingCount` to know a save is outstanding, and the SDK resolves a stuck
+   * one itself.
    */
   diagnostics(): DocSyncDiagnostics {
     const own: DocSyncDiagnostics = this._diagnosticsProvider?.() ?? {
@@ -2407,7 +2675,10 @@ export class Document {
 
   private _ensureLocalUpdatesSubscribed(): void {
     if (this._unsubLocal) return;
-    if (!this._localOpHook) return;
+    if (!this._localOpHook) {
+      this._reportTransportUnavailable();
+      return;
+    }
     // Loro's `subscribeLocalUpdates` fires after every local commit
     // with the op-blob bytes for that commit. Importing a remote op
     // does NOT trigger this callback, so we don't risk feeding the
@@ -2796,6 +3067,45 @@ export class Document {
     this._gone.mark(reason);
   }
 
+  /**
+   * The top-level collections of the stream this document is open at, keyed
+   * as it keys them, each naming the kind of handle that reads it.
+   *
+   * A partitioned document keeps its collections per stream, so this is the
+   * open stream's answer rather than every stream's. `listStreams` names the
+   * rest, and `stream.roots()` asks one of them the same question.
+   *
+   * `map` / `list` are get-or-create, and taking the wrong kind for a key
+   * materializes a second container beside the real one, so read this before
+   * taking a handle on a key you are unsure of. A collection holding nothing
+   * is not listed, which is what keeps a handle taken but never written from
+   * appearing as one.
+   *
+   * The cost is the number of collections rather than the size of the
+   * document. In checkout, it describes the version being previewed.
+   */
+  roots(): Record<string, RootKind> {
+    this._assertNotClosed();
+    const source =
+      this._checkout !== null ? this._checkout.previewDoc : this._doc;
+    const found: [string, RootKind][] = [];
+    for (const [key, containerId] of Object.entries(source.getShallowValue())) {
+      const kind = rootKindOf(containerId);
+      if (kind === null) continue;
+      // Reading the container's own count, rather than its value, is what
+      // keeps this off the projection: an empty collection is skipped without
+      // anything being decoded.
+      const container = source.getContainerById(containerId);
+      if (container === undefined || rootIsEmpty(container)) continue;
+      found.push([key, kind]);
+    }
+    // Loro reports roots in registration order, which is an accident of who
+    // wrote what first. Inserting in key order makes a reader's iteration
+    // stable across opens.
+    found.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    return Object.fromEntries(found);
+  }
+
   // Plain-JS projection of the current state.
   toJSON(): Record<string, unknown> {
     this._assertNotClosed();
@@ -3043,7 +3353,7 @@ export class Document {
   // undo step, so a bulk write that correctly split into many ops comes back
   // as one op the size of the entire write. Past `MAX_OP_BLOB_CHARS` that op
   // is refused outright and the redone edit never persists, and below it, it
-  // still lands as a single large row on the document's one storage partition.
+  // still lands as one very large write against the document.
   //
   // The ops already exist, so the only lever left is which spans they ship in.
   // The blob names the counter range it covers, and re-exporting a sub-range
@@ -3140,7 +3450,8 @@ export class Document {
     // the app's callback on a doc it has closed. Detaching first stops that;
     // fresh handles are minted on resume + next access.
     for (const entry of this._rootHandles.values()) {
-      teardownRootHandle(entry.handle);
+      if (entry.kind === 'text') entry.handle._teardown();
+      else teardownRootHandle(entry.handle);
     }
     this._rootHandles.clear();
     // Drop the ordered-map cache too. Each wrapper holds the specific root
@@ -3157,6 +3468,7 @@ export class Document {
   /** @internal */
   _resume(): void {
     this._suspended = false;
+    this._openEpoch += 1;
     this._setStreamsSuspended(false);
     // Pair of the `_suspend` presence gate: reopen the presence controller's
     // outbound path and re-advertise this client's cursor on the resumed open.
@@ -3173,6 +3485,13 @@ export class Document {
   /** @internal */
   get _isSuspended(): boolean {
     return this._suspended;
+  }
+
+  /** @internal Which open this Document is currently in (see `_openEpoch`).
+   *  Read by anything holding a per-open mark on a Document, since a park hit
+   *  hands the same instance to the next open. */
+  get _openGeneration(): number {
+    return this._openEpoch;
   }
 
   close(): void {
@@ -3213,7 +3532,8 @@ export class Document {
     // per-container Loro subscription outlives the cache reference, and
     // `_doc.free()` must not run with subscriptions still attached.
     for (const entry of this._rootHandles.values()) {
-      teardownRootHandle(entry.handle);
+      if (entry.kind === 'text') entry.handle._teardown();
+      else teardownRootHandle(entry.handle);
     }
     this._rootHandles.clear();
     this._orderedMapHandles.clear();

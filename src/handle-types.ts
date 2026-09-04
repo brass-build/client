@@ -301,3 +301,38 @@ export interface OrderedMapHandle<T = unknown> {
    */
   onSettled(cb: () => void): HandleUnsubscribe;
 }
+
+
+/**
+ * A handle on a top-level text container. `roots()` reports such a container
+ * as kind `'text'`; this is what reads and writes one.
+ *
+ * Deliberately small. The record surface (`map` / `list` / `orderedMap`) is
+ * where an app models its own data, and a text root is what a document
+ * authored elsewhere may carry, so this covers reading it and replacing it
+ * rather than growing a rich-text editing surface.
+ */
+export interface TextHandle {
+  /** The container's current contents. */
+  read(): string;
+  /**
+   * Replace the contents. Loro diffs against what is stored and applies the
+   * smallest edit that gets there, so a concurrent edit elsewhere in the text
+   * survives, where writing the whole string as one replacement would discard
+   * it.
+   */
+  update(next: string): void;
+  /** Fires once on registration with the current contents, then on every change. */
+  subscribe(cb: TextSubscriber): HandleUnsubscribe;
+}
+
+// A text subscriber. Fires once on registration with the current contents,
+// then on every change. `origin` carries who authored the change, the way
+// `MapSubscriber`'s does, and is undefined on a fire that describes no
+// authored transition (registration, and the whole-container catch-up a
+// checkout or a return to head produces).
+//
+// A field bound to a text container needs it: the value arrives on the app's
+// own keystroke as well as on a peer's, and only the two peers' fires ask
+// the app to move a caret that a person is sitting in.
+export type TextSubscriber = (value: string, origin?: ChangeOrigin) => void;

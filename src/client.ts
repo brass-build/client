@@ -7,6 +7,7 @@ import {
   type RefreshOutcome,
   type TokenSet,
 } from './auth-flow.js';
+import { ensureWasmReady } from './wasm-runtime.js';
 import { decodeIdToken } from './jwt.js';
 import { createEmitter } from './emitter.js';
 import {
@@ -45,10 +46,27 @@ import {
 import { readGuestLinkToken } from './guest-link.js';
 import { consumeLaunchOrganizationId } from './launch-context.js';
 import {
+  callService,
+  normalizeServiceHost,
+  listAppServices,
+  type AppServiceState,
+  type CallServiceOptions,
+} from './call-service.js';
+import {
   clearAll as clearLastSelections,
   readLastDocument,
   storeLastDocument,
 } from './selection-persistence.js';
+import {
+  clearActingOrganization,
+  fetchActingOrganization,
+  readActingOrganization,
+  resolveActingOrganization,
+  switchActingOrganization,
+  storeActingOrganization,
+  visibleOrganization,
+  type ResolveOutcome,
+} from './acting-organization.js';
 import {
   DEFAULT_BRANCH_URL_PARAM,
   DEFAULT_DOC_URL_PARAM,
@@ -303,6 +321,41 @@ export class BrassClient {
   // when the app was reached some other way. A create that names no
   // destination of its own lands here; see `launch-context.ts`.
   private launchOrganizationId: string | null = null;
+  // The organization this page has resolved to act in, and the name the
+  // server gave it. Held for the life of the page load so repeated acts
+  // resolve once; dropped on sign-out, and replaced by a later switch.
+  private actingOrganization: {
+    id: string;
+    /** Empty for a resolution taken from an open document, which names an
+     * id and nothing else. `nameStoredOrganization` fills it in for the
+     * chrome. */
+    name: string;
+  } | null = null;
+  // Pushed to the account menu, which names the organization once one has a
+  // name. Resolution happens at the first act that needs one, and a document
+  // arrives later still, so the menu is rendered before there is anything to
+  // show and has to hear about it rather than poll.
+  private documentWatchForActingOrganization: (() => void) | null = null;
+  // The open document's organization, named. Null while no document is open,
+  // while its organization is one this reader is not a member of, and until
+  // the name has been read.
+  private chromeDocumentOrganization: { id: string; name: string } | null = null;
+  // Drops a name that arrived after the document it was for moved on.
+  private chromeOrganizationToken = 0;
+  // Names by organization id, so opening five documents in one organization
+  // reads it once. A null value records that the server did not confirm the
+  // id, which is as durable an answer as a name.
+  private organizationNames = new Map<
+    string,
+    { id: string; name: string; installed: boolean } | null
+  >();
+  private actingOrganizationListeners = new Set<
+    (organization: { id: string; name: string } | null) => void
+  >();
+  // One document's organization, by document id. A document's placement
+  // does not move under an open app, so the read behind it runs once per
+  // id; the in-flight promise is shared so concurrent acts make one call.
+  private documentOrganizationIds = new Map<string, Promise<string | null>>();
   // The app's export backend (`Brass.registerSerializer`), invoked by the
   // platform when a hosted surface downloads an app-owned blob doc. One
   // per app; a later registration replaces the earlier.
@@ -339,6 +392,15 @@ export class BrassClient {
     // the click handler that opens a surface, so it would miss the press that
     // opened it and have nothing to hand focus back to on dismissal.
     trackHostedUiActivations();
+    // The WASM this package runs on is fetched from here, so the download
+    // overlaps the auth round-trip below and is usually ready before anything
+    // asks for it. It is deliberately NOT awaited here: an app's sign-in
+    // screen needs no engine, and gating `init` on the download puts several
+    // megabytes in front of the first paint of every app that has one. The
+    // paths that construct a document await it instead. The rejection is
+    // absorbed because this call is only the head start; a failure has to
+    // surface at the open that needs it, which retries the fetch.
+    void ensureWasmReady().catch(() => undefined);
     try {
       // A Brass-hosted bundle resolves its app id and all four origins from
       // the serving slot's runtime descriptor, which is authoritative: the
@@ -456,10 +518,7 @@ export class BrassClient {
       await this.hydrateProfile();
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
-      // console.error so the failure is visible in DevTools even when no
-      // onError listener was registered. Prefixed for grep-ability.
-      console.error('[Brass]', error.message);
-      this.fireError(error);
+      this.reportUncatchable(error);
       // Deliberately do not re-throw: callers using
       // `void Brass.init(...).then(setup)` should see .then() fire so the
       // page transitions out of its loading state. signIn() etc. continue
@@ -490,7 +549,25 @@ export class BrassClient {
   }
 
   signIn(): void {
-    const appId = this.requireAppId();
+    // Reported rather than thrown, because this is the one gesture an app
+    // offers in a state the SDK itself invited. A failed init resolves with
+    // `authStatus === 'signed-out'`, indistinguishable from a reader who is
+    // genuinely signed out, so every app renders its sign-in control and the
+    // reader clicks it. `signIn` returns void and runs from a click handler,
+    // so a throw there is an uncaught error the app has no way to catch,
+    // raised over a decision the app did not get wrong. The error channel
+    // carries it to the same places, and to the listener the app registered.
+    if (!this.initialized || !this.appId) {
+      this.reportUncatchable(
+        new Error(
+          this.initialized
+            ? 'Brass.init was called without an app ID'
+            : 'Call Brass.init(appId) first',
+        ),
+      );
+      return;
+    }
+    const appId = this.appId;
     if (typeof window === 'undefined') {
       throw new Error('Brass.signIn must be called in a browser');
     }
@@ -544,6 +621,13 @@ export class BrassClient {
     // Clear the per-app selection-persistence layer so the next user
     // on this tab doesn't see the previous user's last selection.
     clearLastSelections(appId);
+    // Same for the organization this app was acting in: the next user's
+    // memberships are their own, so both the stored choice and this page
+    // load's resolution go with the session.
+    clearActingOrganization(appId);
+    this.actingOrganization = null;
+    this.emitActingOrganization();
+    this.documentOrganizationIds.clear();
     const signedOutUrl = buildSignedOutOfAppUrl(this.authBaseUrl, appId, window.location.href);
     // On a Brass-hosted origin, route the sign-out through the edge's
     // /__brass/leave so the first-party brass_site gate cookie is cleared
@@ -584,9 +668,18 @@ export class BrassClient {
     return this.user !== null ? 'signed-in' : 'signed-out';
   }
 
-  // The anonymous public-link token this page was opened with
-  // (`?brass_link=`), or null on the ordinary signed-in path. Set during
-  // `init` and read by the session to boot the read-only guest document.
+  // The organization this app is acting in, as far as this page load already
+  // knows. Synchronous, so nothing is resolved to answer it: the open
+  // document's organization outranks the rest for the same reason it does in
+  // the chrome, since it is what every act made while it is open spends.
+  private knownOrganizationId(): string | null {
+    return (
+      this.chromeDocumentOrganization?.id ??
+      this.actingOrganization?.id ??
+      this.launchOrganizationId
+    );
+  }
+
   get isGuest(): boolean {
     return this.guestLinkTokenValue !== null;
   }
@@ -776,6 +869,21 @@ export class BrassClient {
       signIn: () => this.signIn(),
       signOut: () => this.signOut(),
       dashboardBaseUrl: this._dashboardBaseUrl,
+      getActingOrganization: () => this.visibleActingOrganization(),
+      subscribeActingOrganization: (listener) => {
+        this.actingOrganizationListeners.add(listener);
+        this.watchDocumentForActingOrganization();
+        // A toolbar mounted after a document opened missed the watch's edge,
+        // so ask once on the way in. This is what makes the read pay only for
+        // an app that renders the chrome.
+        void this.refreshChromeOrganization();
+        return () => {
+          this.actingOrganizationListeners.delete(listener);
+        };
+      },
+      switchOrganization: () => {
+        void this.switchActingOrganization();
+      },
       getDocument: (docId) => this.documents.get(docId),
       // The version-preview bar is a hosted embed; it takes the same theme
       // as the other hosted surfaces.
@@ -843,6 +951,10 @@ export class BrassClient {
       this.hostedUiLauncher = createHostedUiLauncher({
         dashboardBaseUrl: this._dashboardBaseUrl,
         callingAppId: appId,
+        // The organization the picker opens on: the one this app is working
+        // in, and otherwise the choice this tab carries for it.
+        actingOrganizationId: () =>
+          this.knownOrganizationId() ?? this.preferredOrganizationId(),
         theme: this.hostedUiTheme,
         serializeForExport: (docId) => this.serializeForExport(docId),
         // The hosted delete surface reports a local delete over the bridge so
@@ -1054,16 +1166,36 @@ export class BrassClient {
   // in which case the caller retries the denied call once.
   private async offerInstallConsent(err: unknown): Promise<boolean> {
     if (!isAppNotInstalled(err) || !err.organizationId) return false;
+    const organizationId = err.organizationId;
     try {
-      const result = await this.getHostedUiLauncher().installApp(
-        err.organizationId,
-      );
-      return result !== null;
+      const result = await this.getHostedUiLauncher().installApp(organizationId);
+      if (result === null) {
+        // Declining abandons the choice, the way declining the install behind
+        // a switch abandons the switch. Kept, it would pin every later act,
+        // and every later visit, to an organization this app cannot serve,
+        // with the chooser only reachable through the account menu.
+        this.forgetActingOrganization(organizationId);
+        return false;
+      }
+      // The choice became one the app can act in, so now it carries past this
+      // page load.
+      storeActingOrganization(this.requireAppId(), organizationId);
+      return true;
     } catch {
       // Hosted UI unavailable here (no DOM, or the dialog failed); the
       // original denial stands.
       return false;
     }
+  }
+
+  // Drop a resolution that never became one the app can act in. Scoped to the
+  // organization named, so a resolution the app has moved on from is left
+  // alone.
+  private forgetActingOrganization(organizationId: string): void {
+    if (this.actingOrganization?.id !== organizationId) return;
+    this.actingOrganization = null;
+    clearActingOrganization(this.requireAppId());
+    this.emitActingOrganization();
   }
 
   // Register the app's export backend. The platform calls it when a
@@ -1304,7 +1436,7 @@ export class BrassClient {
           acquireOrganization: () =>
             this.getHostedUiLauncher().acquireOrganization(),
         },
-        launchOrganizationId: () => this.launchOrganizationId,
+        preferredOrganizationId: () => this.knownOrganizationId(),
         reportError: (err) => this.fireError(err),
       });
     }
@@ -1361,6 +1493,441 @@ export class BrassClient {
   // calls `getAccessToken()` then this reads the same (possibly just
   // refreshed) token set without forcing a second refresh. Rejects on a
   // transient outage for the same reason `getAccessToken` does.
+  // Which organization the next act spends, resolved at the act rather than
+  // at boot: the open document's organization, one already resolved on this
+  // page load, and otherwise the server's answer from the caller's context,
+  // with the hosted dialog asking where context cannot decide. An app never
+  // names one, so this is the only place the answer comes from.
+  // `ask: false` answers null where the chooser would open, for a read an app
+  // makes before the person has pressed anything.
+  private resolveActingOrganizationId(options?: {
+    ask: false;
+  }): Promise<string | null> {
+    const appId = this.requireAppId();
+    return resolveActingOrganization({
+      activeDocumentOrganizationId: () => this.activeDocumentOrganizationId(),
+      cachedResolution: () => this.actingOrganization?.id ?? null,
+      // The launch value is written into the same slot at boot, so this one
+      // read carries both the stored choice and the launch.
+      launchPreference: () => this.launchOrganizationId,
+      storedPreference: () => readActingOrganization(appId),
+      forgetPreference: () => clearActingOrganization(appId),
+      fetchResolved: (prefer) => this.fetchActingOrganization(prefer),
+      pickOrganization: () =>
+        this.pickActingOrganization(this.actingOrganization?.id),
+      remember: (organizationId, organizationName, persist) => {
+        this.setActingOrganization(organizationId, organizationName, persist);
+      },
+    }, options === undefined ? {} : { ask: false });
+  }
+
+  // The same resolve for a caller that has nowhere to put a null: the ladder
+  // asks, and a person who dismisses the chooser is a BrassError rather than
+  // an organization.
+  private async requireActingOrganizationId(): Promise<string> {
+    const resolved = await this.resolveActingOrganizationId();
+    // `resolveActingOrganization` throws rather than answering null while it
+    // may ask, so this is a type narrowing rather than a reachable branch.
+    if (resolved === null) throw new BrassError('No organization chosen.', { status: 400 });
+    return resolved;
+  }
+
+  private fetchActingOrganization(prefer: string | null): Promise<ResolveOutcome> {
+    return fetchActingOrganization(
+      {
+        apiBaseUrl: this.apiBaseUrl,
+        getAccessToken: () => this.getAccessToken(),
+        getAppAssertion: () => this.getAppAssertion(),
+      },
+      prefer,
+    );
+  }
+
+  // The hosted organization picker: it lists the caller's own organizations
+  // and offers to create or join one, which is the whole question being asked
+  // here. An install is a consequence of the answer rather than the question,
+  // so it is left to the act that needs one: the call the resolution feeds
+  // refuses `app_not_installed` and raises the install dialog against the
+  // organization just chosen. Null when the person closed it.
+  //
+  // The surface is iframe-only, since a chosen organization cannot survive a
+  // redirect fallback, so a context that cannot host one (a browser
+  // partitioning third-party storage) cannot ask this question at all. That
+  // reaches the caller as a rejection rather than a dismissal: an act
+  // refuses with it, and a deliberate switch reports it, which is what keeps
+  // the menu's own control from reading as dead.
+  private async pickActingOrganization(current?: string): Promise<string | null> {
+    const result = await this.getHostedUiLauncher().selectOrganization(current);
+    return result?.organization_id ?? null;
+  }
+
+  // The account menu's switch. The same hosted dialog the resolution opens,
+  // reached deliberately rather than from a refused act, so the reader can
+  // move an app to another organization without going to the dashboard.
+  // Dismissal leaves the current one standing.
+  private async switchActingOrganization(): Promise<void> {
+    try {
+      await switchActingOrganization({
+        current: () => this.knownOrganizationId(),
+        pickOrganization: (current) => this.pickActingOrganization(current),
+        fetchResolved: (prefer) => this.fetchActingOrganization(prefer),
+        offerInstall: (organizationId) =>
+          this.getHostedUiLauncher()
+            .installApp(organizationId)
+            .then((r) => r !== null),
+        remember: (organizationId, organizationName) => {
+          this.setActingOrganization(organizationId, organizationName);
+        },
+        reload: () => {
+          // A document belongs to one organization, and it decides every act
+          // made while it is open, so it cannot survive a move to another
+          // one: leaving it open would put the reader in an organization they
+          // did not switch to for everything they then did. Closing it is the
+          // switch, rather than a side effect of it.
+          //
+          // The tab's remembered pick goes whether or not one is open, and
+          // that is the half a close alone does not cover. A reload restores
+          // the last document a person picked, so a switch made with nothing
+          // open reopens the document the reader just moved away from, whose
+          // organization then outranks the one they chose. The switch would
+          // read as a page reload that changed nothing.
+          if (this.appId) clearLastSelections(this.appId);
+          if (this.session.document !== null) this.session.close();
+          if (typeof window !== 'undefined') window.location.reload();
+        },
+      });
+    } catch (err) {
+      this.fireError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+
+  // The open document's organization. The Document itself does not carry one,
+  // so this reads the record once per document id and remembers it; a
+  // document picked through the hosted picker already named its organization
+  // on the way in, which answers with no request at all.
+  private activeDocumentOrganizationId(): Promise<string | null> {
+    // A link guest holds no API credential, so there is nothing to read with.
+    if (this.guestLinkTokenValue !== null) return Promise.resolve(null);
+    const docId = this.session.document?.id;
+    if (!docId) return Promise.resolve(null);
+    const known = this.documentOrganizationIds.get(docId);
+    if (known) return known;
+    const lastPicked = readLastDocument(this.requireAppId());
+    const pending =
+      lastPicked?.doc_id === docId
+        ? Promise.resolve(lastPicked.organization_id)
+        : this.documents
+            .get(docId)
+            .then((record) => record.organization_id)
+            .catch(() => {
+              // The server resolves an organization from the caller's context
+              // without this, so a failed read costs a request rather than the
+              // act that needed one. It is dropped rather than remembered,
+              // since what the read would have answered still outranks that
+              // fallback for every later act on this document.
+              this.documentOrganizationIds.delete(docId);
+              return null;
+            });
+    this.documentOrganizationIds.set(docId, pending);
+    return pending;
+  }
+
+  // Record the organization this app acts in, from a surface where the person
+  // chose it. Replaces whatever this page load had resolved, so the next act
+  // spends the new one rather than a memo of the old.
+  // @internal
+
+  // The one writer of the memo, the stored slot and the menu, so a resolution
+  // and a switch cannot report different things to the chrome.
+  // What this tab would offer the server as its preference: the launch value
+  // first, since it is the freshest thing this tab knows, then the choice a
+  // previous act on this page confirmed. Neither is an answer; the server
+  // validates both.
+  private preferredOrganizationId(): string | null {
+    if (this.launchOrganizationId) return this.launchOrganizationId;
+    return this.appId ? readActingOrganization(this.appId) : null;
+  }
+
+  private setActingOrganization(
+    organizationId: string,
+    organizationName: string,
+    // False while the app is not installed there: the choice holds for this
+    // page load, so the install the refusal raises is about the organization
+    // the reader just picked, and it is written to the slot once that install
+    // lands rather than before. False again for a resolution taken from an
+    // open document, which is where the app is working rather than a choice
+    // the person made.
+    persist = true,
+  ): void {
+    const appId = this.requireAppId();
+    // An id can arrive with no name, from a resolution an open document
+    // answered. Keep a name the chrome has already read for that same
+    // organization rather than blanking the line the reader is looking at.
+    const name =
+      organizationName === '' && this.actingOrganization?.id === organizationId
+        ? this.actingOrganization.name
+        : organizationName;
+    this.actingOrganization = { id: organizationId, name };
+    if (persist) storeActingOrganization(appId, organizationId);
+    this.emitActingOrganization();
+  }
+
+  private visibleActingOrganization(): { id: string; name: string } | null {
+    return visibleOrganization(
+      this.session.document === null
+        ? null
+        : { organization: this.chromeDocumentOrganization },
+      this.actingOrganization,
+    );
+  }
+
+  // Opening or closing a document changes which organization the next act
+  // spends, so the chrome has to hear about it. Keyed on the document's id
+  // rather than on the session event, which also fires on every mutation.
+  private watchDocumentForActingOrganization(): void {
+    if (this.documentWatchForActingOrganization) return;
+    let lastDocId = this.session.document?.id ?? null;
+    this.documentWatchForActingOrganization = this.session.subscribe(() => {
+      const docId = this.session.document?.id ?? null;
+      if (docId === lastDocId) return;
+      lastDocId = docId;
+      void this.refreshChromeOrganization();
+    });
+  }
+
+  // Name the organization the chrome would show, where one is already known.
+  //
+  // This never RESOLVES an organization: it asks the server to name an id the
+  // app already holds, and takes the answer only when the server names the
+  // same one back. An app reached by its own URL with nothing stored has no
+  // id, so nothing is asked and the menu stays silent, which is the state a
+  // person who has not acted yet is genuinely in.
+  //
+  // The mismatch case is the load-bearing half. A document can live in an
+  // organization the reader reaches through a directly shared project and is
+  // not a member of; the route then resolves something else, and naming that
+  // would put an organization on screen that has nothing to do with what is
+  // open. So a name is shown only when the server confirms the id asked
+  // about.
+  private async refreshChromeOrganization(): Promise<void> {
+    const token = ++this.chromeOrganizationToken;
+    const documentOrganizationId = await this.activeDocumentOrganizationId();
+    const named =
+      documentOrganizationId === null
+        ? null
+        : await this.namedOrganization(documentOrganizationId);
+    // A later document (or a switch) started its own resolve while this one
+    // was in flight, and its answer is the current one.
+    if (token !== this.chromeOrganizationToken) return;
+    this.chromeDocumentOrganization = named;
+    // The document is where this app is working, so its organization is what
+    // the next act spends once the document closes: a reader who opens a
+    // model, closes it and creates another would otherwise be asked where to
+    // put the second one, having just worked in the answer. Held for the page
+    // load rather than written to the tab's slot, because it is where the app
+    // was taken rather than a choice the person made.
+    if (named !== null && named.installed) {
+      this.setActingOrganization(named.id, named.name, false);
+    }
+    this.emitActingOrganization();
+    if (documentOrganizationId === null) await this.nameStoredOrganization(token);
+  }
+
+  // An organization can reach this app as an id with no name: a launch
+  // parameter, the choice this tab carries, or the organization of a document
+  // the reader has just closed. Each is what a cold create and every service
+  // call spend until something else resolves, so the menu owes it a name once
+  // an app renders the chrome, and this is where the memo learns one.
+  //
+  // Nothing happens without an id in hand, which is the case the design turns
+  // on: an app reached by its own URL has none, and asking the server to pick
+  // one so a menu has something to say is the boot-time question this refuses.
+  private async nameStoredOrganization(token: number): Promise<void> {
+    if (!this.appId) return;
+    // A memo carrying a name was named by the server already.
+    if (this.actingOrganization !== null && this.actingOrganization.name !== '') {
+      return;
+    }
+    const stored = this.actingOrganization?.id ?? this.preferredOrganizationId();
+    if (stored === null) return;
+    const named = await this.namedOrganization(stored);
+    // A stored id the caller has since left resolves as some OTHER
+    // organization, which `namedOrganization` refuses. Staying silent is the
+    // right answer: adopting what the server picked would be resolving one to
+    // decorate a menu.
+    if (named === null || token !== this.chromeOrganizationToken) return;
+    // An organization this app is no longer installed on is not one it is
+    // acting in, whatever the tab is carrying. Adopting it here would be the
+    // chrome deciding where acts land: the memo it writes is what the
+    // resolver answers from before it asks the server anything, so the
+    // staleness check on the way in never runs and every act is refused for
+    // an organization somebody deliberately removed this app from. Drop the
+    // carried value and stay silent, which is the state the reader is in.
+    if (!named.installed) {
+      this.forgetActingOrganization(named.id);
+      clearActingOrganization(this.appId);
+      return;
+    }
+    this.setActingOrganization(named.id, named.name);
+  }
+
+  private async namedOrganization(
+    organizationId: string,
+  ): Promise<{ id: string; name: string; installed: boolean } | null> {
+    const cached = this.organizationNames.get(organizationId);
+    if (cached !== undefined) return cached;
+    let named: { id: string; name: string; installed: boolean } | null = null;
+    try {
+      const outcome = await this.fetchActingOrganization(organizationId);
+      if (outcome.kind === 'resolved' && outcome.organizationId === organizationId) {
+        named = {
+          id: outcome.organizationId,
+          name: outcome.organizationName,
+          installed: outcome.installed,
+        };
+      }
+    } catch {
+      // A name is decoration. A failed read leaves the menu quiet rather than
+      // costing the app anything, and is not cached, so the next document
+      // change asks again.
+      return null;
+    }
+    // A name is durable; whether this app is installed there is not, since an
+    // admin can install it while the page is open. So an answer carrying
+    // `installed: false` is returned and not kept, and the next read asks
+    // again rather than reporting what was true once.
+    if (named === null || named.installed) {
+      this.organizationNames.set(organizationId, named);
+    }
+    return named;
+  }
+
+  private emitActingOrganization(): void {
+    const visible = this.visibleActingOrganization();
+    for (const listener of this.actingOrganizationListeners) {
+      try {
+        listener(visible);
+      } catch (err) {
+        this.fireError(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+  }
+
+  // One brokered call to an outside service the app's manifest declares.
+  // Brass attaches the credential, so the app holds none and the key never
+  // reaches the browser.
+  //
+  // Returns the service's own answer rather than throwing on it: a `401` from
+  // the service, a `409` for a service nobody has keyed yet, and a `429` at a
+  // cap are all results the app renders differently.
+  async callService(
+    host: string,
+    path: string,
+    options?: CallServiceOptions,
+  ): Promise<Response> {
+    this.requireInit();
+    const service = normalizeServiceHost(host);
+    return callService(
+      {
+        apiBaseUrl: this.apiBaseUrl,
+        getAccessToken: () => this.getAccessToken(),
+        getAppAssertion: () => this.getAppAssertion(),
+        resolveOrganization: (ask) =>
+          ask
+            ? this.requireActingOrganizationId()
+            : this.resolveActingOrganizationId({ ask: false }),
+        offerInstallConsent: (err) => this.offerInstallConsent(err),
+        offerServiceCredential: (organizationId, serviceHost) =>
+          this.offerServiceCredential(organizationId, serviceHost),
+      },
+      service,
+      path,
+      options,
+    );
+  }
+
+  // Which of the services this app declares would serve a call right now, for
+  // the organization it is acting in. An app whose credential is optional
+  // renders the feature as available or as an upgrade from this, instead of
+  // learning by making a call the reader has already pressed for.
+  //
+  // `ready: false` carries the same `code` the call itself answers with, so an
+  // app branches on one vocabulary rather than two.
+  async listServices(): Promise<AppServiceState[] | null> {
+    this.requireInit();
+    // A reader with no session is acting nowhere, which is the state null
+    // reports, so a page that calls this while it loads gets an answer to
+    // render on rather than a rejection. A transient outage rejects from
+    // here, since that is not an answer about where the app is acting.
+    if ((await this.getAccessToken()) === null) return null;
+    // Resolved without the chooser: an app calls this to decide what to
+    // render, before the reader has pressed anything, so a question put here
+    // is one they did not ask for. `callService` is the act, and the act is
+    // where a question belongs.
+    const orgId = await this.resolveActingOrganizationId({ ask: false });
+    // Null is a state the app renders on: it is acting nowhere yet.
+    if (orgId === null) return null;
+    const deps = {
+      apiBaseUrl: this.apiBaseUrl,
+      getAccessToken: () => this.getAccessToken(),
+      getAppAssertion: () => this.getAppAssertion(),
+    };
+    try {
+      return await listAppServices(deps, orgId);
+    } catch (err) {
+      // An organization that has not installed this app is the same kind of
+      // answer as having none resolved: something only a person can settle, so
+      // it is reported here and raised by `callService`, where the reader has
+      // acted.
+      if (isAppNotInstalled(err)) return null;
+      throw err;
+    }
+  }
+
+  // Open the hosted dialog for one service, from the app's own affordance
+  // rather than from a refused call. Resolves true when that host became
+  // usable, which is when a caller re-reads or retries.
+  //
+  // Takes a host the manifest declares, or a pattern it declares where the
+  // address names the account (`*.myshopify.com`). One method rather than two,
+  // because what the caller is asking for is the same in both: an account this
+  // app can spend at a service it declared.
+  async connectService(host: string): Promise<boolean> {
+    this.requireInit();
+    const orgId = await this.requireActingOrganizationId();
+    return this.offerServiceCredential(orgId, normalizeServiceHost(host));
+  }
+
+  // A brokered call was refused for a credential somebody using the app can
+  // supply, which the platform states on the refusal rather than the SDK
+  // reading it off the code. Open the hosted dialog, which asks whoever is
+  // there for whatever the host is missing and tells anyone who cannot answer
+  // who to ask. Resolves true only when this host became usable, in which case
+  // the caller sends the refused call again.
+  private async offerServiceCredential(
+    organizationId: string,
+    host: string,
+  ): Promise<boolean> {
+    try {
+      const result = await this.getHostedUiLauncher().serviceCredential(
+        organizationId,
+        host,
+      );
+      if (result === null) return false;
+      // A pattern names a host per account, so what became usable is the
+      // account the reader named rather than the term the app asked under.
+      // Anything under the pattern is what the app can now call.
+      return host.startsWith('*.')
+        ? result.ready.some((ready) => ready.endsWith(host.slice(1)))
+        : result.ready.includes(host);
+    } catch {
+      // Hosted UI unavailable here (no DOM, or the dialog failed); the
+      // original refusal stands.
+      return false;
+    }
+  }
+
   async getAppAssertion(): Promise<string | null> {
     this.requireInit();
     // Paired with `getAccessToken`: a link guest holds no token to assert
@@ -1399,6 +1966,12 @@ export class BrassClient {
     // and strip it here, so a client-side navigation later in the session
     // cannot lose it and the address bar stays the app's own.
     this.launchOrganizationId = consumeLaunchOrganizationId();
+    // The launch value is held rather than stored. It names the organization
+    // the person was standing in when they clicked Open, so it outranks an
+    // older choice from an earlier load, but nothing has validated it yet:
+    // written straight to the slot, a launch naming an organization this app
+    // cannot act in would be carried by the tab for as long as it lives. The
+    // first resolve that confirms it is what writes it.
     this.pendingAuthCode = consumeAuthCodeParam();
     if (this.pendingAuthCode) {
       // A fresh sign-in just landed. Burn any previously-stored
@@ -1543,6 +2116,27 @@ export class BrassClient {
       this.user.sub !== nextUser.sub
     ) {
       this.setTokens(null);
+      this.actingOrganization = null;
+      this.emitActingOrganization();
+      this.documentOrganizationIds.clear();
+    }
+    // A session ENDING, which is where the per-app stashes are dropped.
+    //
+    // They are keyed by app and survive the token set, so they describe the
+    // previous person's pick: their document's name, organization and role,
+    // answered out of storage with no request the server could refuse. The
+    // session's `start()` restores from them, so a stash left behind puts
+    // whoever signs in next into the document the previous person chose.
+    //
+    // On the transition to null rather than on the sub changing, because the
+    // two identities need never meet: a refresh that settles `no_session` in
+    // between (an expiry, a reconnect) drops the tokens, and the arriving
+    // person is then a null-to-user transition that has nothing to compare
+    // against. This branch is also what the retirement above reaches, so the
+    // sub-change path clears through here too.
+    if (this.user !== null && nextUser === null && this.appId) {
+      clearLastSelections(this.appId);
+      clearActingOrganization(this.appId);
     }
     this.tokens = next;
     if (sameUser(this.user, nextUser)) return;
@@ -1588,6 +2182,17 @@ export class BrassClient {
     } catch {
       // Profile hydration is best-effort; the app works without it.
     }
+  }
+
+  // One failure reaches a reader exactly once: the listener when one is
+  // registered, the console otherwise. Used by `init`, which resolves rather
+  // than rejecting, and by the void gestures that cannot throw usefully.
+  // Logging unconditionally would double-report, since the README's own
+  // sample logs under this same `[Brass]` prefix. `_reportError` in
+  // documents.ts and open-document.ts is the same rule.
+  private reportUncatchable(error: Error): void {
+    if (this.errorListeners.size === 0) console.error('[Brass]', error.message);
+    this.fireError(error);
   }
 
   private requireInit(): void {

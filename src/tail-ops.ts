@@ -1,7 +1,7 @@
 // Tail ops arrive in one of two shapes and are used in only one.
 //
-// An op that fit its durable row carries its bytes inline. One that
-// spilled to storage carries a short-lived signed URL instead, because a
+// An op small enough to store inline carries its bytes. A larger one
+// carries a short-lived signed URL instead, because a
 // join response holding several megabytes of base64 is a response the
 // server cannot build. Both mean the same thing to a reader: bytes to
 // apply, in seq order.

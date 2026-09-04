@@ -49,7 +49,13 @@ With an example in hand: the user adds it at their Brass dashboard
 (`https://app.brass.build`) and sends you back the document's link,
 and you read what that document holds. A resolved schema is your
 record contract: pull it and adopt it verbatim
-(`npx @brass-build/cli schema pull --doc <docId>`). A stored file with
+(`npx @brass-build/cli schema pull --doc <docId>`). Read the records too,
+before you write code against them
+(`npx @brass-build/cli contents --doc <docId>` writes the whole document as
+JSON): the schema names the fields and the data tells you what is in them.
+Read all of it rather than the first few records, since a file's records are
+grouped by type and its opening records carry a couple of the types it holds
+and none of the rest. A stored file with
 no schema means your app is its first importer: register your parse
 half with `Brass.registerImporter`, and declare the schema of the
 records you write in `brass-app.json` so the next app can adopt it.
@@ -225,13 +231,16 @@ It inspects the credential and app state for this environment and ends
 in a `Next:` line naming the one command to run. Follow that line, then
 run `brass status` again, for the rest of this section.
 
-Two steps need the human's Brass account, and you cannot stand in for
-it. Drive both to completion rather than noting them and stopping:
+These steps need the human's Brass account, and you cannot stand in for
+them. Drive each to completion rather than noting it and stopping:
 
 - **Getting an app id.** `Brass.init` needs the `app_id` of a
   registered app. Run the first `brass publish` (below): it creates the
-  app and writes its id to `.brass/project.json`, which you read back
-  into `Brass.init('brass_app_...')`. A new app already allows sign-in
+  app and reports the id, which `--json` gives you as `app_id` for your
+  own parsing, and you pass that to `Brass.init('brass_app_...')`. The
+  publish also writes `.brass/project.json`, which is the CLI's own
+  state: commit it so re-runs target the same app, and read the id from
+  the publish result rather than out of that file. A new app already allows sign-in
   from `localhost`, so once you have the id, `Brass.signIn()` works in
   local development with no further setup. (Or the human creates the app
   on the dashboard and gives you the id.)
@@ -241,6 +250,15 @@ it. Drive both to completion rather than noting them and stopping:
   box it prints a URL and short code the human approves from any device.
   Running it and getting the human through approval is your step. For CI
   the human supplies `BRASS_SERVICE_TOKEN` instead.
+- **A key for every service you declared.** An app that declares
+  `services` in `brass-app.json` calls those hosts through Brass, which
+  holds the credential, and the credential comes from the provider's own
+  console. `brass publish` names each host still waiting and the page
+  that takes its key, in the log and in `warnings` under `--json`. Give
+  the human that line as it stands: it carries the host and a link
+  straight to the page. Until they paste it, `Brass.callService` answers
+  `409` with `code: 'app_credential_not_set'` for that host and the app
+  cannot reach it.
 
 Once `brass status` reports a credential, publish:
 
@@ -257,6 +275,9 @@ done:
 - **signed in**: `brass status` confirms a credential.
 - **published**: `brass publish` reported a URL.
 - **opened**: you loaded that URL and confirmed sign-in works there.
+- **keyed**: `brass publish` named no host as still waiting for a key. A
+  host it named is an open item like any other, so offer the link and
+  wait rather than reporting the integration done around it.
 
 An open item is the next thing to offer. When publishing is waiting only
 on the human's sign-in, say so and offer to walk them through

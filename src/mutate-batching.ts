@@ -17,8 +17,8 @@
 //
 // The budget answers to STORAGE, not to the socket: an op past the frame cap
 // takes the HTTP write, which carries about 190x a frame. What storage meters
-// is op COUNT (a seq allocation and HEAD update on the document's one
-// partition, plus an entry in the join's tail budget). Measured on a
+// is op COUNT: each op costs the same bookkeeping whatever its size, and
+// takes a place in the join's tail budget. Measured on a
 // 500,000-element write, 48 KB produces 526 ops and 512 KB produces 158, past
 // which the budget stops binding for that shape, while encode time stays flat
 // throughout: a smaller budget spends op count and buys nothing.

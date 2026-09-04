@@ -2,7 +2,7 @@
 // local-peer-scoped (reverts only this peer's ops), group bracketing collapses
 // same-stroke edits into one entry, and remote-import bookkeeping keeps the
 // redo stack honest across other peers' edits.
-import { UndoManager, type LoroDoc } from 'loro-crdt';
+import { UndoManager, type LoroDoc } from './wasm-runtime.js';
 
 import type { UndoControllerOptions } from './types.js';
 

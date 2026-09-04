@@ -67,8 +67,20 @@ interface PresenceState {
   // The entity ids the user has selected. Use to highlight remote
   // selections so collaborators see what each other is working on.
   selection?: string[];
+  // Where the user's caret sits in a text container. `key` names the
+  // container (`doc.text(key)`), and both offsets count UTF-16 code
+  // units into its value: `anchor` where the selection began, `head`
+  // where it is now, equal for a plain caret. Use it to draw remote
+  // carets in prose, the way `selection` highlights picked entities.
+  textCaret?: { key: string; anchor: number; head: number };
 }
 ```
+
+A caret belongs in `state` rather than in `ext` for the same reason a
+selection does: a document of prose is often open in more than one app,
+and a reader wants to see where the other person is working whichever
+app they are each in. Publish it on every selection change, which the
+10 Hz debounce already paces.
 
 App-specific state (the current tool, a chat bubble, a typing
 indicator) goes under `ext` instead so it stays namespaced and out of

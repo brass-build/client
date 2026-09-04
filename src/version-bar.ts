@@ -88,6 +88,10 @@ function clampHeight(h: number): number {
 // takes the strip. Matches the hosted-UI launcher's own long window.
 const VERSION_BAR_READY_TIMEOUT_MS = 10_000;
 
+// How long a frame that answered gets to draw its strip before the
+// placeholder comes off anyway. See `armRevealTimer`.
+const VERSION_BAR_REVEAL_TIMEOUT_MS = 10_000;
+
 export function createVersionBarFrame(
   root: HTMLElement,
   deps: VersionBarDeps,
@@ -164,6 +168,10 @@ export function createVersionBarFrame(
   // one that never answers, which is why this is a timer rather than a
   // handler.
   let readyTimer: ReturnType<typeof setTimeout> | undefined;
+  // The placeholder holds the strip's height until the embed has drawn its
+  // own, which `booted` reports and this timer backstops.
+  let revealed = false;
+  let revealTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Hand the strip to the SDK-drawn fallback, which carries the two controls
   // that need no timeline (return to latest, close).
@@ -174,10 +182,35 @@ export function createVersionBarFrame(
       clearTimeout(readyTimer);
       readyTimer = undefined;
     }
+    if (revealTimer !== undefined) {
+      clearTimeout(revealTimer);
+      revealTimer = undefined;
+    }
     placeholder.style.display = 'none';
     iframe.style.height = '0';
     fallback.hidden = false;
     renderFallback();
+  }
+
+  // Give the embed's strip the height the placeholder was holding.
+  function revealFrame(): void {
+    if (destroyed || failed || revealed) return;
+    revealed = true;
+    if (revealTimer !== undefined) {
+      clearTimeout(revealTimer);
+      revealTimer = undefined;
+    }
+    placeholder.style.display = 'none';
+    iframe.style.height = `${READY_HEIGHT}px`;
+  }
+
+  // A frame that answers and then draws nothing (a boot that dies past its
+  // first script, an embed page older than `booted`) holds the placeholder
+  // otherwise. The swap is what the reader's controls arrive with, so take
+  // it on the timer rather than leaving the strip inert.
+  function armRevealTimer(): void {
+    if (revealed || revealTimer !== undefined) return;
+    revealTimer = setTimeout(revealFrame, VERSION_BAR_REVEAL_TIMEOUT_MS);
   }
 
   function armReadyTimer(): void {
@@ -267,14 +300,21 @@ export function createVersionBarFrame(
     if (!data || data[EMBED_ENVELOPE] !== EMBED_PROTOCOL_VERSION) return;
     switch (data['type']) {
       case 'ready': {
+        // The frame is alive. It says nothing about the embed having drawn
+        // its strip yet, so the placeholder stays until `booted`: the embed
+        // posts this from a script that runs before its application, and
+        // swapping here would trade the themed placeholder for an empty one.
         ready = true;
         if (readyTimer !== undefined) {
           clearTimeout(readyTimer);
           readyTimer = undefined;
         }
-        placeholder.style.display = 'none';
-        iframe.style.height = `${READY_HEIGHT}px`;
+        armRevealTimer();
         postInit();
+        break;
+      }
+      case 'booted': {
+        revealFrame();
         break;
       }
       case 'resize': {
@@ -336,6 +376,13 @@ export function createVersionBarFrame(
         // page gets a fresh verdict, so the failed state resets with it.
         ready = false;
         failed = false;
+        // The placeholder is back up, so the swap the new page's `booted`
+        // asks for is one this bar has not made yet.
+        revealed = false;
+        if (revealTimer !== undefined) {
+          clearTimeout(revealTimer);
+          revealTimer = undefined;
+        }
         deliveredVersion = undefined;
         fallback.hidden = true;
         placeholder.style.display = '';
@@ -368,6 +415,10 @@ export function createVersionBarFrame(
       if (readyTimer !== undefined) {
         clearTimeout(readyTimer);
         readyTimer = undefined;
+      }
+      if (revealTimer !== undefined) {
+        clearTimeout(revealTimer);
+        revealTimer = undefined;
       }
       window.removeEventListener('message', onMessage);
       iframe.remove();

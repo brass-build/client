@@ -1,6 +1,6 @@
 {
   "name": "@brass-build/client",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Client SDK for Brass",
   "type": "module",
   "main": "./dist/index.js",
@@ -11,15 +11,14 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./vite": {
-      "types": "./dist/vite.d.ts",
-      "import": "./dist/vite.js"
-    },
     "./internal": {
       "types": "./dist/internal.d.ts",
       "import": "./dist/internal.js"
     },
     "./package.json": "./package.json"
+  },
+  "browser": {
+    "./dist/wasm-runtime.js": "./dist/wasm-runtime.browser.js"
   },
   "files": [
     "dist",

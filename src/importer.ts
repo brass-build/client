@@ -73,9 +73,17 @@ const CLAIM_REFUSED_STATUS = 422;
 // protocol is testable against mocked HTTP deps.
 export function createImportRunner(deps: ImportRunnerDeps): ImportRunner {
   let importer: DocumentImporter | null = null;
-  // One attempt per Document instance; a reopen mints a new instance,
-  // whose claim resolves `already_imported` as a no-op.
-  const attempted = new WeakSet<Document>();
+  // One attempt per OPEN, recorded as the open generation the attempt was
+  // made in. The mark cannot be per-instance: an app's `close()` parks the
+  // Document and the park cache hands the SAME instance back on reopen, so a
+  // bare mark says "this document already had its attempt" for the life of the
+  // page. Every path that leaves the file unimported (the claim failing, the
+  // importer throwing, the writes never draining) is then unrecoverable
+  // without a reload, and the reopen the reader reaches for does nothing and
+  // says nothing. Keyed on the open, a reopen attempts again; a document whose
+  // import already finished spends one claim that resolves `already_imported`,
+  // which is what a reopen has always cost on a fresh instance.
+  const attempted = new WeakMap<Document, number>();
   // Documents waiting on server-side work, holding the detach for the status
   // listener that is watching it. Kept apart from `attempted` so the wait does
   // not consume the attempt, and holding the DETACH rather than a bare mark so
@@ -94,7 +102,10 @@ export function createImportRunner(deps: ImportRunnerDeps): ImportRunner {
       importer = fn;
     },
     async attempt(doc: Document): Promise<void> {
-      if (importer === null || doc.id === null || attempted.has(doc)) return;
+      if (importer === null || doc.id === null) return;
+      if (attempted.has(doc) && attempted.get(doc) === doc._openGeneration) {
+        return;
+      }
       // Claiming an import binds the document to THIS client for the claim's
       // lifetime, and only this client can complete it. A document that is
       // closed or parked can no longer read its source or write records, so a
@@ -125,7 +136,7 @@ export function createImportRunner(deps: ImportRunnerDeps): ImportRunner {
           waiting.set(doc, off);
         } catch {
           // The document closed while attaching; nothing left to import
-          // into, and a reopen mints a fresh instance that attempts again.
+          // into, and the attempt is unspent, so the reopen attempts again.
         }
         return;
       }
@@ -133,7 +144,7 @@ export function createImportRunner(deps: ImportRunnerDeps): ImportRunner {
       // rather than leave it to fire against a document already past it.
       waiting.get(doc)?.();
       waiting.delete(doc);
-      attempted.add(doc);
+      attempted.set(doc, doc._openGeneration);
       const run = importer;
       const docId = doc.id;
       let claim: ImportClaimResponse;

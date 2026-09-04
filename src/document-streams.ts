@@ -16,6 +16,7 @@ import type {
   DocumentSubscriber,
   DocumentUnsubscribe,
   EntityProxy,
+  RootKind,
 } from './documents.js';
 import type { DocumentStreamInfo } from './documents-namespace.js';
 import type {
@@ -25,7 +26,12 @@ import type {
   DocumentStatusUnsubscribe,
   DocumentWorkStatus,
 } from './document-signals.js';
-import type { ListHandle, MapHandle, OrderedMapHandle } from './handle-types.js';
+import type {
+  ListHandle,
+  MapHandle,
+  OrderedMapHandle,
+  TextHandle,
+} from './handle-types.js';
 
 // The wiring `Document.stream()` runs on: list/create manifests over
 // HTTP, and open a stream's line (join + WS subscribe) returning the
@@ -76,6 +82,14 @@ export class DocumentStream {
     fn: (d: DocumentMutator<E>) => void,
   ): void {
     this._inner.mutate<E>(fn);
+  }
+
+  roots(): Record<string, RootKind> {
+    return this._inner.roots();
+  }
+
+  text(key: string): TextHandle {
+    return this._inner.text(key);
   }
 
   toJSON(): Record<string, unknown> {

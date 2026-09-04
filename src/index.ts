@@ -14,6 +14,7 @@ import type {
   OpenedDocument,
 } from './open-document.js';
 import type { SelectDocumentResult } from './hosted-ui.js';
+import type { AppServiceState, CallServiceOptions } from './call-service.js';
 import type { DocumentsNamespace } from './documents-namespace.js';
 import type { DocumentImporter } from './importer.js';
 import type { DocumentSerializer } from './serializer.js';
@@ -36,6 +37,11 @@ export type {
   UserChangeListener,
 };
 export { BrassError, type BrassErrorCode } from './errors.js';
+export type {
+  AppServiceState,
+  CallServiceBody,
+  CallServiceOptions,
+} from './call-service.js';
 export {
   type HostedUiTheme,
   type SelectDocumentResult,
@@ -94,6 +100,7 @@ export {
   type DocumentDriveTrackingState,
   type DriveMirrorDirection,
   type EntityProxy,
+  type RootKind,
   type UndoState,
   type UndoStateSubscriber,
 } from './documents.js';
@@ -110,6 +117,8 @@ export type {
   MapSubscriber,
   OrderedMapHandle,
   OrderedMapPosition,
+  TextHandle,
+  TextSubscriber,
 } from './handle-types.js';
 
 export type {
@@ -140,16 +149,21 @@ export type {
 const client = new BrassClient();
 
 // A Brass-hosted bundle (`*.onbrass.app`) resolves its app id and
-// environment from the serving slot, so it uses the zero-argument form;
-// everywhere else the app id is required.
+// environment from the serving slot, so it takes no id; everywhere else the
+// id is supplied. One bundle does both, so the id argument accepts
+// `undefined` and an app can pass whatever its build resolved to without
+// branching on it.
 function init(options?: BrassInitOptions): Promise<void>;
-function init(appId: string, options?: BrassInitOptions): Promise<void>;
+function init(appId: string | undefined, options?: BrassInitOptions): Promise<void>;
 function init(
   appIdOrOptions?: string | BrassInitOptions,
   options?: BrassInitOptions,
 ): Promise<void> {
   if (typeof appIdOrOptions === 'string') return client.init(appIdOrOptions, options);
-  return client.init(undefined, appIdOrOptions);
+  // With no id in the first position the options are in whichever argument
+  // the caller used: `init(options)` on a hosted bundle, `init(undefined,
+  // options)` from an app that resolves its id at build time.
+  return client.init(undefined, appIdOrOptions ?? options);
 }
 
 export const Brass = {
@@ -179,6 +193,31 @@ export const Brass = {
   },
   getAccessToken(): Promise<string | null> {
     return client.getAccessToken();
+  },
+  // One call to an outside service the app's manifest declares, under a
+  // credential Brass holds. Returns the service's own response.
+  callService(
+    host: string,
+    path: string,
+    options?: CallServiceOptions,
+  ): Promise<Response> {
+    return client.callService(host, path, options);
+  },
+  // Which of this app's declared services would serve a call right now, so a
+  // feature that works better with an account connected renders as available
+  // or as an upgrade before the reader presses anything.
+  //
+  // Null while the app is acting in no organization yet, or in one that has
+  // not installed it, which is a state to render the feature as available on.
+  // `connectService` asks when the reader reaches for it.
+  listServices(): Promise<AppServiceState[] | null> {
+    return client.listServices();
+  },
+  // Open the hosted dialog for one service from the app's own affordance.
+  // Whoever can supply the credential does it there; anyone else reads who to
+  // ask. Resolves true when that host became usable.
+  connectService(host: string): Promise<boolean> {
+    return client.connectService(host);
   },
   // Metadata read for a known id (`get`) plus thumbnails. Create / move /
   // list / grant access are hosted-only.

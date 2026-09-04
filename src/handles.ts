@@ -11,7 +11,7 @@ import {
   type LoroEventBatch,
   isContainer,
   type Delta,
-} from 'loro-crdt';
+} from './wasm-runtime.js';
 
 import {
   PAGE_TAG,

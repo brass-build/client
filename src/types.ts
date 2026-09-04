@@ -87,10 +87,12 @@ export interface UndoControllerOptions {
  * A document's own view of how its sync is going, as the client sees it.
  *
  * The server records what reached it, so the facts that separate a write
- * that was lost from a client that is merely slow live only here. Read it
- * when a save is taking longer than it should; `Brass.onError` reports
- * failures, and this reports the state a failure has not yet been declared
- * for.
+ * that was lost from a client that is merely slow live only here.
+ *
+ * @internal Read on demand by Brass's own surfaces, through the `@internal`
+ * `Document.diagnostics()`. An app reads `savingCount` to know a save is
+ * outstanding and `Brass.onError` to hear a failure; the SDK resolves a
+ * stuck save itself.
  */
 export interface DocSyncDiagnostics {
   /** Ops committed locally that the server has not acknowledged. */
