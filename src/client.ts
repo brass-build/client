@@ -7,6 +7,7 @@ import {
   type RefreshOutcome,
   type TokenSet,
 } from './auth-flow.js';
+import { applyAppAssertionHeader, applyClientVersionHeader } from './api-headers.js';
 import { ensureWasmReady } from './wasm-runtime.js';
 import { decodeIdToken } from './jwt.js';
 import { createEmitter } from './emitter.js';
@@ -352,6 +353,14 @@ export class BrassClient {
   private actingOrganizationListeners = new Set<
     (organization: { id: string; name: string } | null) => void
   >();
+  // The resolve in flight, so concurrent acts share one answer and the
+  // chooser opens once. Keyed by whether the caller may be asked, because a
+  // read that answers null where the chooser would open must not settle an
+  // act that is waiting for the person, and an act must not take that null.
+  private actingOrganizationResolve: {
+    ask: boolean;
+    promise: Promise<string | null>;
+  } | null = null;
   // One document's organization, by document id. A document's placement
   // does not move under an open app, so the read behind it runs once per
   // id; the in-flight promise is shared so concurrent acts make one call.
@@ -625,9 +634,7 @@ export class BrassClient {
     // memberships are their own, so both the stored choice and this page
     // load's resolution go with the session.
     clearActingOrganization(appId);
-    this.actingOrganization = null;
-    this.emitActingOrganization();
-    this.documentOrganizationIds.clear();
+    this.retireActingOrganizationState();
     const signedOutUrl = buildSignedOutOfAppUrl(this.authBaseUrl, appId, window.location.href);
     // On a Brass-hosted origin, route the sign-out through the edge's
     // /__brass/leave so the first-party brass_site gate cookie is cleared
@@ -1188,13 +1195,37 @@ export class BrassClient {
     }
   }
 
+  // Everything this page load holds about which organization it acts in, and
+  // what it is called. Enumerated here rather than at each transition,
+  // because the memberships behind every one of these belong to the person
+  // who was signed in: a name, a launch, an open document's organization and
+  // a resolution are all answers about them. A caller that clears a subset
+  // hands the next person the rest, which is what the account menu reads.
+  private retireActingOrganizationState(): void {
+    this.actingOrganization = null;
+    this.launchOrganizationId = null;
+    this.chromeDocumentOrganization = null;
+    this.chromeOrganizationToken += 1;
+    this.organizationNames.clear();
+    this.documentOrganizationIds.clear();
+    this.actingOrganizationResolve = null;
+    this.emitActingOrganization();
+  }
+
   // Drop a resolution that never became one the app can act in. Scoped to the
   // organization named, so a resolution the app has moved on from is left
   // alone.
   private forgetActingOrganization(organizationId: string): void {
     if (this.actingOrganization?.id !== organizationId) return;
     this.actingOrganization = null;
-    clearActingOrganization(this.requireAppId());
+    // The tab's stored choice is a separate answer from this page load's
+    // resolution: the memo may hold an organization the launch or an open
+    // document supplied while the slot holds a deliberate choice made
+    // earlier, so it is cleared only when it names the same organization.
+    const appId = this.requireAppId();
+    if (readActingOrganization(appId) === organizationId) {
+      clearActingOrganization(appId);
+    }
     this.emitActingOrganization();
   }
 
@@ -1500,9 +1531,27 @@ export class BrassClient {
   // names one, so this is the only place the answer comes from.
   // `ask: false` answers null where the chooser would open, for a read an app
   // makes before the person has pressed anything.
+  //
+  // One resolve at a time per mode: concurrent acts share the in-flight one,
+  // so the chooser opens once and every caller hears the same answer. The two
+  // modes stay apart, since a read must not wait on a dialog and an act must
+  // not take a read's null as its answer.
   private resolveActingOrganizationId(options?: {
     ask: false;
   }): Promise<string | null> {
+    const ask = options === undefined;
+    const inFlight = this.actingOrganizationResolve;
+    if (inFlight !== null && inFlight.ask === ask) return inFlight.promise;
+    const promise = this.runActingOrganizationResolve(ask).finally(() => {
+      if (this.actingOrganizationResolve?.promise === promise) {
+        this.actingOrganizationResolve = null;
+      }
+    });
+    this.actingOrganizationResolve = { ask, promise };
+    return promise;
+  }
+
+  private runActingOrganizationResolve(ask: boolean): Promise<string | null> {
     const appId = this.requireAppId();
     return resolveActingOrganization({
       activeDocumentOrganizationId: () => this.activeDocumentOrganizationId(),
@@ -1518,7 +1567,7 @@ export class BrassClient {
       remember: (organizationId, organizationName, persist) => {
         this.setActingOrganization(organizationId, organizationName, persist);
       },
-    }, options === undefined ? {} : { ask: false });
+    }, ask ? {} : { ask: false });
   }
 
   // The same resolve for a caller that has nowhere to put a null: the ladder
@@ -2116,9 +2165,7 @@ export class BrassClient {
       this.user.sub !== nextUser.sub
     ) {
       this.setTokens(null);
-      this.actingOrganization = null;
-      this.emitActingOrganization();
-      this.documentOrganizationIds.clear();
+      this.retireActingOrganizationState();
     }
     // A session ENDING, which is where the per-app stashes are dropped.
     //
@@ -2165,10 +2212,24 @@ export class BrassClient {
     if (!this.apiBaseUrlConfigured) return;
     const token = this.tokens?.accessToken;
     if (!token) return;
+    // The same headers every other data-API call carries. The bearer names
+    // the person and never the app, so a platform that requires the acting
+    // app refuses a request holding only it, and this one degrades silently
+    // (see the catch below), which would leave a reader looking at a raw sub
+    // where their name belongs with nothing reporting why.
+    //
+    // Read straight off the held token set rather than through
+    // `getAppAssertion()`, mirroring the access token above: this is
+    // best-effort hydration, so it must not drive a refresh of its own.
     try {
+      const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+      applyClientVersionHeader(headers);
+      await applyAppAssertionHeader(headers, () =>
+        Promise.resolve(this.tokens?.appAssertion ?? null),
+      );
       const res = await fetch(
         `${this.apiBaseUrl}/users/${encodeURIComponent(this.user.sub)}`,
-        { headers: { Authorization: `Bearer ${token}` } },
+        { headers },
       );
       if (!res.ok) return;
       const profile = (await res.json()) as {

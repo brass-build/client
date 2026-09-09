@@ -154,18 +154,12 @@ export async function resolveActingOrganization(
   options: { ask?: boolean } = {},
 ): Promise<string | null> {
   const fromDocument = await deps.activeDocumentOrganizationId();
-  if (fromDocument) {
-    // Recorded, not merely returned. This is where the app is working, so it
-    // is what the next act spends once the document closes; without it a
-    // reader who opens a document, closes it and creates another is asked
-    // where to put the second one, having just worked in the answer. It carries no name (the
-    // document named an id) and does not reach the tab's slot: a document
-    // can live in an organization the reader reaches through a shared
-    // project and is not a member of, which is a place to act from while it
-    // is open rather than a choice to carry.
-    deps.remember(fromDocument, '', false);
-    return fromDocument;
-  }
+  // Answered, not recorded. A document can live in an organization the
+  // reader reaches through a shared project and is not a member of, which is
+  // a place to act from while it is open and not one to keep once it closes.
+  // The caller records a document's organization only after the server
+  // confirms membership and the install.
+  if (fromDocument) return fromDocument;
   const cached = deps.cachedResolution();
   if (cached) return cached;
 

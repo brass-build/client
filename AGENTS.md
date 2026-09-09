@@ -122,6 +122,27 @@ live backend. Hold that reviewer to implementation-independent checks:
   peer's has to be told so. Both halves fail silently, and a single
   session never reaches either.
 
+Both you and the reviewer need a signed-in browser.
+`brass browser-session` prints a URL that opens your app already signed
+in as you:
+
+```sh
+npx @brass-build/cli browser-session --return-to http://localhost:5173/
+```
+
+Point `--return-to` at your dev server while you build, and at the
+published URL once you have one. Run the command once per browser
+context, at the moment that context is ready to navigate. Each URL signs
+in one browser once and expires two minutes after it is printed. Give
+the two readers a URL each. Both readers are you, so ask the human for a
+second account when a check needs them to be different people.
+
+Open the document by its id, through `Brass.openDocumentById` or the
+`?doc=` parameter the session restores on boot. The picker and Brass's
+other dialogs need a Brass sign-in, which this URL does not provide. The
+`@brass-build/cli` package's `AGENTS.md` covers the rest, including how
+to install and drive a headless browser.
+
 Have the reviewer drive any gesture on a touch device as well as a
 desktop mouse. Drags, multi-point taps, and anything else
 pointer-driven commonly work under a mouse and break under touch, and a
@@ -272,9 +293,10 @@ against this end state, and close out every item before you call it
 done:
 
 - **built**: `npm run build` is clean.
-- **signed in**: `brass status` confirms a credential.
+- **signed in**: `brass status` confirms a publish credential.
 - **published**: `brass publish` reported a URL.
-- **opened**: you loaded that URL and confirmed sign-in works there.
+- **opened**: you loaded that URL in a browser you drive, signed in
+  through `brass browser-session`, and used the app there.
 - **keyed**: `brass publish` named no host as still waiting for a key. A
   host it named is an open item like any other, so offer the link and
   wait rather than reporting the integration done around it.

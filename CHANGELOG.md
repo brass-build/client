@@ -6,6 +6,19 @@ and the package follows [semantic versioning](https://semver.org/spec/v2.0.0.htm
 While the version is below `1.0.0`, minor releases may introduce
 breaking changes.
 
+## 0.4.1
+
+### Fixed
+
+- `Brass.user.display_name` and `Brass.user.avatar_url` keep resolving: the
+  profile read identifies the calling app the way every other call does.
+  Signing in as someone else also clears the previous person's organization
+  from the hosted toolbar.
+- `Brass.callService` and `Brass.connectService` work on a document reached
+  through a project shared with you directly, which can sit in an organization
+  you are not a member of. Several calls needing an organization at once open
+  the chooser once between them.
+
 ## 0.4.0
 
 ### Added
