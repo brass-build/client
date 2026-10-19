@@ -52,8 +52,7 @@ export interface HostedUiProvider {
   ) => Promise<{ branch_id: string } | null>;
   // Open the hosted drive-divergence resolution surface
   // (`Document.resolveDrive()` routes through this). Resolves with the
-  // outcome (a fresh mirror doc id, or `null` newDocId for an in-place
-  // publish-over), or `null` when dismissed.
+  // outcome, or `null` when dismissed.
   driveResolve?: (docId: string) => Promise<DriveResolveResult | null>;
   // Open the hosted acquire-organization surface for a caller with zero
   // organizations; resolves with the organization they created or
@@ -385,7 +384,6 @@ export class CommandMenu {
   private _builtins(): readonly Command[] {
     if (this._builtinCommands !== null) return this._builtinCommands;
     const hasHostedUi = (): boolean => this._hostedUi !== null;
-    const editable = (): boolean => !this.host.readOnly() && this.host.isLive();
     const list: Command[] = [
       this._buildCommand(
         'history',
@@ -482,7 +480,9 @@ export class CommandMenu {
         DOC_COMMAND_LABELS.undo,
         'edit',
         DOC_COMMAND_SURFACES.undo,
-        () => editable() && this.host.canUndo(),
+        // `canUndo` carries the read-only gate per stream: the document can
+        // be read-only while a stream of it takes writes and holds the step.
+        () => this.host.isLive() && this.host.canUndo(),
         () => {
           this.host.undo();
         },
@@ -492,7 +492,7 @@ export class CommandMenu {
         DOC_COMMAND_LABELS.redo,
         'edit',
         DOC_COMMAND_SURFACES.redo,
-        () => editable() && this.host.canRedo(),
+        () => this.host.isLive() && this.host.canRedo(),
         () => {
           this.host.redo();
         },

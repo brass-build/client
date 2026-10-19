@@ -23,8 +23,15 @@ export {
 export { decodeIdToken } from './jwt.js';
 export {
   readDocumentContents,
+  readJoinContents,
   type DocumentContents,
 } from './document-contents.js';
+export { decodeJoinContent, type JoinContent } from './join-content.js';
+export { SEALED_ACCEPT } from './sealed-store.js';
+export { decodeRecordValue } from './record-paging.js';
+// `Brass.documents.list` is internal, so what it takes and returns is too.
+export type { DocumentListing, ListDocumentsQuery } from './documents-namespace.js';
+export type { DocumentList } from './document-set-subscription.js';
 export {
   fetchWithRetry,
   RETRY_READ,

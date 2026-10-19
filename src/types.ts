@@ -30,12 +30,12 @@ export interface BrassInitOptions {
   // its own theme should pass the matching value so the modal doesn't
   // mismatch the page that opened it.
   hostedUiTheme?: HostedUiTheme;
-  // Open a document even when this app's declared schema cannot read it
-  // (default off). Off, the platform refuses such an open and the SDK asks
-  // the person whether to go ahead, so a bookmark or a reload cannot open
-  // one silently. On, every open carries the answer already, which is what
-  // an app driving opens with nobody watching needs.
-  openIncompatibleDocuments?: boolean;
+  /** How the session opens documents. `readOnly: true` opens every document
+   *  the session opens read-only (the URL on boot and reload, Open, a followed
+   *  link, `session.open`), and `doc.reopen()` reopens the bound one for
+   *  editing. A document the session creates opens editable. Default
+   *  editable. */
+  open?: { readOnly?: boolean };
   // Mirror the active document selection to the page URL (default on):
   // writes the doc id (and non-default branch) using `pushState` for a
   // genuine open / branch switch and `replaceState` to pin the boot

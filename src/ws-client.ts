@@ -34,6 +34,7 @@ import {
   type TopicEvent,
   type TopicState,
 } from './topic-lifecycle.js';
+import { PRESENCE_TOPIC_PREFIX } from './presence.js';
 import { SDK_CLIENT_ID } from './version.js';
 
 interface WsClientOptions {
@@ -41,12 +42,8 @@ interface WsClientOptions {
   appId: string;
   getAccessToken: () => Promise<string | null>;
   // Resolves the current app assertion (the auth proxy mints it alongside
-  // the access token). Sent as the `app_assertion` connect param so the
-  // server can enforce Layer 2 on the socket the same way it does on HTTP;
-  // absent / null just means the connection is not app-attested (the
-  // server treats it as first-party, un-gated). Optional so a client
-  // constructed without it (or on the first-party dashboard path) connects
-  // unchanged.
+  // the access token). Sent as the `app_assertion` connect param, which the
+  // server requires wherever it requires the HTTP header.
   getAppAssertion?: () => Promise<string | null>;
   // The anonymous link-guest token (`?brass_link=`), or null on the
   // ordinary signed-in path. When `getAccessToken` returns null but this
@@ -116,6 +113,16 @@ const HEARTBEAT_FIRST_MS = 10_000;
 // credits: the question is whether the path still carries bytes. Two missed
 // replies plus slack, so one dropped `pong` is not enough.
 const SOCKET_SILENCE_LIMIT_MS = 150_000;
+const SUBSCRIBE_RETRY_BASE_MS = 250;
+const SUBSCRIBE_RETRY_MAX_MS = 15_000;
+// How long a sent subscribe may go unacked before it is sent again. The
+// `subscribed` ack can be lost while the frames after it arrive, and frames
+// for an unacked topic are held, so without a second subscribe everything the
+// topic's owner sends waits for the next socket. Well above an ordinary ack's
+// round trip, since each resend repeats the server's open work; a duplicate
+// subscribe is idempotent there.
+const SUBSCRIBE_ACK_TIMEOUT_MS = 5_000;
+const SUBSCRIBE_ACK_TIMEOUT_MAX_MS = 30_000;
 // Spread added to that limit, because the condition is SHARED: the server
 // answers a `ping` after an awaited presence refresh and reap sweep, so its
 // replies slow under exactly the load that makes sockets fragile, and every
@@ -142,7 +149,7 @@ const MAX_QUEUED_FRAMES = 1024;
 // live (`established`) subscription behind it, so any LATER ack means the
 // socket dropped in between and frames may have been missed.
 interface ListenerMeta {
-  onSubscribed?: (info: { resubscribed: boolean }) => void;
+  onSubscribed?: (info: { resubscribed: boolean; currentSeq?: number }) => void;
   onEnded?: (info: { reason: string }) => void;
   expectGap: boolean;
 }
@@ -156,7 +163,12 @@ export interface SubscribeOptions {
   // drop, so frames fanned out in the gap were lost and the subscriber
   // should reconcile by refetching (org-topic events carry no catch-up;
   // only the `doc:` topics replay via `doc_init`).
-  onSubscribed?: (info: { resubscribed: boolean }) => void;
+  onSubscribed?: (info: { resubscribed: boolean; currentSeq?: number }) => void;
+  // Asks the server only to report that a `doc:` topic's document moved: no
+  // `doc_init` follows the ack, and the ack names the branch head as
+  // `currentSeq`. Honoured while every callback on the topic asks for it; a
+  // callback that does not re-subscribes the topic in full.
+  notice?: boolean;
   // Fired once when the server ends the subscription under a caller that
   // still wants it: it refused the subscribe (a revoked grant), or evicted
   // it again after the one silent re-subscribe a connection grants. The
@@ -254,6 +266,19 @@ export class BrassWsClient {
   // one socket cannot move its own deadline every time the check looks at it.
   private silenceLimitMs = SOCKET_SILENCE_LIMIT_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // A subscribe the server could not finish is sent again on a doubling,
+  // jittered delay, so a burst that collided does not collide again in step.
+  // Cleared once the topic leaves its unacked phase or the socket changes.
+  private readonly subscribeRetries = new Map<
+    string,
+    { attempt: number; timer: ReturnType<typeof setTimeout> | null }
+  >();
+  // One per sent subscribe still awaiting its ack (`SUBSCRIBE_ACK_TIMEOUT_MS`).
+  // Cleared with `subscribeRetries`.
+  private readonly subscribeAckWatches = new Map<
+    string,
+    { attempt: number; timer: ReturnType<typeof setTimeout> | null }
+  >();
   // Sockets this client has opened. Every topic and every open document
   // rides this one socket, so the count is a fact about the client rather
   // than about any one of them. Reported in a client's own sync-health
@@ -265,9 +290,20 @@ export class BrassWsClient {
   // once.
   private outboundOverflowReported = false;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  // When the last heartbeat went out, and when each topic was last acked: a
+  // pong describes the rows the server held when it answered that ping, so it
+  // says nothing about a topic acked after the ping was sent.
+  private lastPingSentAt = 0;
+  private readonly ackedAt = new Map<string, number>();
   private closedByUser = false;
   // Page-lifecycle listeners, installed lazily on first connect and removed on
   // user close. Guarded for non-DOM environments (Node, SSR).
+  // Topics every callback subscribed to as a notice (see `notice`).
+  private readonly noticeTopics = new Set<string>();
+  // Topics upgraded from a notice while the notice subscribe was unacked. The
+  // full subscribe waits for that ack: sent alongside, the notice one can
+  // land second and leave the connection a notice subscriber.
+  private readonly upgradeOnAck = new Set<string>();
   private visibilityListener: (() => void) | null = null;
   private onlineListener: (() => void) | null = null;
 
@@ -286,6 +322,18 @@ export class BrassWsClient {
     if (!set) {
       set = new Map();
       this.listeners.set(topic, set);
+    }
+    if (firstForTopic && options.notice === true) {
+      this.noticeTopics.add(topic);
+    } else if (options.notice !== true && this.noticeTopics.delete(topic)) {
+      // The topic was subscribed as a notice, which sends no `doc_init`, and
+      // this callback needs the full subscription.
+      const prior = this.topics.get(topic);
+      if (prior?.phase === 'established') {
+        this.sendIfOpen({ type: 'subscribe', topic });
+      } else if (prior !== undefined && holdsFrames(prior)) {
+        this.upgradeOnAck.add(topic);
+      }
     }
     set.set(callback, {
       ...(options.onSubscribed ? { onSubscribed: options.onSubscribed } : {}),
@@ -321,6 +369,7 @@ export class BrassWsClient {
       if (current.size > 0) return;
       this.listeners.delete(topic);
       this.ownFrameRetryTopics.delete(topic);
+      this.noticeTopics.delete(topic);
       this.dispatch(topic, { type: 'user_unsubscribe' });
       // Drop the connection once no topic is wanted, so no idle socket lingers.
       if (this.listeners.size === 0) {
@@ -336,8 +385,25 @@ export class BrassWsClient {
   private dispatch(topic: string, event: TopicEvent): void {
     const prior = this.topics.get(topic) ?? IDLE_TOPIC;
     const { state, effects } = step(prior, event);
+    if (
+      !holdsFrames(state) ||
+      event.type === 'socket_open' ||
+      event.type === 'socket_closed'
+    ) {
+      this.clearSubscribeRetry(topic);
+    }
+    // A socket transition re-sends every wanted topic in full, and a topic
+    // that left its live phases has no subscription left to upgrade.
+    if (
+      event.type === 'socket_open' ||
+      event.type === 'socket_closed' ||
+      (!holdsFrames(state) && state.phase !== 'established')
+    ) {
+      this.upgradeOnAck.delete(topic);
+    }
     if (state.phase === 'idle') {
       this.topics.delete(topic);
+      this.ackedAt.delete(topic);
     } else if (event.type === 'user_subscribe') {
       // Re-insert so the map's order (the reconnect replay order) tracks
       // subscription order even for a topic re-subscribed after teardown.
@@ -378,7 +444,16 @@ export class BrassWsClient {
       case 'send_subscribe':
         // Dropped when the socket is not open; `socket_open` re-derives a
         // `send_subscribe` for every wanted topic, so nothing is lost.
-        this.sendIfOpen({ type: 'subscribe', topic });
+        if (!this.ws || this.ws.readyState !== this.ws.OPEN) return;
+        this.sendFrame(
+          this.noticeTopics.has(topic)
+            ? { type: 'subscribe', topic, notice: true }
+            : { type: 'subscribe', topic },
+        );
+        this.watchSubscribeAck(topic);
+        return;
+      case 'resend_subscribe_later':
+        this.scheduleSubscribeRetry(topic);
         return;
       case 'send_unsubscribe':
         this.sendIfOpen({ type: 'unsubscribe', topic });
@@ -410,6 +485,54 @@ export class BrassWsClient {
         );
         return;
     }
+  }
+
+  private scheduleSubscribeRetry(topic: string): void {
+    const retry = this.subscribeRetries.get(topic) ?? { attempt: 0, timer: null };
+    if (retry.timer !== null) return;
+    const base = Math.min(
+      SUBSCRIBE_RETRY_MAX_MS,
+      SUBSCRIBE_RETRY_BASE_MS * 2 ** retry.attempt,
+    );
+    retry.attempt += 1;
+    retry.timer = setTimeout(() => {
+      retry.timer = null;
+      const state = this.topics.get(topic);
+      if (!state || !holdsFrames(state)) return;
+      this.runEffect(topic, { kind: 'send_subscribe' });
+    }, base / 2 + Math.random() * (base / 2));
+    this.subscribeRetries.set(topic, retry);
+  }
+
+  private clearSubscribeRetry(topic: string): void {
+    const watch = this.subscribeAckWatches.get(topic);
+    if (watch) {
+      if (watch.timer !== null) clearTimeout(watch.timer);
+      this.subscribeAckWatches.delete(topic);
+    }
+    const retry = this.subscribeRetries.get(topic);
+    if (!retry) return;
+    if (retry.timer !== null) clearTimeout(retry.timer);
+    this.subscribeRetries.delete(topic);
+  }
+
+  // Send the subscribe again if its ack has not arrived in time, on a
+  // doubling delay so a server that is merely slow is not asked repeatedly.
+  private watchSubscribeAck(topic: string): void {
+    const watch = this.subscribeAckWatches.get(topic) ?? { attempt: 0, timer: null };
+    if (watch.timer !== null) clearTimeout(watch.timer);
+    const delay = Math.min(
+      SUBSCRIBE_ACK_TIMEOUT_MAX_MS,
+      SUBSCRIBE_ACK_TIMEOUT_MS * 2 ** watch.attempt,
+    );
+    watch.attempt += 1;
+    watch.timer = setTimeout(() => {
+      watch.timer = null;
+      const state = this.topics.get(topic);
+      if (!state || !holdsFrames(state)) return;
+      this.runEffect(topic, { kind: 'send_subscribe' });
+    }, delay);
+    this.subscribeAckWatches.set(topic, watch);
   }
 
   // Send an arbitrary frame. Queued when the socket is not open and drained on
@@ -524,6 +647,35 @@ export class BrassWsClient {
     }
   }
 
+  /**
+   * Replace the socket because the credential it was opened with no longer
+   * applies (a guest page moved onto another document's link). Wanted topics
+   * re-subscribe on the new socket and queued frames wait for it.
+   */
+  reconnect(): void {
+    if (this.closedByUser) return;
+    if (this.ws === null && !this.connecting) return;
+    this.connectEpoch++;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopHeartbeat();
+    const old = this.ws;
+    this.ws = null;
+    this.lastInboundAt = 0;
+    this.connecting = false;
+    for (const topic of this.topics.keys()) {
+      this.dispatch(topic, { type: 'socket_closed' });
+    }
+    try {
+      old?.close();
+    } catch {
+      // Closing an already-closing socket is fine.
+    }
+    if (this.listeners.size > 0) void this.ensureConnected();
+  }
+
   private async ensureConnected(): Promise<void> {
     // The reconnect bound is deliberately not consulted here. A caller's own
     // connect always attempts, so a client parked on the bound still reaches
@@ -536,11 +688,12 @@ export class BrassWsClient {
     this.closedByUser = false;
     const epoch = ++this.connectEpoch;
     try {
-      const token = await this.opts.getAccessToken();
+      // A page on a link connects with the link, whoever is signed in: the
+      // socket carries one credential, and the link is the one that admits
+      // its document.
+      const guestToken = this.opts.getGuestLinkToken?.() ?? null;
+      const token = guestToken ? null : await this.opts.getAccessToken();
       if (epoch !== this.connectEpoch) return;
-      // Anonymous link guest: no access token, but a link token authorises a
-      // read-only connection.
-      const guestToken = token ? null : this.opts.getGuestLinkToken?.() ?? null;
       if (!token && !guestToken) {
         this.connecting = false;
         this.opts.fireError(
@@ -726,15 +879,22 @@ export class BrassWsClient {
     }
 
     if (type === 'subscribed' && typeof frame.topic === 'string') {
+      this.ackedAt.set(frame.topic, Date.now());
       // `flush_held` drains the frames held back for the unacked subscribe.
       this.dispatch(frame.topic, { type: 'subscribed_ack' });
+      if (this.upgradeOnAck.delete(frame.topic)) {
+        this.sendIfOpen({ type: 'subscribe', topic: frame.topic });
+      }
       const acked = this.listeners.get(frame.topic);
+      const currentSeq = (frame as { current_seq?: unknown }).current_seq;
       if (acked) {
         for (const meta of acked.values()) {
           const resubscribed = meta.expectGap;
           meta.expectGap = true;
           try {
-            meta.onSubscribed?.({ resubscribed });
+            meta.onSubscribed?.(
+              typeof currentSeq === 'number' ? { resubscribed, currentSeq } : { resubscribed },
+            );
           } catch {
             // A bad listener must not break the others or kill the read loop.
           }
@@ -747,8 +907,14 @@ export class BrassWsClient {
       return;
     }
     if (type === 'pong') {
-      // Heartbeat reply; drop silently (the round-trip already reset API
-      // Gateway's idle-timeout).
+      // Heartbeat reply (the round-trip already reset API Gateway's
+      // idle-timeout). It names the presence topics the server still holds a
+      // row on for this socket. A row reaped while this page's timers were
+      // suspended leaves the page out of every roster, and a page that
+      // publishes nothing draws no `not_subscribed` to rejoin, so a missing
+      // topic is subscribed again here.
+      const held = (frame as { presence_topics?: unknown }).presence_topics;
+      if (Array.isArray(held)) this.rejoinDroppedPresence(new Set(held));
       return;
     }
     if (type === 'error') {
@@ -780,7 +946,18 @@ export class BrassWsClient {
     // Topic-scoped server frames: fan out to every callback for the topic.
     if (typeof frame.topic === 'string') {
       this.fanOut(frame.topic, frame);
+      // `doc_gone` evicts every subscriber on the topic server-side. A
+      // subscriber reopening the same topic (a moved document reopens under
+      // the same id) must send its own subscribe, which it only does as the
+      // topic's first listener.
+      if (type === 'doc_gone') this.endTopic(frame.topic);
     }
+  }
+
+  private endTopic(topic: string): void {
+    this.ownFrameRetryTopics.delete(topic);
+    this.dispatch(topic, { type: 'server_ended' });
+    if (this.listeners.size === 0) this.close();
   }
 
   private fanOut(topic: string, frame: unknown): void {
@@ -894,6 +1071,11 @@ export class BrassWsClient {
     return this.isHidden();
   }
 
+  /** Whether any socket has opened since this client was made. */
+  get everOpened(): boolean {
+    return this.socketsOpened > 0;
+  }
+
   /** Whether a socket is open right now. */
   get connected(): boolean {
     return this.ws !== null && this.ws.readyState === this.ws.OPEN;
@@ -965,11 +1147,21 @@ export class BrassWsClient {
           this.dropSilentSocket();
           return;
         }
+        this.lastPingSentAt = Date.now();
         this.sendIfOpen({ type: 'ping' });
         arm(HEARTBEAT_INTERVAL_MS);
       }, delay);
     };
     arm(HEARTBEAT_FIRST_MS);
+  }
+
+  private rejoinDroppedPresence(held: Set<unknown>): void {
+    for (const [topic, state] of this.topics) {
+      if (!topic.startsWith(PRESENCE_TOPIC_PREFIX) || state.phase !== 'established') continue;
+      if (held.has(topic)) continue;
+      if ((this.ackedAt.get(topic) ?? Infinity) >= this.lastPingSentAt) continue;
+      this.dispatch(topic, { type: 'server_dropped' });
+    }
   }
 
   private socketHasGoneSilent(): boolean {

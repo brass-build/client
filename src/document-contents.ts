@@ -26,6 +26,9 @@
 // and not `ensureWasmReady`: its caller holds the bytes already, which means
 // something upstream has opened a document and readied the runtime.
 import { LoroDoc } from './wasm-runtime.js';
+import type { JoinContent } from './join-content.js';
+import { isReservedRootName } from './references.js';
+import { importTailOp } from './tail-op-import.js';
 import {
   META_KEY,
   flattenPagedLookup,
@@ -53,8 +56,29 @@ export function readDocumentContents(
 ): DocumentContents {
   const doc = new LoroDoc();
   if (snapshot !== null) doc.import(snapshot);
-  for (const op of ops) doc.import(op);
+  for (const op of ops) importTailOp(doc, op);
   return readRoots(doc);
+}
+
+/**
+ * Read every root of a join's decoded content.
+ *
+ * Frozen content is read as it stands, with no CRDT engine: it carries no tail
+ * (the conversion that would give it one is the platform's). CRDT content and
+ * a document with no snapshot are materialised with `ops`, as
+ * `readDocumentContents` does.
+ */
+export function readJoinContents(
+  content: JoinContent,
+  ops: readonly Uint8Array[],
+): DocumentContents {
+  if (content.kind === 'frozen') {
+    if (ops.length > 0) {
+      throw new Error('Frozen content arrived with changes above it, so it is not the whole document.');
+    }
+    return content.content.toJSON();
+  }
+  return readDocumentContents(content.kind === 'crdt' ? content.bytes : null, ops);
 }
 
 // A root container id is `cid:root-<name>:<Type>`; the name arrives as the
@@ -68,6 +92,8 @@ function readRoots(doc: LoroDoc): DocumentContents {
   // Root ids only, so the enumeration converts nothing: each root below
   // decides its own read.
   for (const [key, containerId] of Object.entries(doc.getShallowValue())) {
+    // The document's references and read marks are not content.
+    if (isReservedRootName(key)) continue;
     switch (containerType(String(containerId))) {
       case 'Map':
         contents[key] = readMapRoot(doc, key);

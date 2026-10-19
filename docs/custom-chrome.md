@@ -44,7 +44,9 @@ Each piece renders one cluster wired to `Brass.session` and returns
 - `Brass.mountDocumentTitle` renders the document title plus a
   location chip; both open the hosted location editor (rename / move /
   file). On a non-default branch the title carries a branch chip.
-- `Brass.mountUndoRedo` renders undo / redo as prominent buttons.
+- `Brass.mountUndoRedo` renders undo / redo as icon buttons once either
+  can act, and nothing before then, so leave its container free to
+  collapse.
 - `Brass.mountPresenceRoster` renders the who's-here roster of
   coloured initials. It is the receiver half only: still publish your
   own presence state (see the README's "Presence").
@@ -55,17 +57,19 @@ Each piece renders one cluster wired to `Brass.session` and returns
 - `Brass.mountAccountMenu` renders the account avatar menu (email, an
   Open Brass dashboard link, and sign out).
 
-`mountHeader` already includes the historical-version preview banner
-(the return-to-live strip shown while a document is previewing an
-earlier version) above the bar, so a multi-pane app on the header shell
-needs no extra mount for it. A fully custom shell (next section, no
+`mountHeader` draws two strips under the bar. One tells a visitor whose
+document was made without an account that it is temporary, and offers
+sign-in. The other is
+the historical-version preview banner (the return-to-live strip shown
+while a document is previewing an earlier version). A multi-pane app on
+the header shell gets both without another mount. A fully custom shell (next section, no
 `mountHeader`) mounts it itself with `Brass.mountVersionPreview(el)`,
 which renders nothing until there is something to show, like the drive
 badge.
 
-Mount the chrome once, when the user signs in, not per document: the
-file menu has to exist in the "signed in, nothing open" state or a
-fresh user has no New / Open (the same rule as `mountToolbar`).
+Mount the chrome once, when the user signs in or becomes a guest, not
+per document: the file menu has to exist before any document is open or
+a fresh user has no New / Open (the same rule as `mountToolbar`).
 
 ## Fully custom shells: the command list as data
 
@@ -87,8 +91,8 @@ The full built-in set when a doc is bound, in list order:
 
 | `id`       | `group`    | `surface` | `label`            | Enabled when                            |
 | ---------- | ---------- | --------- | ------------------ | --------------------------------------- |
-| `new`      | `session`  | `menu`    | New                | Signed in.                              |
-| `open`     | `session`  | `menu`    | Open...            | Signed in.                              |
+| `new`      | `session`  | `menu`    | New                | Signed in, or signed out where `access.create` in your manifest resolves to `"anyone"`. Never when it is `false`. |
+| `open`     | `session`  | `menu`    | Open... / Upload... (signed out) | Signed in, or signed out where `access.create` in your manifest resolves to `"anyone"`. |
 | `history`  | `document` | `menu`    | Version history... | A document is open.                     |
 | `branches` | `document` | `menu`    | Branches...        | A document is open. Has `children`.     |
 | `share`    | `document` | `menu`    | Share... / Share / Download... | A document is open.         |
@@ -98,8 +102,8 @@ The full built-in set when a doc is bound, in list order:
 
 The order runs use, then manage, then destructive: `new` / `open` put a
 different document on screen, `history` / `branches` put a different
-state of this one there, `share` hands the document to a person or to a
-file, and `manage` (the entry holding the delete) comes last. Render the
+state of this one there, `share` shares the document with someone or
+exports it to a file, and `manage` (the entry that offers delete) comes last. Render the
 list in the order you receive it.
 
 Each command carries `enabled` (read on every notification),
@@ -108,8 +112,8 @@ affordance), and `run()` (always resolves; failures route to
 `Brass.onError`, never throw).
 
 Read `label` on every notification too. `share` relabels once the SDK
-knows whether the document has a file to hand over, since downloading is
-one row of the share dialog rather than a command of its own.
+knows whether the document has an exportable file, since downloading is
+one option in the share dialog rather than a command of its own.
 
 Draw a rule where `group` changes: `'session'` (a different document),
 `'document'` (this document), `'edit'` (undo / redo). The widgets do
@@ -132,7 +136,11 @@ invoke, and the SDK owns the behavior:
 
 - **`new`** creates a document and binds it, asking the platform where
   to put it (`Brass.session.create()` under the hood).
-- **`open`** opens the hosted picker and binds what the user chooses.
+- **`open`** opens the hosted picker and opens the document the user chooses.
+  Without an account it reads `Upload...` and creates a document from a file
+  the visitor chooses (`Brass.session.open()` under the hood). Before either
+  command replaces a document the visitor created without an account and has
+  edited, it prompts whether to sign in to save it to their account.
 - **`history`** drives version preview end to end. During a preview
   `doc.readOnly` is `true`, so gate your own edit controls on it;
   returning to live is the chrome's job (the `mountVersionPreview`
@@ -142,7 +150,7 @@ invoke, and the SDK owns the behavior:
   invoke a child's `run()`; a flat-list shell can call the parent's
   `run()` to open the hosted picker instead.
 - **`share`** opens the hosted share dialog: who can open the document,
-  and, where there is a file to hand over, the download.
+  and, where an exportable file is available, the download action.
 - **`manage`** opens the same dialog on the document itself: its name,
   where it sits, Duplicate, and Delete.
 - **`undo` / `redo`** call `doc.undo()` / `doc.redo()` (see "Undo,

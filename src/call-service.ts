@@ -149,6 +149,10 @@ export interface CallServiceDeps {
     host: string,
   ) => Promise<boolean>;
   fetchImpl?: typeof fetch;
+  /** Injected for tests; defaults to the real timer. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injected for tests; defaults to `Date.now`. */
+  now?: () => number;
 }
 
 export async function callService(
@@ -187,7 +191,7 @@ export async function callService(
     });
   };
 
-  const response = await send();
+  const response = await sendThroughFrontDoor(send, deps);
   // The service's own status is the answer, so nothing here throws on one.
   // The exceptions are the refusals that are a question for the person rather
   // than a result for the app: offer the hosted surface that asks it, and send
@@ -197,13 +201,84 @@ export async function callService(
   const ask = response.headers.get(BRASS_ASK_HEADER);
   if (ask === 'credential') {
     return (await deps.offerServiceCredential(organizationId, host))
-      ? send()
+      ? sendThroughFrontDoor(send, deps)
       : response;
   }
   if (ask !== 'install') return response;
   const denial = await notInstalledDenial(response);
   if (!denial) return response;
-  return (await deps.offerInstallConsent(denial)) ? send() : response;
+  return (await deps.offerInstallConsent(denial))
+    ? sendThroughFrontDoor(send, deps)
+    : response;
+}
+
+// Every answer from Brass carries this header, and the broker drops any header
+// under that prefix a service sends. Without it, in the gateway's own body, the
+// answer came from the gateway in front of Brass: a `429` from its rate limit,
+// or a quick `503` from a call it could not start because the brokered call's
+// concurrency was all in use. Nothing behind the gateway ran for either, so
+// sending it again is safe whatever the method. The gateway's `503` for a call
+// that ran past its 30s limit has the same body, and that call may have reached
+// the service, so a `503` counts only when it came back well inside that limit.
+const ANSWERED_BY_BRASS_HEADER = 'x-brass-answered';
+
+// A quick 503 lasts until a call already running ends, which is within the
+// gateway's 30s limit, so the resend lasts that long. The backoff stays short
+// so the call starts soon after room frees.
+const FRONT_DOOR_WINDOW_MS = 30_000;
+const FRONT_DOOR_BASE_DELAY_MS = 300;
+const FRONT_DOOR_MAX_DELAY_MS = 2_000;
+const FRONT_DOOR_MESSAGES: Record<number, string> = {
+  429: 'Too Many Requests',
+  503: 'Service Unavailable',
+};
+const FRONT_DOOR_503_WITHIN_MS = 10_000;
+
+async function shedByFrontDoor(response: Response, elapsedMs: number): Promise<boolean> {
+  const message = FRONT_DOOR_MESSAGES[response.status];
+  if (message === undefined || response.headers.has(ANSWERED_BY_BRASS_HEADER)) return false;
+  if (response.status === 503 && elapsedMs >= FRONT_DOOR_503_WITHIN_MS) return false;
+  try {
+    const body = (await response.clone().json()) as unknown;
+    return (
+      typeof body === 'object' &&
+      body !== null &&
+      Object.keys(body).length === 1 &&
+      (body as { message?: unknown }).message === message
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function sendThroughFrontDoor(
+  send: () => Promise<Response>,
+  deps: Pick<CallServiceDeps, 'sleep' | 'now'>,
+): Promise<Response> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const firstSentAt = now();
+  let response: Response;
+  for (let attempt = 0; ; attempt += 1) {
+    const startedAt = now();
+    response = await send();
+    if (!(await shedByFrontDoor(response, now() - startedAt))) return response;
+    const delay =
+      Math.min(FRONT_DOOR_BASE_DELAY_MS * 2 ** attempt, FRONT_DOOR_MAX_DELAY_MS) +
+      Math.random() * FRONT_DOOR_BASE_DELAY_MS;
+    if (now() + delay - firstSentAt > FRONT_DOOR_WINDOW_MS) break;
+    await sleep(delay);
+  }
+  // Still shed after the window: answered with the code of Brass's own
+  // limit, so an app branches on one `code` for both, and with an `error`
+  // naming the gateway's status, so a report says which one turned it away.
+  return new Response(
+    JSON.stringify({
+      error: `The gateway in front of Brass turned the call away (${response.status})`,
+      code: 'rate_limited',
+    }),
+    { status: 429, headers: { 'content-type': 'application/json' } },
+  );
 }
 
 // No organization resolved, for a caller that did not ask for the chooser.

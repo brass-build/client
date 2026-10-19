@@ -14,14 +14,18 @@ import type {
   CommandSurface,
   Document,
   DocumentOptions,
+  ReopenMode,
 } from './documents.js';
 import type {
   CreateDocumentArgs,
   CreateDocumentOptions,
   CreateDocumentResult,
+  MintedAnonymousDocument,
   OpenDocumentByIdOptions,
   OpenedDocument,
 } from './open-document.js';
+import type { ReadOnlyDocument } from './read-only-document.js';
+import { placeThroughHostedSurfaces } from './placement.js';
 import type {
   CreateDestinationResult,
   DocumentHistoryResult,
@@ -34,6 +38,7 @@ import type { UrlSelection } from './doc-url-sync.js';
 import type { AuthStatus } from './types.js';
 import { BrassError } from './errors.js';
 import { makeLiveCommand } from './document-commands.js';
+import { appCallbackError } from './subscriber-delivery.js';
 
 // A command in `session.commands`. The SDK owns each command's `run` /
 // `enabled` / `running` plus a `surface` placement hint; the app places each
@@ -49,7 +54,7 @@ export type {
 // Coarse lifecycle state: 'unknown' (auth not yet determined), 'signed-out',
 // 'empty' (signed in, no document), 'loading' (open in flight), 'ready',
 // 'error' (a user-initiated open terminally failed with nothing to fall back
-// to). 'unknown' is distinct from 'signed-out' so a status-gated app renders a
+// to, or `Brass.init` rejected its configuration). 'unknown' is distinct from 'signed-out' so a status-gated app renders a
 // neutral state during boot instead of flashing the sign-in surface at a user
 // who turns out to be signed in. 'error' is distinct from 'empty' so a
 // document the user navigated to but cannot open (deleted, or an access the
@@ -68,6 +73,10 @@ export interface SessionOpenOptions {
   branch?: string;
   // Open a historical version read-only (`document.readOnly` is true).
   version?: number;
+  /** Open this document read-only (`true`) or for editing (`false`), whatever
+   *  the mode set at `Brass.init` (`open: { readOnly }`). Unset, that mode
+   *  decides. */
+  readOnly?: boolean;
   // Forwarded to the Document materialization (e.g. the undo merge
   // interval). Matches `documentOptions` on `OpenDocumentByIdOptions` /
   // `CreateDocumentOptions`.
@@ -92,7 +101,8 @@ export interface DocumentSession {
   // evolve the wording without any app change); an app supplies its own
   // recovery affordances around it and does not author the copy. `.status`
   // is there for logging or an override the app absolutely needs. Cleared on
-  // the next open / create / close.
+  // the next open / create / close. Also set, with no `status`, when
+  // `Brass.init` rejected its configuration (a missing app id).
   readonly error: BrassError | null;
   // While `status` is `'loading'`, a progress message for the open in flight
   // (e.g. `Downloading... 62%`), or null. Populated as a presigned snapshot
@@ -119,15 +129,19 @@ export interface DocumentSession {
   // any, else the empty state. Safe before sign-in (resolves null). Also runs
   // automatically on first sign-in.
   start(): Promise<Document | null>;
+  // With no id, open the hosted picker and make the picked document active;
+  // null on dismiss. Signed out, ask for a file instead and open the document
+  // made from it with no account, as `create` does for an empty one.
+  open(): Promise<Document | null>;
   // Open a document by id and make it active.
+  open(docId: string, options: SessionOpenOptions & { readOnly: true }): Promise<ReadOnlyDocument>;
   open(docId: string, options?: SessionOpenOptions): Promise<Document>;
   // Create a document and make it active. Create-in-place: with no explicit
   // destination it lands as a sibling of the active one. A cold create (no
   // active doc) in a single-org caller lands loose; a multi-org caller is
   // asked via the hosted destination dialog, resolving null on dismiss.
   create(options?: CreateDocumentOptions): Promise<Document | null>;
-  // Open the hosted picker and make the picked document active; null on
-  // dismiss.
+  /** @deprecated Use `open()` with no id. */
   pick(): Promise<Document | null>;
   // Close the active document and return to the empty state.
   close(): void;
@@ -160,10 +174,19 @@ export interface DocumentSession {
    *  delete request failed, so a later remote delete of the same doc is not
    *  misread as local. */
   _clearLocalDelete(docId: string): void;
+  /** @internal Open what the hosted history and branch surfaces switch to
+   *  from the bound document, in the mode that document was opened in. */
+  _openSibling(docId: string, options?: SessionOpenOptions): Promise<Document>;
 }
 
 // Dependency seam. The session is a pure coordinator over the public SDK
 // surface; injecting these keeps it unit-testable and breaks the import cycle.
+export type ClaimedLinkTarget = { docId: string } | 'sign-in' | null;
+
+// Thrown through a guest open whose link leads its claimant to sign in: the
+// open ends with no document and no error, on the signed-out surface.
+class SignInToFollowLink extends Error {}
+
 export interface DocumentSessionDeps {
   isSignedIn(): boolean;
   // The tri-state auth lifecycle, so `status()` reports `'unknown'` during
@@ -226,16 +249,69 @@ export interface DocumentSessionDeps {
   lastSelectedDocument(): SelectDocumentResult | null;
   documents: Pick<DocumentsNamespace, 'get' | 'setThumbnail'>;
   reportError(error: Error): void;
+  // The configuration failure that stopped `Brass.init`, or null. Nothing can
+  // sign in or open while it holds, so it is the session's error.
+  initFailure?(): BrassError | null;
   // Anonymous "anyone with the link" boot. When the page was opened via a
   // public-link token (`?brass_link=`), `guestLinkToken` returns it and the
   // session boots by opening that document read-only through
   // `openDocumentByLink` instead of the signed-in URL / last-selected
   // restore. Absent (returns null) in the ordinary signed-in case.
   guestLinkToken?(): string | null;
+  // Whether the app set `open: { readOnly: true }` at init, which opens every
+  // document the session opens (other than one it creates) read-only.
+  openReadOnly?(): boolean;
   openDocumentByLink?(
     token: string,
     options?: OpenDocumentByIdOptions,
   ): Promise<OpenedDocument>;
+  // A create while signed out mints a document with no account
+  // (`POST /anonymous-documents`); `enterGuestMode` then makes its link
+  // token the page's credential (`guestLinkToken` returns it, the URL
+  // carries it) so the session opens it through `openDocumentByLink`.
+  mintAnonymousDocument?(args: {
+    name?: string;
+  }): Promise<MintedAnonymousDocument>;
+  // A pick while signed out asks for a file instead (`chooseAnonymousFile`,
+  // the browser's dialog filtered to what the app can start from; null on
+  // dismiss) and mints the document from it.
+  chooseAnonymousFile?(): Promise<File | null>;
+  mintAnonymousDocumentFromFile?(args: {
+    file: File;
+    onUploadProgress?: (loaded: number, total: number) => void;
+  }): Promise<MintedAnonymousDocument>;
+  enterGuestMode?(token: string): void;
+  // Whether the app may be used without an account, read once the page is
+  // signed out: the refusal the server answers for an app that is not
+  // public, or null. New and Open are offered until it answers.
+  signedOutUseRefusal?(): Promise<BrassError | null>;
+  // Whether this app offers New: false when its published manifest says
+  // `"access": { "create": false }`.
+  appOffersNew?(): Promise<boolean>;
+  // The last document created without an account on this app, as the
+  // client stashed it when a guest open resolved one (`readUnsavedWork`):
+  // null once expired or cleared. `clearUnsavedWork` forgets it after the
+  // link is refused for good, and `leaveGuestMode` takes the token back
+  // out of the page's credential and URL after such a refusal, so the
+  // session reports signed out again rather than a guest with nothing open.
+  unsavedWork?(): { token: string; expiresAt: Date } | null;
+  clearUnsavedWork?(): void;
+  leaveGuestMode?(): void;
+  // A link the platform refused with 410 may be one this person's own claim
+  // revoked. `followClaimedLink` takes the page out of guest mode for the
+  // account that claimed it, signed in, and resolves the document's id; in the
+  // browser that claimed it with no session, signed out and `'sign-in'`; and
+  // null for anyone else, leaving the page the guest it was.
+  followClaimedLink?(token: string): Promise<ClaimedLinkTarget>;
+  // New and Upload ask before replacing a document made without an account
+  // that this browser has edited (`markTrialEdited` records an edit,
+  // `trialEdited` reads it back across reloads). `confirmReplaceTrial` asks,
+  // and its `'sign-in'` answer starts `signIn`, which keeps the document by
+  // claiming it into the account.
+  markTrialEdited?(token: string, expiresAt: Date): void;
+  trialEdited?(token: string): boolean;
+  confirmReplaceTrial?(expiresAt: Date): Promise<'sign-in' | 'leave' | 'cancel'>;
+  signIn?(): void;
 }
 
 // Built-in orphan command labels (no active doc needed). Sentence case, ASCII
@@ -245,6 +321,9 @@ export interface DocumentSessionDeps {
 const SESSION_LABELS = {
   new: 'New',
   open: 'Open...',
+  // Without an account there is nothing to browse, so Open takes a file from
+  // the reader's own machine.
+  upload: 'Upload...',
 } as const;
 
 function toError(err: unknown): Error {
@@ -254,15 +333,19 @@ function toError(err: unknown): Error {
 // Fallback copy for a failed open with no server message to render (a
 // network drop, no HTTP response). The HTTP case carries the server's own
 // message instead, so the platform evolves the wording without an app change.
-const OPEN_FAILED_MESSAGE = 'This document could not be opened';
+const OPEN_FAILED_MESSAGE = 'This could not be opened';
+// The session holds a live copy, so a frozen one is opened beside it.
+const FROZEN_IN_SESSION =
+  'The session holds a live copy of its document. Open a frozen copy with Brass.openDocumentById';
+const PREPARING_MESSAGE = 'Preparing for editing...';
 
 // Copy parked on `session.error` when the open document is evicted remotely
 // (a `doc_gone` the local user did not initiate). Matches the wording a
-// post-eviction op frame degrades to ("the document is no longer available"),
+// post-eviction op frame degrades to ("this is no longer available"),
 // so a delete observed live and a fresh visit to the same deleted id read the
 // same. A reload re-opens the id, hits the server 404, and swaps in the
 // server-authored copy.
-const DOCUMENT_GONE_MESSAGE = 'This document is no longer available';
+const DOCUMENT_GONE_MESSAGE = 'This is no longer available';
 
 // The error parked on `session.error` for a failed open, shaped so its
 // `.message` is always presentable copy an app can render verbatim. An HTTP
@@ -309,6 +392,9 @@ export function createDocumentSession(
   // changes, so a per-commit `doc.subscribe` that doesn't move a command's
   // enabled state stays quiet.
   let lastSignature: string | null = null;
+  // Counts the documents bound, so a new copy of the same id (a reopen for
+  // editing, a reload) changes the signature and reaches subscribers.
+  let bindCount = 0;
   // Outstanding `whenReady()` promises, settled in `emit()`: resolve once a
   // document binds, reject if the user signs out before one ever does.
   const whenReadyPending: Array<{
@@ -345,15 +431,73 @@ export function createDocumentSession(
   // misread as local.
   const localDeletes = new Set<string>();
 
+  // Set for the length of an open started without an account (see `status`).
+  let accountFreeOpen = false;
+
+  // Documents the session opened read-only by request, as opposed to ones a
+  // reader's access made read-only. A reopen of one (a move, a reload) keeps
+  // that mode.
+  const readOnlyOpens = new WeakSet<Document>();
+
+  // The read intent of one open: the caller's ask where it made one, else the
+  // mode the app set at init.
+  function inMode<T extends OpenDocumentByIdOptions>(
+    options: T,
+    asked: boolean | undefined,
+  ): T {
+    const readOnly = asked ?? (deps.openReadOnly?.() === true ? true : undefined);
+    return readOnly === undefined ? options : { ...options, readOnly };
+  }
+
+  // Opens that asked to read, keyed by the open's own promise, so `activate`
+  // records the document it binds from one in `readOnlyOpens`.
+  const readOnlyAsks = new WeakSet<Promise<OpenedDocument>>();
+
+  function remember(
+    opened: Promise<OpenedDocument>,
+    options: OpenDocumentByIdOptions,
+  ): Promise<OpenedDocument> {
+    if (options.readOnly ?? options.documentOptions?.readOnly === true) {
+      readOnlyAsks.add(opened);
+    }
+    return opened;
+  }
+
+  function openById(
+    docId: string,
+    options: OpenDocumentByIdOptions,
+    consent?: 'offer' | 'skip',
+  ): Promise<OpenedDocument> {
+    const opened =
+      consent === undefined
+        ? deps.openDocumentById(docId, options)
+        : deps.openDocumentById(docId, options, consent);
+    return remember(opened, options);
+  }
+
+  function openByLink(
+    openGuest: NonNullable<DocumentSessionDeps['openDocumentByLink']>,
+    token: string,
+    options: OpenDocumentByIdOptions,
+  ): Promise<OpenedDocument> {
+    return remember(openGuest(token, options), options);
+  }
+
   function status(): SessionStatus {
     // 'unknown' before auth settles; the onUserChange handler re-fires
     // (start() / emit()) and flips this to its resolved value.
     if (deps.authStatus() === 'unknown') return 'unknown';
+    if (deps.initFailure?.()) return 'error';
     // A guest (opened via `?brass_link=`) is not signed in but still has a
     // read-only document to load, so it never reports 'signed-out' (which
     // would render the app's sign-in surface instead of the document).
     const isGuest = deps.guestLinkToken?.() != null;
-    if (!deps.isSignedIn() && !isGuest) return 'signed-out';
+    // An open started without an account loads before there is a link to be
+    // a guest on (a pick sends its file first), and the visitor is watching
+    // that load, not the sign-in surface.
+    if (!deps.isSignedIn() && !isGuest && !(loading && accountFreeOpen)) {
+      return 'signed-out';
+    }
     if (loading) return 'loading';
     if (document) return 'ready';
     if (openError) return 'error';
@@ -374,15 +518,26 @@ export function createDocumentSession(
     const load = loading ? `${loadingMessage ?? ''}:${loadingProgress ?? ''}` : '';
     // `openError` message joins the signature so a switch from one failed open
     // to a different one (same 'error' status, no bound doc) still re-fires.
-    const err = openError ? `${openError.status ?? ''}:${openError.message}` : '';
+    const shown = openError ?? deps.initFailure?.() ?? null;
+    const err = shown ? `${shown.status ?? ''}:${shown.message}` : '';
     // The previewed version and the browsing flag are their own terms because
     // nothing else in this signature follows them: a preview -> preview step
     // holds the id, the name, the status and every command's enabled state
     // (edit affordances are already disabled by the first checkout), so
     // without these the step is a silent emit and the chrome rendering the
     // preview keeps showing the version the reader stepped away from.
-    const ver = `${document?.version ?? ''}:${document?.versionBrowsing ? 1 : 0}`;
-    return `${status()}|${document?.id ?? ''}|${documentName ?? ''}|${load}|${err}|${ver}|${cmds}`;
+    const ver = `${document?.previewVersion ?? ''}:${document?.versionBrowsing ? 1 : 0}`;
+    // The expiry moves once, to null, when the document is claimed; the
+    // chrome naming it has to hear that.
+    const expiry = document?.expiresAt?.getTime() ?? '';
+    return `${status()}|${bindCount}|${document?.id ?? ''}|${documentName ?? ''}|${load}|${err}|${ver}|${expiry}|${cmds}`;
+  }
+
+  // A listener that throws usually leaves the app showing nothing, so the
+  // app's `onError` hears about it as well as the console.
+  function reportListenerThrow(err: unknown): void {
+    console.error('[Brass] session listener threw:', err);
+    deps.reportError(appCallbackError(err));
   }
 
   function emit(): void {
@@ -401,7 +556,7 @@ export function createDocumentSession(
         listener(session);
       } catch (err) {
         // A throwing listener must not strand the others.
-        console.error('[Brass] session listener threw:', err);
+        reportListenerThrow(err);
       }
     }
   }
@@ -419,11 +574,13 @@ export function createDocumentSession(
       );
       const pending = whenReadyPending.splice(0, whenReadyPending.length);
       for (const { reject } of pending) reject(error);
-    } else if (current === 'error' && openError) {
-      // A user-initiated open failed terminally; reject rather than hang the
-      // awaiter forever. Same error object the session surfaces on `.error`.
+    } else if (current === 'error' && session.error) {
+      // A user-initiated open failed terminally, or init could not start;
+      // reject rather than hang the awaiter forever. Same error object the
+      // session surfaces on `.error`.
+      const failure = session.error;
       const pending = whenReadyPending.splice(0, whenReadyPending.length);
-      for (const { reject } of pending) reject(openError);
+      for (const { reject } of pending) reject(failure);
     }
     // No branch for 'empty': it is both the idle pre-open state (an awaiter
     // legitimately waits for a future open) and the post-close state. A close
@@ -447,7 +604,7 @@ export function createDocumentSession(
   // active doc), with a session `emit` on each running flip.
   function buildOrphanCommand(
     id: string,
-    label: string,
+    label: string | (() => string),
     group: CommandGroup,
     surface: CommandSurface,
     isEnabled: () => boolean,
@@ -463,22 +620,81 @@ export function createDocumentSession(
     );
   }
 
+  // New and Open start a document without an account where the app can mint
+  // one, so a visitor's own buttons and the menu run the same commands.
+  // A failed init leaves the page signed out with nothing either command
+  // could reach, so neither is offered.
+  const withoutAccount = (): boolean => {
+    if (deps.initFailure?.()) return false;
+    const status = deps.authStatus();
+    return status === 'signed-out' || status === 'guest';
+  };
+  // The server refuses every account-free route for an app that does not
+  // offer signed-out use, so New and Open are withdrawn once it says so
+  // rather than offered only to show that refusal. Read lazily, from the
+  // first check made while signed out, and settled for the page.
+  let signedOutRefusal: BrassError | null = null;
+  let signedOutProbe: Promise<void> | null = null;
+  const refusedWithoutAccount = (): boolean => {
+    if (signedOutProbe === null && deps.signedOutUseRefusal) {
+      const read = deps.signedOutUseRefusal;
+      signedOutProbe = (async () => {
+        try {
+          signedOutRefusal = await read();
+        } catch {
+          signedOutRefusal = null;
+        }
+        if (signedOutRefusal !== null) emit();
+      })();
+    }
+    return signedOutRefusal !== null;
+  };
+  const canStartWithoutAccount = (): boolean =>
+    withoutAccount() &&
+    !refusedWithoutAccount() &&
+    deps.mintAnonymousDocument !== undefined &&
+    deps.enterGuestMode !== undefined &&
+    deps.openDocumentByLink !== undefined;
+  const canPickWithoutAccount = (): boolean =>
+    canStartWithoutAccount() &&
+    deps.chooseAnonymousFile !== undefined &&
+    deps.mintAnonymousDocumentFromFile !== undefined;
+
+  // An app that creates no documents offers no New. Read lazily, from the
+  // first check, and settled for the page; until it answers, New is offered.
+  let offersNew = true;
+  let offersNewProbe: Promise<void> | null = null;
+  const appOffersNew = (): boolean => {
+    if (offersNewProbe === null && deps.appOffersNew) {
+      const read = deps.appOffersNew;
+      offersNewProbe = (async () => {
+        try {
+          offersNew = await read();
+        } catch {
+          offersNew = true;
+        }
+        if (!offersNew) emit();
+      })();
+    }
+    return offersNew;
+  };
+
   const cmdNew = buildOrphanCommand(
     'new',
     SESSION_LABELS.new,
     'session',
     'menu',
-    deps.isSignedIn,
+    () => appOffersNew() && (deps.isSignedIn() || canStartWithoutAccount()),
     async () => {
       await create();
     },
   );
   const cmdOpen = buildOrphanCommand(
     'open',
-    SESSION_LABELS.open,
+    () => (withoutAccount() ? SESSION_LABELS.upload : SESSION_LABELS.open),
     'session',
     'menu',
-    deps.isSignedIn,
+    () => deps.isSignedIn() || canPickWithoutAccount(),
     async () => {
       await pick();
     },
@@ -521,6 +737,7 @@ export function createDocumentSession(
       sessionCanvasUnregister = null;
     }
     const previous = document;
+    if (next !== previous) bindCount += 1;
     document = next;
     documentName = name;
     if (next === null) {
@@ -533,6 +750,19 @@ export function createDocumentSession(
         // A close failure (already-closed, freed WASM) is non-fatal.
       }
     }
+    if (next && next !== previous) {
+      // `reopen` on the bound copy goes through the session, so the new copy
+      // binds in its place. A copy the session no longer holds reopens the
+      // way the layer that opened it would.
+      const outside = next._reopenerFn;
+      next._setReopener((mode) =>
+        document === next
+          ? reopenBound(next, mode)
+          : outside !== null
+            ? outside(mode)
+            : Promise.reject(new BrassError('This document cannot be reopened', { status: 0 })),
+      );
+    }
     if (next) {
       // `subscribe` fires on every change including local mutations (the
       // session's listeners drive UI that re-renders on local edits). The
@@ -544,6 +774,7 @@ export function createDocumentSession(
         // needs to drop a specified-but-default branch; re-sync in place so
         // the pinned branch settles once the default is known.
         if (event.kind === 'branches') syncUrlForActive('replace');
+        if (event.kind === 'change' && event.source !== 'remote') noteTrialEdit(next);
         // Take the doc's name whenever it moves. A rename reaches the doc
         // from the server's `doc_meta` frame, which sets it directly, and
         // `documentName` is what the emit signature reads: without this the
@@ -580,24 +811,45 @@ export function createDocumentSession(
           // keeps its topic subscription and its LoroDoc until it is closed, so
           // every move would otherwise leave one resident for the life of the
           // page, taking a copy of every op the reopened document receives.
+          //
+          // A guest holds no access by id, so it re-opens through its link,
+          // as its first open did.
+          //
+          // A copy that is already read-only (a reload onto converted or
+          // sealed content, or one discarding a refused change) stays bound
+          // until the re-opened one replaces it, so the reader keeps seeing
+          // the document instead of a loading surface between two copies of
+          // it. Nothing can be written to it in the meantime. An editable one
+          // is detached as any other open detaches its predecessor.
           const branch = urlBranch(next);
           const evicted = next;
-          document = null;
-          documentName = null;
+          const keepBound = next.readOnly;
+          const mode = readOnlyOpens.has(next) ? { readOnly: true } : {};
+          const guestToken = deps.guestLinkToken?.();
+          const openGuest = deps.openDocumentByLink;
+          if (!keepBound) {
+            document = null;
+            documentName = null;
+          }
           void activate(
             (onSnapshotProgress) =>
-              deps.openDocumentById(
-                id,
-                {
-                  ...withDefaults(),
-                  ...(branch ? { branch } : {}),
-                  onSnapshotProgress,
-                },
-                'skip',
-              ),
+              guestToken && openGuest
+                ? openByLink(openGuest, guestToken, { ...mode, onSnapshotProgress })
+                : openById(
+                    id,
+                    {
+                      ...withDefaults(),
+                      ...(branch ? { branch } : {}),
+                      ...mode,
+                      onSnapshotProgress,
+                    },
+                    'skip',
+                  ),
             null,
             'skip',
             branch,
+            true,
+            keepBound,
           )
             .catch(() => markGoneRemote())
             .finally(() => closeQuietly(evicted));
@@ -703,6 +955,8 @@ export function createDocumentSession(
   async function activate(
     load: (
       onSnapshotProgress: (loaded: number, total: number | null) => void,
+      onUploadProgress: (loaded: number, total: number) => void,
+      releasePrevious: () => void,
     ) => Promise<OpenedDocument>,
     knownName: string | null,
     urlNav: UrlNav = 'push',
@@ -713,9 +967,16 @@ export function createDocumentSession(
     // self-heal that should settle silently on empty (the user asked for
     // nothing specific).
     surfaceOpenError = true,
+    // Re-opening the document already bound: it stays bound, and the session
+    // stays 'ready', until the new copy replaces it. A failure detaches it as
+    // though it had been detached at the start.
+    keepBound = false,
+    // With `keepBound`: a failure leaves the bound document in place and only
+    // rejects the caller.
+    keepOnFailure = false,
   ): Promise<Document> {
     const generation = ++openGeneration;
-    loading = true;
+    loading = !keepBound;
     loadingMessage = null;
     loadingProgress = null;
     // A new open attempt supersedes any prior failure's error state.
@@ -726,11 +987,13 @@ export function createDocumentSession(
     // 'loading' until the new doc binds; a failed open restores the previous
     // binding. The doc-event/gone subscriptions stay attached (`setDocument`
     // re-points them, and the restore path watches the same doc).
-    const previousDocument = document;
-    const previousName = documentName;
+    let previousDocument = keepBound ? null : document;
+    const previousName = keepBound ? null : documentName;
     const previousSpecifiedBranch = activeSpecifiedBranch;
-    document = null;
-    documentName = null;
+    if (!keepBound) {
+      document = null;
+      documentName = null;
+    }
     // What the join's spilled ops have cost so far, and what the whole
     // download was declared to be. Carried across the two phases so the pair
     // reads as one figure. Per open, because a second open of the same
@@ -743,9 +1006,20 @@ export function createDocumentSession(
     const onSnapshotProgress = (
       loaded: number,
       total: number | null,
-      phase?: 'snapshot' | 'tail',
-    ): void => {
-      if (generation !== openGeneration) return;
+      phase?: 'snapshot' | 'tail' | 'preparing' | 'importing',
+      message?: string,
+    ): boolean => {
+      if (generation !== openGeneration) return false;
+      // The platform is making the document editable, or replacing a
+      // reader's content, and the open waits for it with nothing bound
+      // meanwhile. A replacement is described in the platform's own words.
+      if (phase === 'preparing' || phase === 'importing') {
+        loadingProgress = null;
+        loadingMessage =
+          phase === 'preparing' ? PREPARING_MESSAGE : message !== undefined && message !== '' ? message : 'Loading...';
+        emit();
+        return true;
+      }
       // One download, reported once. A document whose ops spilled to storage
       // fetches them from the join before the snapshot, so a load has two
       // stretches of bytes arriving over the network with a reader watching.
@@ -790,6 +1064,7 @@ export function createDocumentSession(
         loadingMessage = `Downloading... ${(loaded / 1_000_000).toFixed(1)} MB`;
       }
       emit();
+      return true;
     };
     // Give up on this open. A warm swap (previous doc present) rebinds it and
     // only rejects the caller, so the working surface is never clobbered; with
@@ -798,6 +1073,13 @@ export function createDocumentSession(
     // and read as the app's document-less home. `display` is what the app
     // renders; it defaults to the platform's own open-failure copy.
     function abandonOpen(err: unknown, display?: BrassError): never {
+      if (keepOnFailure && generation === openGeneration) {
+        loading = false;
+        loadingMessage = null;
+        loadingProgress = null;
+        emit();
+        throw err;
+      }
       if (generation === openGeneration) {
         loading = false;
         loadingMessage = null;
@@ -805,7 +1087,10 @@ export function createDocumentSession(
         // 'replace' restores the URL without planting an entry for an open
         // that never happened.
         activeSpecifiedBranch = previousSpecifiedBranch;
-        if (surfaceOpenError && previousDocument === null) {
+        if (err instanceof SignInToFollowLink) {
+          // The URL names the document the sign-in returns to.
+          setDocument(previousDocument, previousName, 'skip');
+        } else if (surfaceOpenError && previousDocument === null) {
           openError = display ?? toDisplayError(err);
           // Leave the URL pointing at the doc that failed ('skip', not the
           // 'replace' below that clears it for a null document): the error
@@ -822,12 +1107,33 @@ export function createDocumentSession(
       }
       throw err;
     }
+    // A file the open sends before there is a document to read.
+    const onUploadProgress = (loaded: number, total: number): void => {
+      if (generation !== openGeneration) return;
+      loadingProgress = total > 0 ? Math.min(1, loaded / total) : null;
+      loadingMessage =
+        loadingProgress === null
+          ? 'Uploading...'
+          : `Uploading... ${Math.floor(loadingProgress * 100)}%`;
+      emit();
+    };
+    // A load that moves the page onto another document's link takes the
+    // outgoing document's credential with it, so that document closes then
+    // rather than after the bind, and a failed open has nothing to rebind.
+    const releasePrevious = (): void => {
+      closeQuietly(previousDocument);
+      previousDocument = null;
+    };
     let doc: OpenedDocument;
+    let askedToRead = false;
     try {
-      doc = await load(onSnapshotProgress);
+      const opening = load(onSnapshotProgress, onUploadProgress, releasePrevious);
+      askedToRead = readOnlyAsks.has(opening);
+      doc = await opening;
     } catch (err) {
       abandonOpen(err);
     }
+    if (askedToRead) readOnlyOpens.add(doc);
     if (generation !== openGeneration) {
       // A newer open / close superseded this one. Discard the orphan (so its
       // WS subscription doesn't leak) plus the doc this generation detached.
@@ -835,13 +1141,14 @@ export function createDocumentSession(
       closeQuietly(previousDocument);
       return doc;
     }
-    // A doc opened mid-preparation (drive-stub hydration, upload extraction)
-    // arrives empty + read-only with a pending blocking status; the SDK
-    // imports the content and emits the terminal status when the work
-    // finishes. Hold the session in 'loading' (surfacing the server message)
-    // and bind only on that terminal status, so the editor's first paint sees
-    // the content. A pending push is non-blocking and binds immediately.
-    const work = doc.status;
+    // An open by id resolves with the document's content or rejects, waiting
+    // out any import first. A trial document opened through its link can
+    // arrive empty while the visitor's file is imported, with a pending
+    // blocking status; hold the session in 'loading' (surfacing the server
+    // message) and bind only on the terminal status, so the editor's first
+    // paint sees the content. A pending push is non-blocking and binds
+    // immediately.
+    const work = doc._workStatusNow;
     if (work !== null && work.pending && work.blocking !== false) {
       loadingMessage = work.message;
       loadingProgress = work.progress ?? null;
@@ -884,7 +1191,7 @@ export function createDocumentSession(
     if (doc._contentLoadFailed) {
       closeQuietly(doc);
       const failure = new BrassError(
-        doc.status?.message ?? OPEN_FAILED_MESSAGE,
+        doc._workStatusNow?.message ?? OPEN_FAILED_MESSAGE,
         { status: 0 },
       );
       abandonOpen(failure, failure);
@@ -923,16 +1230,26 @@ export function createDocumentSession(
       const openGuest = deps.openDocumentByLink;
       try {
         return await activate(
-          (onSnapshotProgress) => openGuest(guestToken, { onSnapshotProgress }),
+          (onSnapshotProgress) =>
+            openByLink(openGuest, guestToken, inMode({ onSnapshotProgress }, undefined)).catch(
+              async (err: unknown) => {
+                const claimed = await claimedDocumentOf(guestToken, err);
+                if (claimed === null) throw err;
+                if (claimed === 'sign-in') throw new SignInToFollowLink();
+                return openById(claimed.docId, inMode({ onSnapshotProgress }, undefined), 'skip');
+              },
+            ),
           null,
           'skip',
           null,
         );
-      } catch {
+      } catch (err) {
+        forgetUnsavedWorkIfGone(guestToken, err);
         return null;
       }
     }
-    if (!deps.isSignedIn() || document) return document;
+    if (document) return document;
+    if (!deps.isSignedIn()) return restoreUnsavedWork();
     // A pick handed back by the hosted picker's redirect fallback opens
     // before the ordinary URL / last-selection restore, and independently of
     // `syncDocToUrl`. `takePickSelection` strips the one-shot params as it
@@ -945,12 +1262,15 @@ export function createDocumentSession(
         // navigation, so it must not plant a history entry.
         return await activate(
           (onSnapshotProgress) =>
-            deps.openDocumentById(
+            openById(
               sel.docId,
-              {
-                ...(sel.branchId ? { branch: sel.branchId } : {}),
-                onSnapshotProgress,
-              },
+              inMode(
+                {
+                  ...(sel.branchId ? { branch: sel.branchId } : {}),
+                  onSnapshotProgress,
+                },
+                undefined,
+              ),
               'skip',
             ),
           null,
@@ -972,7 +1292,7 @@ export function createDocumentSession(
       try {
         return await activate(
           (onSnapshotProgress) =>
-            deps.openDocumentById(last.doc_id, { onSnapshotProgress }, 'skip'),
+            openById(last.doc_id, inMode({ onSnapshotProgress }, undefined), 'skip'),
           last.name,
           'replace',
           null,
@@ -986,6 +1306,73 @@ export function createDocumentSession(
       }
     }
     return null;
+  }
+
+  // Whether a failed link open says the link itself is gone. The view route
+  // answers `404` for a token it does not know, `410` for one that expired
+  // or was revoked and `403` for one its organization's policy now refuses;
+  // anything else (no response, a shed request) says nothing about the link.
+  function linkGone(err: unknown): boolean {
+    return (
+      err instanceof BrassError &&
+      (err.status === 403 || err.status === 404 || err.status === 410)
+    );
+  }
+
+  // The document a revoked link leads this person to, when their own claim
+  // revoked it. Asked only on a 410, the one refusal a claim produces.
+  async function claimedDocumentOf(token: string, err: unknown): Promise<ClaimedLinkTarget> {
+    if (!(err instanceof BrassError) || err.status !== 410 || !deps.followClaimedLink) {
+      return null;
+    }
+    try {
+      return await deps.followClaimedLink(token);
+    } catch {
+      return null;
+    }
+  }
+
+  // A stashed token the platform no longer answers names nothing to
+  // continue, so it is forgotten where the refusal is heard, whether the
+  // open was the boot of its URL or the restore below.
+  function forgetUnsavedWorkIfGone(token: string, err: unknown): void {
+    if (!linkGone(err)) return;
+    if (deps.unsavedWork?.()?.token === token) deps.clearUnsavedWork?.();
+  }
+
+  // A signed-out boot on a URL that names no document reopens the last
+  // document this browser made without an account on this app, the way a
+  // signed-in boot reopens the last document picked.
+  async function restoreUnsavedWork(): Promise<Document | null> {
+    if (deps.readUrlSelection()) return null;
+    const entry = deps.unsavedWork?.();
+    if (!entry || !deps.enterGuestMode || !deps.openDocumentByLink) return null;
+    const openGuest = deps.openDocumentByLink;
+    const { token } = entry;
+    // The same path a reload of the document's URL takes: the token becomes
+    // the page's credential and the URL carries it, then the link opens.
+    deps.enterGuestMode(token);
+    try {
+      return await activate(
+        (onSnapshotProgress) =>
+          openByLink(
+            openGuest,
+            token,
+            inMode({ ...withDefaults({}), onSnapshotProgress }, undefined),
+          ),
+        null,
+        'skip',
+      );
+    } catch (err) {
+      // The token did not open, so it is not this page's credential after
+      // all: the page is signed out again, and the stash is kept unless the
+      // link is gone for good, so the next boot tries it again.
+      deps.leaveGuestMode?.();
+      openError = null;
+      forgetUnsavedWorkIfGone(token, err);
+      emit();
+      return null;
+    }
   }
 
   function start(): Promise<Document | null> {
@@ -1005,19 +1392,132 @@ export function createDocumentSession(
     docId: string,
     options?: SessionOpenOptions,
   ): Promise<Document> {
+    if ((options as { frozen?: unknown } | undefined)?.frozen === true) {
+      return Promise.reject(new BrassError(FROZEN_IN_SESSION, { status: 0 }));
+    }
+    const asked = options?.readOnly ?? options?.documentOptions?.readOnly;
     return activate(
       (onSnapshotProgress) =>
-        deps.openDocumentById(docId, {
-          ...withDefaults(options),
-          onSnapshotProgress,
-        }),
+        openById(
+          docId,
+          inMode({ ...withDefaults(options), onSnapshotProgress }, asked),
+        ),
       null,
       'push',
       options?.branch ?? null,
     );
   }
 
+  // A switch the hosted history or branch surfaces make from the bound
+  // document (another branch, a version, a fork) opens in the mode that
+  // document was opened in, so a copy opened to read stays one and a copy
+  // reopened to edit stays one.
+  function openSibling(docId: string, options?: SessionOpenOptions): Promise<Document> {
+    const current = document;
+    const readOnly =
+      current === null || current.id !== docId
+        ? undefined
+        : readOnlyOpens.has(current)
+          ? true
+          : current._openMode === 'edit'
+            ? false
+            : undefined;
+    return open(docId, { ...options, ...(readOnly !== undefined ? { readOnly } : {}) });
+  }
+
+  // `reopen` on the bound document: the new copy replaces it the way a move's
+  // reopen does, kept on screen until it binds and kept bound if the reopen
+  // fails. The session holds a live copy, so a frozen one is the caller's to
+  // open beside it.
+  async function reopenBound(current: Document, mode: ReopenMode): Promise<OpenedDocument> {
+    if (mode === 'frozen') {
+      throw new BrassError(FROZEN_IN_SESSION, { status: 0 });
+    }
+    const id = current.id;
+    if (id === null) throw new BrassError('No document is open', { status: 0 });
+    const branch = urlBranch(current);
+    const guestToken = deps.guestLinkToken?.();
+    const openGuest = deps.openDocumentByLink;
+    const readOnly = mode === 'read';
+    const next = await activate(
+      (onSnapshotProgress) =>
+        guestToken && openGuest
+          ? openByLink(openGuest, guestToken, {
+              ...withDefaults(),
+              readOnly,
+              onSnapshotProgress,
+            })
+          : openById(id, {
+              ...withDefaults(),
+              ...(branch ? { branch } : {}),
+              readOnly,
+              onSnapshotProgress,
+            }),
+      documentName,
+      'skip',
+      activeSpecifiedBranch,
+      true,
+      true,
+      true,
+    );
+    // A newer open, reopen or close took the session while this one joined,
+    // and closed the copy it produced.
+    if (document !== next) {
+      throw new BrassError('The reopen was replaced by a later open of the session', {
+        status: 0,
+      });
+    }
+    return next as OpenedDocument;
+  }
+
+  // A create fails in two regimes, and only the later one reaches the
+  // session. Once `activate` has the open, `abandonOpen` parks the failure on
+  // `session.error` for a status-gated app to render. Everything before that
+  // (minting the account-less document, resolving the destination) throws with
+  // the returned promise as its only report, and the documented way to call
+  // this from a button floats that promise, so the click reads as ignored.
+  // Parking here under `abandonOpen`'s own condition gives both regimes one
+  // surface. The generation check is what keeps a failure from clobbering a
+  // newer open that started while this one was still resolving a destination.
+  // The trial token this page last recorded an edit for, so a burst of
+  // edits writes the marker once.
+  let trialEditNoted: string | null = null;
+  function noteTrialEdit(doc: Document): void {
+    const token = deps.guestLinkToken?.();
+    if (!token || doc.expiresAt === null || trialEditNoted === token) return;
+    trialEditNoted = token;
+    deps.markTrialEdited?.(token, doc.expiresAt);
+  }
+
+  // Whether New or Upload may replace the document on screen. A document
+  // made without an account that this browser edited is kept only at its
+  // link, so the visitor is asked first, and signing in is what keeps it.
+  async function mayLeaveTrial(): Promise<boolean> {
+    const token = deps.guestLinkToken?.();
+    const doc = document;
+    if (!token || !doc || doc.expiresAt === null) return true;
+    if (!deps.confirmReplaceTrial || !deps.trialEdited?.(token)) return true;
+    const answer = await deps.confirmReplaceTrial(doc.expiresAt);
+    if (answer === 'sign-in') deps.signIn?.();
+    return answer === 'leave';
+  }
+
   async function create(
+    options?: CreateDocumentOptions,
+  ): Promise<Document | null> {
+    const generation = openGeneration;
+    try {
+      return await createUnguarded(options);
+    } catch (err) {
+      if (generation === openGeneration && document === null && openError === null) {
+        openError = toDisplayError(err);
+        emit();
+      }
+      throw err;
+    }
+  }
+
+  async function createUnguarded(
     options?: CreateDocumentOptions,
   ): Promise<Document | null> {
     // Placement is expressed by context, never an org this layer names.
@@ -1037,28 +1537,61 @@ export function createDocumentSession(
     // one. The server owns the single-vs-multi decision: a `needs-*` outcome
     // is where we open the corresponding hosted surface and retry with the
     // opaque destination it returns, relayed verbatim.
+    // No account: the document is minted without one and opened through
+    // its link token, which the URL then carries so a reload and a sign-in
+    // both find it again.
+    if (
+      withoutAccount() &&
+      deps.mintAnonymousDocument &&
+      deps.enterGuestMode &&
+      deps.openDocumentByLink
+    ) {
+      if (!(await mayLeaveTrial())) return null;
+      const minted = await deps.mintAnonymousDocument(
+        options?.name !== undefined ? { name: options.name } : {},
+      );
+      const enterGuestMode = deps.enterGuestMode;
+      const openGuest = deps.openDocumentByLink;
+      accountFreeOpen = true;
+      try {
+        return await activate(
+          (onSnapshotProgress, _onUploadProgress, releasePrevious) => {
+            releasePrevious();
+            enterGuestMode(minted.linkToken);
+            return openGuest(minted.linkToken, {
+              ...withDefaults(
+                options?.documentOptions
+                  ? { documentOptions: options.documentOptions }
+                  : undefined,
+              ),
+              onSnapshotProgress,
+            });
+          },
+          options?.name ?? null,
+          'skip',
+        );
+      } finally {
+        accountFreeOpen = false;
+      }
+    }
+
     let args = base;
     let knownName = options?.name ?? null;
-    let result: CreateDocumentResult;
-    for (;;) {
-      result = await deps.createDocumentId(args);
-      if (result.kind === 'created') break;
-      if (result.kind === 'needs-organization') {
-        const acquired = await deps.acquireOrganization();
-        if (!acquired) return null;
-        args = { ...args, destination: { organization_id: acquired.organization_id } };
-        continue;
-      }
-      // needs-destination
-      const destination = await deps.selectCreateDestination(
-        options?.name !== undefined ? { name: options.name } : undefined,
-      );
-      if (destination === null) return null;
-      // The dialog's final name wins on both the wire and the display: the
-      // user saw and could edit it.
-      args = { ...args, destination, name: destination.name };
-      knownName = destination.name ?? knownName;
-    }
+    const result = await placeThroughHostedSurfaces(
+      deps,
+      (destination) =>
+        deps.createDocumentId(
+          destination === undefined ? args : { ...args, destination },
+        ),
+      options?.name,
+      (chosen) => {
+        // The dialog's final name wins on both the wire and the display: the
+        // user saw and could edit it.
+        args = { ...args, name: chosen.name };
+        knownName = chosen.name;
+      },
+    );
+    if (result === null) return null;
 
     const docId = result.docId;
     const openOptions = options?.documentOptions
@@ -1070,7 +1603,7 @@ export function createDocumentSession(
     // stored name once the record binds.
     return activate(
       (onSnapshotProgress) =>
-        deps.openDocumentById(docId, {
+        openById(docId, {
           ...withDefaults(openOptions),
           onSnapshotProgress,
         }),
@@ -1078,16 +1611,78 @@ export function createDocumentSession(
     );
   }
 
+  // The upload runs inside the open, so the app renders its loading surface
+  // with the upload's progress rather than an unchanged screen. A failure
+  // lands on `session.error` the way a failed create's does.
+  async function pickAnonymousFile(
+    choose: () => Promise<File | null>,
+    mint: NonNullable<DocumentSessionDeps['mintAnonymousDocumentFromFile']>,
+    enterGuestMode: (token: string) => void,
+    openGuest: NonNullable<DocumentSessionDeps['openDocumentByLink']>,
+  ): Promise<Document | null> {
+    const generation = openGeneration;
+    let file: File | null;
+    try {
+      file = await choose();
+    } catch (err) {
+      // Before `activate` there is no open to abandon, so the refusal is
+      // parked here under `create`'s condition.
+      if (generation === openGeneration && document === null && openError === null) {
+        openError = toDisplayError(err);
+        emit();
+      }
+      throw err;
+    }
+    if (file === null) return null;
+    accountFreeOpen = true;
+    try {
+      return await activate(
+        async (onSnapshotProgress, onUploadProgress, releasePrevious) => {
+          const minted = await mint({ file, onUploadProgress });
+          releasePrevious();
+          enterGuestMode(minted.linkToken);
+          return openGuest(minted.linkToken, {
+            ...withDefaults(),
+            onSnapshotProgress,
+          });
+        },
+        null,
+        'skip',
+      );
+    } finally {
+      accountFreeOpen = false;
+      emit();
+    }
+  }
+
   async function pick(): Promise<Document | null> {
+    if (
+      withoutAccount() &&
+      deps.chooseAnonymousFile &&
+      deps.mintAnonymousDocumentFromFile &&
+      deps.enterGuestMode &&
+      deps.openDocumentByLink
+    ) {
+      if (!(await mayLeaveTrial())) return null;
+      return pickAnonymousFile(
+        deps.chooseAnonymousFile,
+        deps.mintAnonymousDocumentFromFile,
+        deps.enterGuestMode,
+        deps.openDocumentByLink,
+      );
+    }
     const result = await deps.selectDocument();
     if (!result) return null;
-    const opts = {
-      ...withDefaults(),
-      ...(result.branch_id ? { branch: result.branch_id } : {}),
-    };
+    const opts = inMode(
+      {
+        ...withDefaults(),
+        ...(result.branch_id ? { branch: result.branch_id } : {}),
+      },
+      undefined,
+    );
     return activate(
       (onSnapshotProgress) =>
-        deps.openDocumentById(result.doc_id, { ...opts, onSnapshotProgress }),
+        openById(result.doc_id, { ...opts, onSnapshotProgress }),
       result.name,
       'push',
       result.branch_id ?? null,
@@ -1182,13 +1777,16 @@ export function createDocumentSession(
     }
     void activate(
       (onSnapshotProgress) =>
-        deps.openDocumentById(
+        openById(
           sel.docId,
-          {
-            ...withDefaults(),
-            ...(sel.branchId ? { branch: sel.branchId } : {}),
-            onSnapshotProgress,
-          },
+          inMode(
+            {
+              ...withDefaults(),
+              ...(sel.branchId ? { branch: sel.branchId } : {}),
+              onSnapshotProgress,
+            },
+            undefined,
+          ),
           'skip',
         ),
       null,
@@ -1220,12 +1818,22 @@ export function createDocumentSession(
   // (opened via `?brass_link=`) is never signed in, so the initial
   // resolution arrives here with `signedIn === false`; it must boot the
   // read-only link document rather than tear down to the sign-in surface.
+  //
+  // The first resolution to signed-out is the boot of a signed-out page, which
+  // restores the unsaved work this browser made (`restoreUnsavedWork`); a
+  // later sign-out lands on the sign-in surface.
+  let authResolved = false;
   deps.onUserChange((signedIn) => {
+    const boot = !authResolved;
+    authResolved = true;
     if (signedIn || deps.guestLinkToken?.() != null) {
       if (!document) void start();
       else emit();
     } else {
       teardownForSignOut();
+      // Deferred: a session made after `init` settled hears this resolution
+      // while it is still being built.
+      if (boot) queueMicrotask(() => void start());
     }
   });
 
@@ -1240,7 +1848,17 @@ export function createDocumentSession(
       return status();
     },
     get error(): BrassError | null {
-      return status() === 'error' ? openError : null;
+      // Not gated on `status() === 'error'`. A signed-out visitor's failed
+      // create is the case that gating loses: 'signed-out' outranks the error
+      // in `status()` (the app must keep rendering its sign-in surface, which
+      // is where the retry lives), so gating here left the try-before-signing-in
+      // failure with no channel at all.
+      // What makes ungating safe is that a parked error never coexists with a
+      // bound document: `activate` clears it on entry and is the only path that
+      // binds a non-null one, and `abandonOpen` parks only when there was no
+      // document to fall back to. So this can never show a stale failure beside
+      // a working document. A new write to `openError` has to hold that.
+      return openError ?? deps.initFailure?.() ?? null;
     },
     get loadingMessage(): string | null {
       return loading ? loadingMessage : null;
@@ -1259,19 +1877,40 @@ export function createDocumentSession(
       try {
         listener(session);
       } catch (err) {
-        console.error('[Brass] session listener threw:', err);
+        reportListenerThrow(err);
       }
       return () => {
         listeners.delete(listener);
       };
     },
     start,
-    open,
+    open: ((docId?: string, options?: SessionOpenOptions) =>
+      docId === undefined ? pick() : open(docId, options)) as DocumentSession['open'],
     create,
     pick,
     close,
     async run(commandId): Promise<void> {
       const command = allCommands().find((c) => c.id === commandId);
+      // An app's own signed-out button may still run a withdrawn New or Open,
+      // and the reader is owed the reason rather than a press that does
+      // nothing.
+      if (
+        command &&
+        command.group === 'session' &&
+        !command.enabled &&
+        withoutAccount() &&
+        signedOutRefusal !== null
+      ) {
+        // A parked error never sits beside a bound document, so a guest
+        // reading one hears the refusal through `onError` instead.
+        if (document === null) {
+          openError = signedOutRefusal;
+          emit();
+        } else {
+          deps.reportError(signedOutRefusal);
+        }
+        return;
+      }
       if (command) await command.run();
     },
     useCanvas(source): () => void {
@@ -1311,8 +1950,9 @@ export function createDocumentSession(
       }
       // Already-terminal open failure: reject now rather than wait for a bind
       // that isn't coming.
-      if (status() === 'error' && openError) {
-        return Promise.reject(openError);
+      const failure = session.error;
+      if (status() === 'error' && failure) {
+        return Promise.reject(failure);
       }
       return new Promise((resolve, reject) => {
         whenReadyPending.push({ resolve, reject });
@@ -1330,6 +1970,7 @@ export function createDocumentSession(
     _clearLocalDelete(docId: string): void {
       localDeletes.delete(docId);
     },
+    _openSibling: openSibling,
   };
 
   return session;

@@ -43,7 +43,7 @@ the host needs, and tells anyone who cannot answer who to ask.
 
 | `code`                | What it means                                                                                             |
 | --------------------- | --------------------------------------------------------------------------------------------------------- |
-| `credential_required` | No credential is connected for this host, or the one connected is not approved for your app, no longer covers what your app sends, or carries no value under a name your app reads back. One code, because the dialog is the answer to all of them. The body's sentence says which, for a person to read. |
+| `credential_required` | No credential is connected for this host, or the one connected is not approved for your app, no longer covers what your app sends, or carries no value under a name your app reads back. One code, because the dialog is the answer to all of them. The body's sentence says which, for a user to read. |
 
 **Your own key is what is missing.** These are yours to settle on your app's
 settings page, so there is nothing to raise on the page: report the feature as
@@ -78,7 +78,7 @@ on their own.
 | `code`               | What it means                                                                          |
 | -------------------- | -------------------------------------------------------------------------------------- |
 | `cap_exceeded`       | A cap has been reached. Try again later.                                               |
-| `rate_limited`       | Over Brass's own rate limit. Slow down.                                                |
+| `rate_limited`       | Over Brass's own rate limit. The SDK resends a call that limit turns away for only a moment, so wait before calling again. |
 | `calls_paused`       | Whoever owns the account being spent set its cap to zero. Waiting will not clear it.   |
 | `vault_unavailable`  | Brass could not read the stored key just now. Nothing is wrong with it; make the same call again. |
 
@@ -112,7 +112,7 @@ signed in, the app has no organization, or it is running in one that has not
 installed it.
 
 Each entry also carries `connectable`, which says whether the dialog has
-anything for the person on the page to do at that host. Together the two are
+anything for the user on the page to do at that host. Together the two are
 the whole branch:
 
 ```js
@@ -134,7 +134,7 @@ if (await Brass.connectService('api.anthropic.com')) showSummariseButton();
 
 Passing `requestMissingCredentials: true` to `callService` opens the same
 dialog from the call, which then goes through once the user answers. It covers
-every refusal the person using your app can answer: `credential_required`, plus
+every refusal your app's user can answer: `credential_required`, plus
 `credential_rejected` and `credential_scheme_unusable` when the account that
 failed is one they own.
 
@@ -157,7 +157,7 @@ same one: you name a host, and Brass attaches whichever credential is in
 force.
 
 Your app reads `connectable` rather than the supplier, because that is the
-split it can act on. Where it is true, the person using your app can
+split it can act on. Where it is true, your app's user can
 settle it, so a Connect button leads somewhere; where it is false, the host is
 waiting on you, so there is nothing to raise. Leave the wording about who to
 ask to the dialog, which knows both the supplier and who is reading, where
@@ -205,7 +205,7 @@ if (cf?.ready && account) {
 
 Brass shows your setup instructions on the form that collects a credential,
 and you are strongly encouraged to provide them. Without them the form shows
-your field labels alone, and the person filling it in has to work out what
+your field labels alone, and the user filling it in has to work out what
 to create at the vendor and where.
 
 Declare a `setup` beside the host:

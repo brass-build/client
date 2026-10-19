@@ -1,7 +1,7 @@
 # Hosted UI: advanced
 
 Brass owns some surfaces: you call one method and Brass renders the UI
-in a modal iframe over your page. `Brass.session` wires the common ones
+in a modal iframe over your page. `Brass.session` runs the common ones
 (`history`, `share`, `manage`) behind the file menu. This page covers
 the rest and how they behave in browsers that block the iframe.
 
@@ -9,8 +9,33 @@ the rest and how they behave in browsers that block the iframe.
 
 | Method | Returns |
 | --- | --- |
-| `Brass.selectDocument()` | `Promise<SelectDocumentResult \| null>`: opens the hosted document picker; resolves to the picked document, or `null` if the user dismisses it. |
 | `Brass.shareDocument(docId)` | `Promise<void>`: opens the hosted share dialog for the document. |
+
+## Narrowing a choice to the files you need
+
+`Brass.chooseInputs(families, options?)` is how a user chooses files,
+folders and projects for your app to read (see the README). `accept`
+narrows the files of those families, for one call, by name or extension. Pass it once your app knows which files it
+needs. An app that has just parsed a federation file asks for the models
+that file names:
+
+```js
+await Brass.chooseInputs(['ifc'], {
+  prompt: `Models in ${federation.name}`,
+  accept: { names: federation.modelFileNames },
+});
+```
+
+The picker renders `prompt` as a subtitle beneath its title. Pass a prompt
+when narrowing the list with `accept`, explaining why only specific files appear.
+On a request you do not narrow, omit the prompt as the picker already shows
+all documents your app can open.
+
+`names` matches both the document's name and the original filename it was imported
+from, and `extensions` matches either name's extension. A document in the specified
+families passes when it matches any given name or extension. When a user selects a
+folder or project, this filtering persists, so listing the container returns only
+the matching documents.
 
 Version history is a built-in file-menu command (`history` in
 `session.commands` and the SDK toolbar's file menu) rather than a
@@ -22,13 +47,18 @@ with no code.
 Where the browser blocks the Hosted UI iframe (Safari, Firefox, Chrome
 with third-party cookies off), these surfaces open as a full-page
 redirect to Brass and return to your app when the user is done. The
-picker returns with the chosen document opened into `Brass.session`.
+Open picker (`Brass.session.open()`) returns with the chosen document
+opened into `Brass.session`.
 
 So render the active document from the session (or `mountToolbar`): on
 the redirect path the page reloads, so the code after `await
-Brass.selectDocument()` never runs, and the pick arrives through the
-session instead. The resolved value is the modal path's convenience,
-correct whenever you receive it.
+Brass.session.open()` never runs, and the picked document opens into the
+session on reload instead.
+
+`chooseInputs` and `chooseInput` do not redirect. Where the browser blocks
+their iframe they reject with a `BrassError` whose `code` is
+`'iframe_unavailable'`. Show the error's `message` and keep the references
+your app already has.
 
 ## `BrassError` `.code` values
 
@@ -38,6 +68,8 @@ The hosted-UI launchers reject with `BrassError` carrying a `.code`
 - `'embed_error'`: the hosted page loaded but couldn't proceed (e.g.
   the user isn't signed in to Brass in this context).
 - `'not_in_browser'`: called outside a browser environment.
+- `'iframe_unavailable'`: the browser blocked the iframe and the surface
+  has no redirect to fall back on (`chooseInputs`, `chooseInput`).
 
 ## Theming
 

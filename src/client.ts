@@ -11,22 +11,39 @@ import { applyAppAssertionHeader, applyClientVersionHeader } from './api-headers
 import { ensureWasmReady } from './wasm-runtime.js';
 import { decodeIdToken } from './jwt.js';
 import { createEmitter } from './emitter.js';
+import { adoptSealedCacheOwner } from './sealed-cache.js';
 import {
   clearParkedDocuments,
   createOpenDocument,
+  type AnonymousUploadAccept,
+  type AnonymousUploadTypes,
+  type GuestImportCalls,
+  type ClaimAnonymousDocumentArgs,
+  type ClaimDocumentResult,
   type CreateDocumentArgs,
   type CreateDocumentOptions,
   type CreateDocumentResult,
   type DocumentFactory,
+  type LinkCredential,
   type OpenDocumentByIdOptions,
   type OpenedDocument,
 } from './open-document.js';
 import { askSchemaConflict } from './schema-conflict-dialog.js';
+import { askReplaceTrial } from './trial-replace-dialog.js';
 import { BrassError } from './errors.js';
+import { inDevelopment } from './in-development.js';
+import { importerWaitRejections } from './importer-wait.js';
+import { checkManifestDrift } from './manifest-drift.js';
+import { createApiFetch } from './api-fetch.js';
+import { chooseFile } from './file-choice.js';
 import {
   createHostedUiLauncher,
   trackHostedUiActivations,
   type DocumentHistoryResult,
+  type ChooseInputOptions,
+  type ChooseInputsOptions,
+  type DocumentFamilies,
+  type InputReference,
   type ExportSerializeOutcome,
   type HostedUiLauncher,
   type HostedUiTheme,
@@ -44,8 +61,31 @@ import {
   startExportGuest,
   type ExportGuestController,
 } from './export-guest.js';
-import { readGuestLinkToken } from './guest-link.js';
+import {
+  isImportMode,
+  startImportGuest,
+  type ImportGuestController,
+} from './import-guest.js';
+import {
+  clearClaimSecret,
+  readClaimedLink,
+  storeClaimedLink,
+  clearGuestLinkToken,
+  clearUnsavedWork,
+  markClaimIntent,
+  readClaimSecret,
+  readGuestLinkToken,
+  readUnsavedWork,
+  storeUnsavedWork,
+  takeClaimIntent,
+  markTrialEdited,
+  trialWasEdited,
+  writeGuestLinkToken,
+  type UnsavedWorkEntry,
+} from './guest-link.js';
 import { consumeLaunchOrganizationId } from './launch-context.js';
+import { onPageRestored, restoredPageIsStale } from './page-restore.js';
+import { placeThroughHostedSurfaces } from './placement.js';
 import {
   callService,
   normalizeServiceHost,
@@ -100,6 +140,7 @@ import {
 } from './documents-namespace.js';
 import {
   createDocumentSession,
+  type ClaimedLinkTarget,
   type DocumentSession,
 } from './session.js';
 import {
@@ -135,6 +176,22 @@ import type {
 } from './types.js';
 
 const DEFAULT_AUTH_BASE_URL = 'https://auth.brass.build';
+
+const NOT_IMPORTED_MESSAGE = 'Not imported';
+const IMPORT_FAILED_MESSAGE = 'This file could not be imported';
+
+// The rejection of an open whose import did not land, naming why when this
+// client stopped waiting for it.
+function notImported(doc: Document): BrassError {
+  return new BrassError(doc._importAbandoned ?? NOT_IMPORTED_MESSAGE, {
+    status: 0,
+    code: 'not_imported',
+  });
+}
+// How long an open waits for `registerImporter` before it rejects
+// `not_imported`, and when a development build first reports the wait.
+const IMPORTER_WAIT_CEILING_MS = 60_000;
+const IMPORTER_WAIT_WARN_MS = 5_000;
 // How long `signOut` waits for the revocation before it navigates. The page
 // it lands on finishes an unrevoked sign-out itself, so waiting longer than
 // this only delays the sign-out.
@@ -212,6 +269,7 @@ export function resolveBaseUrls(options: BrassInitOptions): ResolvedBaseUrls {
 }
 // Refresh slightly before expiry so callers never see a stale access token.
 const REFRESH_LEEWAY_MS = 60_000;
+
 // App id format. The server mints `brass_app_` + random chars; some
 // real ids carry a `test`/`live`/`internal` infix. The optional infix
 // group accepts both shapes, and the permissive tail keeps minor
@@ -235,8 +293,19 @@ function refreshUnavailableError(): BrassError {
   return new BrassError('The sign-in service is unavailable', { status: 503 });
 }
 
+// A link token that names a document created without an account, as the
+// probe read it: what the claim needs, plus the name the destination dialog
+// is pre-filled with.
+interface AnonymousLinkClaim {
+  token: string;
+  claimSecret: string;
+  docId: string;
+  name?: string;
+}
+
 export class BrassClient {
   private appId: string | null = null;
+  private initFailure: BrassError | null = null;
   private authBaseUrl = DEFAULT_AUTH_BASE_URL;
   private apiBaseUrl = DEFAULT_API_BASE_URL;
   private apiBaseUrlConfigured = false;
@@ -252,9 +321,8 @@ export class BrassClient {
   // (no `prefers-color-scheme: dark` in its CSS). `'auto'` follows the
   // OS preference; `'dark'` pins dark.
   private hostedUiTheme: HostedUiTheme = 'light';
-  // See `BrassInitOptions.openIncompatibleDocuments`. When set, every open
-  // carries the answer the dialog would otherwise ask for.
-  private openIncompatibleDocuments = false;
+  // See `BrassInitOptions.open`: the mode the session opens documents in.
+  private openReadOnly = false;
   // Doc-selection-in-URL sync. On by default; off via
   // `syncDocToUrl: false`. Param names configurable via `docUrlParam` /
   // `branchUrlParam`.
@@ -283,6 +351,10 @@ export class BrassClient {
   // on `authStatus`.
   private bootstrapped = false;
   private listeners = new Set<UserChangeListener>();
+  // The session's own listener. It reacts to sign-in and sign-out, and is
+  // left out of a guest-mode change: the session starts that change itself,
+  // mid-open, and would otherwise begin a second open of the same document.
+  private readonly sessionUserListeners = new WeakSet<UserChangeListener>();
   // Init-failure listeners. Swallow a listener's throw so one bad handler
   // cannot block the others or mask the original error (already logged).
   private readonly errorListeners = createEmitter<Error>({ onError: () => {} });
@@ -294,7 +366,7 @@ export class BrassClient {
   private authEpoch = 0;
   private initialized = false;
   // Incognito / third-party-cookie fallback state. Both null in a normal
-  // browser, where the cross-site `brass_auth` cookie carries the session
+  // browser, where the cross-site `__Host-brass_auth` cookie carries the session
   // and `/refresh` works without a body.
   //   - `pendingAuthCode`: the one-time `brass_code` pulled off the
   //     landing URL by bootstrap(), consumed at most once by refresh() if
@@ -315,13 +387,22 @@ export class BrassClient {
   private documentSession: DocumentSession | null = null;
   private hostedUiLauncher: HostedUiLauncher | null = null;
   private documentFactory: DocumentFactory | null = null;
-  // The `?brass_link=` token when this page was opened as an anonymous
-  // link guest; null on the ordinary signed-in path. Set in `init`.
+  // The `?brass_link=` token the page's document opens through, whoever is
+  // signed in; null when the page is not on a link. Set in `init`.
   private guestLinkTokenValue: string | null = null;
+  private watchingPageRestore = false;
   // The organization this page was launched from (`?brass_org=`), or null
   // when the app was reached some other way. A create that names no
   // destination of its own lands here; see `launch-context.ts`.
   private launchOrganizationId: string | null = null;
+  // The install-consent dialog in flight per organization, so concurrent
+  // denials share one. Keyed by organization because that is what an install
+  // is granted on, and cleared when the dialog settles so a later denial
+  // (a declined install, a second organization) raises its own.
+  private readonly installConsentByOrganization = new Map<
+    string,
+    Promise<boolean>
+  >();
   // The organization this page has resolved to act in, and the name the
   // server gave it. Held for the life of the page load so repeated acts
   // resolve once; dropped on sign-out, and replaced by a later switch.
@@ -373,21 +454,67 @@ export class BrassClient {
   // iframe (`isExportMode`): serializes a handed-in snapshot and never
   // authenticates. `registerSerializer` forwards to it.
   private exportGuest: ExportGuestController | null = null;
+  // Set only when Brass loaded this bundle to run its importer headless
+  // (`isImportMode`). `registerImporter` forwards to it.
+  private importGuest: ImportGuestController | null = null;
+  private importer: DocumentImporter | null = null;
+  // Opens of a file this app imports, waiting for `registerImporter`.
+  private readonly importerWaiters: Array<() => void> = [];
+  // An open gave up waiting for `registerImporter`, so a registration after
+  // it is late and says so once.
+  private importerWaitExpired = false;
   // Open documents by id, so an export request can hand the serializer
   // the right Document. Dropped when a doc goes; a re-open overwrites.
   private openDocuments = new Map<string, Document>();
   // The app's import backend (`Brass.registerImporter`) plus the claim
   // protocol run per opened document. The deps read the documents
   // namespace lazily, so attempts (always post-open) build it on demand.
+  // A guest imports only the trial document it started from a file, through
+  // that document's edit link, which is the page's credential.
   private readonly importRunner: ImportRunner = createImportRunner({
-    claimImport: (docId) => this.docsInternal().claimImport(docId),
-    completeImport: (docId) => this.docsInternal().completeImport(docId),
+    claimImport: (docId) => {
+      const guest = this.guestImports(docId);
+      return guest ? guest.claimImport() : this.docsInternal().claimImport(docId);
+    },
+    stageImport: (docId, bundle) => {
+      const guest = this.guestImports(docId);
+      return guest ? guest.stageImport(bundle) : this.docsInternal().stageImport(docId, bundle);
+    },
+    completeImport: (docId, report, uploadKey) => {
+      const guest = this.guestImports(docId);
+      return guest
+        ? guest.completeImport(report, uploadKey)
+        : this.docsInternal().completeImport(docId, report, uploadKey);
+    },
+    failImport: (docId, message) => {
+      const guest = this.guestImports(docId);
+      return guest ? guest.failImport(message) : this.docsInternal().failImport(docId, message);
+    },
     reportError: (error) => this.fireError(error),
   });
+
+  private guestImports(docId: string): GuestImportCalls | null {
+    const token = this.guestLinkTokenValue;
+    return token === null ? null : this.getDocumentFactory().guestImports(token, docId);
+  }
+
+  // Whether this page runs a registered importer for an open document: one
+  // whose join offers this app the import (`awaits_import`), or whose file is
+  // still being stored, which the runner waits out before it claims. Any other
+  // document has nothing to import, and the platform refuses a claim on it.
+  // A guest imports only into a trial document it started from a file (a trial
+  // carries an expiry).
+  private importsInto(doc: Document): boolean {
+    const offered = doc._awaitsImport || doc._workStatusNow?.pending === true;
+    if (this.guestLinkTokenValue === null) return offered;
+    return doc.expiresAt !== null && offered;
+  }
   // One socket carrying every document topic this client subscribes,
   // built on first open so an app that never opens a document never
   // connects.
   private docWsClient: BrassWsClient | null = null;
+  // One socket per link a document on this page opened through, by token.
+  private readonly linkWsClients = new Map<string, BrassWsClient>();
 
   // init ALWAYS resolves: failures (bad/missing app_id) fire onError +
   // console.error rather than rejecting. Otherwise
@@ -401,6 +528,7 @@ export class BrassClient {
     // the click handler that opens a surface, so it would miss the press that
     // opened it and have nothing to hand focus back to on dismissal.
     trackHostedUiActivations();
+    this.initFailure = null;
     // The WASM this package runs on is fetched from here, so the download
     // overlaps the auth round-trip below and is usually ready before anything
     // asks for it. It is deliberately NOT awaited here: an app's sign-in
@@ -481,9 +609,7 @@ export class BrassClient {
       this.apiBaseUrlConfigured = urls.apiBaseUrlConfigured;
       this.wsBaseUrl = urls.wsBaseUrl;
       this._dashboardBaseUrl = urls.dashboardBaseUrl;
-      if (options.openIncompatibleDocuments === true) {
-        this.openIncompatibleDocuments = true;
-      }
+      this.openReadOnly = options.open?.readOnly === true;
       if (options.hostedUiTheme) {
         this.hostedUiTheme = options.hostedUiTheme;
       }
@@ -510,23 +636,80 @@ export class BrassClient {
         if (this.serializer) this.exportGuest.setSerializer(this.serializer);
         return;
       }
+      if (typeof window !== 'undefined' && isImportMode(window.location.search)) {
+        this.importGuest = startImportGuest();
+        if (this.importer) this.importGuest.setImporter(this.importer);
+        return;
+      }
       const guestToken =
         typeof window !== 'undefined'
           ? readGuestLinkToken(window.location.search)
           : null;
       if (guestToken) {
-        // Anonymous "anyone with the link" open. The token IS the
-        // credential, so there is no auth bootstrap: the session opens the
-        // document read-only through it. `authStatus` reports `'guest'` and
-        // the finally block's initial `onUserChange` emit drives the
-        // read-only boot (the session's guest-aware handler calls start()).
+        // Only a sign-in this tab started from this token claims a document
+        // created without an account, and only in the browser holding the
+        // mint's claim secret. `brass_code` on the URL is not enough: the
+        // cookie session resolves whether or not the code is real, so a
+        // crafted link carrying one would claim into whoever opens it. A
+        // stored hint or session pointer says nothing about whether the
+        // person meant to keep THIS document either, so a signed-in browser
+        // opening the link cold stays signed in and leaves the document
+        // temporary; the strip's Keep is the deliberate act that claims it.
+        //
+        // Who the person is comes from the session either way. The link is
+        // the credential for this document alone: its reads, writes and
+        // socket use the link, and a link open carries the person's own
+        // credential beside it (`currentLinkCredential`).
+        if (signInReturned()) {
+          const appId = this.requireAppId();
+          const claimSecret =
+            takeClaimIntent(appId) === guestToken
+              ? readClaimSecret(appId, guestToken)
+              : null;
+          await this.bootstrap();
+          if (this.user !== null) {
+            const anonymous = await this.probeAnonymousLink(guestToken);
+            const claim =
+              anonymous !== null && claimSecret !== null
+                ? { ...anonymous, claimSecret }
+                : null;
+            if (anonymous !== null && claim === null) {
+              this.reportUncatchable(
+                new BrassError(
+                  'Only the browser that started this work can keep it. It stays open here until it expires.',
+                ),
+              );
+            }
+            if (claim !== null) {
+              if (await this.claimAnonymousLink(claim)) {
+                await this.hydrateProfile();
+                return;
+              }
+              // Refused, or the person declined to place it: `claimAnonymousLink`
+              // has entered guest mode on the token.
+              return;
+            }
+          }
+        } else {
+          await this.bootstrap();
+        }
+        // The token is the document's credential: the session opens the
+        // document through it. `authStatus` reports the person (`'guest'`
+        // with nobody signed in) and the finally block's initial
+        // `onUserChange` emit drives the boot (the session's guest-aware
+        // handler calls start()).
         this.guestLinkTokenValue = guestToken;
+        await this.hydrateProfile();
         return;
       }
       await this.bootstrap();
       await this.hydrateProfile();
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
+      // A failure before `initialized` is the app's configuration (a missing
+      // or malformed app id, a hosted bundle without its runtime config), so
+      // it holds for the page's life and the session reports it as its error.
+      if (!this.initialized) this.initFailure = new BrassError(error.message);
       this.reportUncatchable(error);
       // Deliberately do not re-throw: callers using
       // `void Brass.init(...).then(setup)` should see .then() fire so the
@@ -549,9 +732,27 @@ export class BrassClient {
       // mean the person is signed out, and an app that reads it as that
       // renders a signed-out UI or calls `signIn()`, which navigates the
       // frame away from the export it was loaded to run.
-      if (this.exportGuest === null) {
+      if (!this.isHeadlessGuest()) {
+        // Before anything opens: bytes kept on this device for whoever used
+        // it last are dropped unless that was this same identity.
+        adoptSealedCacheOwner(this.user?.sub ?? null);
         for (const listener of Array.from(this.listeners)) {
           listener(this.user);
+        }
+        if (this.initialized && !this.watchingPageRestore) {
+          this.watchingPageRestore = true;
+          onPageRestored(() => void this.reloadIfRestoredStale());
+        }
+        if (this.user !== null && this.appId && typeof window !== 'undefined') {
+          checkManifestDrift({
+            appId: this.appId,
+            origin: window.location.origin,
+            apiFetch: createApiFetch({
+              apiBaseUrl: this.apiBaseUrl,
+              getAccessToken: () => this.getAccessToken(),
+              getAppAssertion: () => this.getAppAssertion(),
+            }),
+          });
         }
       }
     }
@@ -569,7 +770,9 @@ export class BrassClient {
     if (!this.initialized || !this.appId) {
       this.reportUncatchable(
         new Error(
-          this.initialized
+          this.initFailure
+            ? this.initFailure.message
+            : this.initialized
             ? 'Brass.init was called without an app ID'
             : 'Call Brass.init(appId) first',
         ),
@@ -583,7 +786,8 @@ export class BrassClient {
     // An export frame stays where it is. It runs a serializer over bytes
     // Brass handed it and never calls the API, so navigating to sign-in
     // would abandon the export mid-flight for a session it has no use for.
-    if (this.exportGuest !== null) return;
+    if (this.isHeadlessGuest()) return;
+    if (this.guestLinkTokenValue !== null) markClaimIntent(appId, this.guestLinkTokenValue);
     window.location.assign(buildSignInUrl(this.authBaseUrl, appId, window.location.href));
   }
 
@@ -635,6 +839,10 @@ export class BrassClient {
     // load's resolution go with the session.
     clearActingOrganization(appId);
     this.retireActingOrganizationState();
+    // And the guest documents this browser made, with the secrets that claim
+    // them, so the next person here is neither offered one nor able to keep it.
+    clearUnsavedWork(appId);
+    clearClaimSecret(appId);
     const signedOutUrl = buildSignedOutOfAppUrl(this.authBaseUrl, appId, window.location.href);
     // On a Brass-hosted origin, route the sign-out through the edge's
     // /__brass/leave so the first-party brass_site gate cookie is cleared
@@ -671,8 +879,8 @@ export class BrassClient {
   // render from it.
   get authStatus(): AuthStatus {
     if (!this.bootstrapped) return 'unknown';
-    if (this.guestLinkTokenValue !== null) return 'guest';
-    return this.user !== null ? 'signed-in' : 'signed-out';
+    if (this.user !== null) return 'signed-in';
+    return this.guestLinkTokenValue !== null ? 'guest' : 'signed-out';
   }
 
   // The organization this app is acting in, as far as this page load already
@@ -688,7 +896,7 @@ export class BrassClient {
   }
 
   get isGuest(): boolean {
-    return this.guestLinkTokenValue !== null;
+    return this.authStatus === 'guest';
   }
 
   // The resolved dashboard origin after `init` (the option's value if
@@ -707,7 +915,7 @@ export class BrassClient {
     // a flicker through the initial `null`. Post-init subscribers get an
     // immediate emit with the current value, the usual "register and
     // read current state" idiom.
-    if (this.bootstrapped && this.exportGuest === null) {
+    if (this.bootstrapped && !this.isHeadlessGuest()) {
       listener(this.user);
     }
     return () => {
@@ -745,6 +953,8 @@ export class BrassClient {
         apiBaseUrl: this.apiBaseUrl,
         getAccessToken: () => this.getAccessToken(),
         getAppAssertion: () => this.getAppAssertion(),
+        getSocket: () =>
+          this.appId === null ? undefined : this.getDocWsClient(this.appId),
       });
     }
     return this.documentsNamespace;
@@ -759,13 +969,36 @@ export class BrassClient {
       this.documentSession = createDocumentSession({
         isSignedIn: () => this.user !== null,
         authStatus: () => this.authStatus,
-        onUserChange: (listener) =>
-          this.onUserChange((user) => listener(user !== null)),
+        initFailure: () => this.initFailure,
+        onUserChange: (listener) => {
+          const wrapped: UserChangeListener = (user) => listener(user !== null);
+          this.sessionUserListeners.add(wrapped);
+          return this.onUserChange(wrapped);
+        },
         openDocumentById: (docId, options, consent) =>
-          this.openDocumentInternal(docId, options, consent),
+          this.asOwnAccess(() => this.openDocumentInternal(docId, options, consent)),
         guestLinkToken: () => this.guestLinkTokenValue,
+        openReadOnly: () => this.openReadOnly,
         openDocumentByLink: (token, options) =>
           this.openByLinkInternal(token, options),
+        mintAnonymousDocument: (args) =>
+          this.getDocumentFactory().mintAnonymousDocument(args),
+        enterGuestMode: (token) => this.enterGuestMode(token),
+        chooseAnonymousFile: () => this.chooseAnonymousFile(),
+        signedOutUseRefusal: () => this.signedOutUseRefusal(),
+        appOffersNew: () => this.appOffersNew(),
+        mintAnonymousDocumentFromFile: (args) =>
+          this.getDocumentFactory().mintAnonymousDocumentFromFile(args),
+        unsavedWork: () => this.readLiveUnsavedWork(),
+        clearUnsavedWork: () => {
+          if (this.appId !== null) clearUnsavedWork(this.appId);
+        },
+        leaveGuestMode: () => this.leaveGuestMode(),
+        followClaimedLink: (token) => this.followClaimedLink(token),
+        markTrialEdited: (token, expiresAt) => markTrialEdited(token, expiresAt),
+        trialEdited: (token) => trialWasEdited(token),
+        confirmReplaceTrial: (expiresAt) => askReplaceTrial(expiresAt),
+        signIn: () => this.signIn(),
         createDocumentId: (args) => this.createDocumentIdWithConsent(args),
         selectDocument: () => this.selectDocumentInternal(),
         selectCreateDestination: (options) =>
@@ -875,7 +1108,15 @@ export class BrassClient {
       onUserChange: (listener) => this.onUserChange(listener),
       signIn: () => this.signIn(),
       signOut: () => this.signOut(),
-      dashboardBaseUrl: this._dashboardBaseUrl,
+      canKeep: () => this.canKeepTemporaryWork(),
+      keep: () => {
+        void this.keepTemporaryWork();
+      },
+      // Both environment-dependent values are read at use rather than copied
+      // in here: a piece can be mounted before `init()` resolves, and until it
+      // does these hold the production defaults. See `AccountMenuDeps`.
+      dashboardBaseUrl: () => this._dashboardBaseUrl,
+      appId: () => this.appId ?? undefined,
       getActingOrganization: () => this.visibleActingOrganization(),
       subscribeActingOrganization: (listener) => {
         this.actingOrganizationListeners.add(listener);
@@ -892,9 +1133,10 @@ export class BrassClient {
         void this.switchActingOrganization();
       },
       getDocument: (docId) => this.documents.get(docId),
+      onLink: () => this.guestLinkTokenValue !== null,
       // The version-preview bar is a hosted embed; it takes the same theme
       // as the other hosted surfaces.
-      hostedUiTheme: this.hostedUiTheme,
+      hostedUiTheme: () => this.hostedUiTheme,
     };
   }
 
@@ -920,6 +1162,33 @@ export class BrassClient {
     const result = await this.getHostedUiLauncher().selectDocument();
     if (result) storeLastDocument(appId, result);
     return result;
+  }
+
+  // Opens the hosted picker for a SET of documents and resolves with every
+  // one the person chose: `[]` when they took out everything `selected`
+  // held, `null` when they dismissed it. The set is confined
+  // to one organization. `options.accept` narrows what the picker offers to
+  // this request alone, which is how an app that has read a file names the
+  // siblings it is missing; `options.prompt` says why it is asking; and
+  // `options.selected` names what the app already holds, so a later call
+  // edits that set and resolves with the whole of it.
+  //
+  // Opening is unchanged: pass each ref's `doc_id` to `openDocumentById`. The
+  // URL carries one document, so a set is the app's to hold; nothing here
+  // writes to it. Throws before init.
+  async chooseInputs(
+    families: DocumentFamilies,
+    options?: ChooseInputsOptions,
+  ): Promise<InputReference[] | null> {
+    return this.getHostedUiLauncher().chooseInputs(families, options);
+  }
+
+  // One file as a reference, from the ordinary Open list. Throws before init.
+  async chooseInput(
+    families: DocumentFamilies,
+    options?: ChooseInputOptions,
+  ): Promise<InputReference | null> {
+    return this.getHostedUiLauncher().chooseInput(families, options);
   }
 
   // The value the most recent `selectDocument()` resolved with
@@ -1014,7 +1283,15 @@ export class BrassClient {
     docId: string,
     options?: OpenDocumentByIdOptions,
   ): Promise<OpenedDocument> {
-    const opened = await this.openDocumentInternal(docId, options);
+    // A frozen copy is read beside whatever the page shows, usually as one of
+    // many, so it claims no URL and raises no consent dialog of its own.
+    if (options?.frozen === true) {
+      return this.reopensBeside(
+        await this.openDocumentInternal(docId, options, 'skip', true),
+        options,
+      );
+    }
+    const opened = this.reopensBeside(await this.openDocumentInternal(docId, options), options);
     // The URL names the document the reader is looking at, and the session
     // owns that whenever it holds one: this open is detached, so claiming the
     // URL would leave the address bar naming a document the session is not
@@ -1023,6 +1300,32 @@ export class BrassClient {
     // this method exists for.
     if (this.session.document === null) this.maybeWriteDocIdToUrl(opened.id);
     return opened;
+  }
+
+  // `doc.reopen` for a copy this method opened: the same open in the asked
+  // mode, on the branch the copy is on, after which this copy closes.
+  private reopensBeside(
+    doc: OpenedDocument,
+    options: OpenDocumentByIdOptions | undefined,
+  ): OpenedDocument {
+    doc._setReopener(async (mode) => {
+      const { readOnly: _readOnly, frozen: _frozen, version: _version, ...rest } = options ?? {};
+      const { readOnly: _alias, readOnlyReason: _reason, ...documentOptions } =
+        rest.documentOptions ?? {};
+      // A copy opened at a stream carries the stream's line as `branchId`,
+      // which the join refuses as a branch, so it reopens on the branch the
+      // open named.
+      const branch = rest.stream !== undefined ? rest.branch : (doc.branchId ?? undefined);
+      const next = await this.openDocumentById(doc.id, {
+        ...rest,
+        documentOptions,
+        ...(branch !== undefined ? { branch } : {}),
+        ...(mode === 'frozen' ? { frozen: true } : { readOnly: mode === 'read' }),
+      });
+      doc.close();
+      return next;
+    });
+    return doc;
   }
 
   // Open a document READ-ONLY from a public-link token (the "anyone with
@@ -1034,10 +1337,49 @@ export class BrassClient {
     token: string,
     options?: OpenDocumentByIdOptions,
   ): Promise<OpenedDocument> {
-    const factory = this.getDocumentFactory();
-    const opened = await factory.openByLink(token, options);
-    this.trackOpenDocument(opened);
+    const opened = await this.importedByLink(await this.joinByLink(token, options), token, options);
+    // A document the platform will remove was created without an account,
+    // and its token is the only way back to it once this tab is gone. Every
+    // guest open of one lands here (a create while signed out, the boot of
+    // its URL, a shared link to one), so this is where the app's signed-out
+    // gate learns of it (`session.unsavedWork`).
+    // A token this browser has claimed is no longer unsaved work, whatever
+    // the open answered: a page the browser kept from before the claim can
+    // still open through it.
+    const appId = this.requireAppId();
+    if (opened.expiresAt !== null && readClaimedLink(appId, token) === null) {
+      storeUnsavedWork(appId, token, opened.expiresAt);
+    }
     return opened;
+  }
+
+  private async joinByLink(
+    token: string,
+    options: OpenDocumentByIdOptions | undefined,
+  ): Promise<OpenedDocument> {
+    const opened = await this.getDocumentFactory().openByLink(token, options);
+    // A link the person opened as themselves was tracked by that open.
+    if (this.openDocuments.get(opened.id) !== opened) this.trackOpenDocument(opened);
+    return opened;
+  }
+
+  // A trial document started from a file is imported by this page before the
+  // open resolves, as `openDocumentInternal` imports a member's: an open whose
+  // import does not land rejects rather than resolving the empty document.
+  private async importedByLink(
+    opened: OpenedDocument,
+    token: string,
+    options: OpenDocumentByIdOptions | undefined,
+  ): Promise<OpenedDocument> {
+    if (!opened._awaitsImport || !this.importsInto(opened)) return opened;
+    if (await this.importBeforeResolving(opened, options?.frozen === true, options?.onSnapshotProgress)) {
+      return opened;
+    }
+    const imported = await this.joinByLink(token, options);
+    if (!imported._awaitsImport) return imported;
+    imported._reopen();
+    imported.close();
+    throw notImported(opened);
   }
 
   // The open path shared by the public `openDocumentById` and the
@@ -1045,24 +1387,147 @@ export class BrassClient {
   // (`replaceState`) for direct multi-doc callers, while the session
   // owns its own push / replace history writes so a single-doc open
   // becomes a back-navigable entry without the two layers double-writing.
+  //
+  // A file this app imports and nobody has imported yet is imported before the
+  // open resolves, in every mode. The platform refuses the open of a file only
+  // another app imports (`not_imported`), so a join that still awaits an
+  // import names this app as the importer.
   private async openDocumentInternal(
     docId: string,
     options?: OpenDocumentByIdOptions,
     consent: 'offer' | 'skip' = 'offer',
+    // A copy read beside whatever the page shows (one of a set a pass reads,
+    // or a frozen copy) is not the session's copy of its id, so it is not
+    // tracked as the open copy of that id.
+    beside = false,
+  ): Promise<OpenedDocument> {
+    const opened = await this.joinDocument(docId, options, consent, beside);
+    if (!opened._awaitsImport || !this.importsInto(opened)) return opened;
+    if (await this.importBeforeResolving(opened, options?.frozen === true, options?.onSnapshotProgress)) {
+      return opened;
+    }
+    const imported = await this.joinDocument(docId, options, 'skip', beside);
+    if (!imported._awaitsImport) return imported;
+    // The import ended without landing (the claim was refused, or this client
+    // stopped waiting on another window's), which the app's error handler has
+    // already been told.
+    imported._reopen();
+    imported.close();
+    throw notImported(opened);
+  }
+
+  // Runs this app's importer on a document opened before its import, and
+  // resolves once the import has ended: true when the copy now holds the
+  // import (a frozen copy, reloaded in place), false when the open joins again
+  // for it. Rejects with the import's error when it failed.
+  private async importBeforeResolving(
+    doc: OpenedDocument,
+    frozen: boolean,
+    progress: OpenDocumentByIdOptions['onSnapshotProgress'],
+  ): Promise<boolean> {
+    // An open that ran before the app registered its importer waits for it.
+    if (this.importer === null && !(await this.waitForImporter(doc))) {
+      if (doc._isLive) {
+        doc._reopen();
+        doc.close();
+      }
+      // The message reaches the app's users, so the cause goes to the console.
+      console.warn(
+        `[brass] An open failed with not_imported: this app's manifest declares an importer for the file and Brass.registerImporter was not called within ${IMPORTER_WAIT_CEILING_MS / 1000}s.`,
+      );
+      const refused = new BrassError(NOT_IMPORTED_MESSAGE, { status: 0, code: 'not_imported' });
+      importerWaitRejections.add(refused);
+      throw refused;
+    }
+    // A tracked copy had its attempt when it was tracked or when the importer
+    // was registered, so a call for the same open is a no-op. A frozen copy
+    // takes the import under the same handles.
+    void this.importRunner.attempt(doc, frozen ? { reloadInPlace: true } : undefined);
+    await new Promise<void>((resolve) => {
+      const stops: Array<() => void> = [];
+      let settled = false;
+      const done = (): void => {
+        if (settled) return;
+        settled = true;
+        queueMicrotask(() => stops.forEach((stop) => stop()));
+        resolve();
+      };
+      stops.push(doc.onGone(done));
+      stops.push(
+        doc.onStatus((status) => {
+          // A settled status from the work that stored the file starts the
+          // import, whose hold is set before this listener hears that status.
+          if (!status.pending && doc._importHold === null) done();
+          // The import's own progress is what the opener shows while it waits.
+          else progress?.(0, null, 'importing', status.message);
+        }),
+      );
+    });
+    if (doc._isLive && doc._contentLoadFailed) {
+      const message = doc._workStatusNow?.message;
+      doc._reopen();
+      doc.close();
+      throw new BrassError(message !== undefined && message !== '' ? message : IMPORT_FAILED_MESSAGE, {
+        status: 0,
+      });
+    }
+    if (frozen && doc._isLive && doc._goneReason === null) {
+      // A reload the importer started is shared.
+      await doc.reload();
+      if (doc._isLive) return true;
+    }
+    // Retired as moved rather than parked, so the join that follows builds a
+    // copy from the imported content instead of taking this empty one back.
+    if (doc._isLive) {
+      doc._reopen();
+      doc.close();
+    }
+    return false;
+  }
+
+  // Resolves true when `registerImporter` runs, false at the ceiling.
+  private waitForImporter(doc: OpenedDocument): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const warning = inDevelopment()
+        ? setTimeout(() => {
+            const dot = doc.name?.lastIndexOf('.') ?? -1;
+            const type = dot > 0 ? `${doc.name!.slice(dot)} files` : 'this file';
+            console.warn(
+              `[brass] An open is waiting for an importer: this app's manifest declares one for ${type}, and Brass.registerImporter has not been called. The open fails with not_imported after ${IMPORTER_WAIT_CEILING_MS / 1000}s.`,
+            );
+          }, IMPORTER_WAIT_WARN_MS)
+        : undefined;
+      const settle = (registered: boolean): void => {
+        clearTimeout(warning);
+        clearTimeout(ceiling);
+        const at = this.importerWaiters.indexOf(waiter);
+        if (at !== -1) this.importerWaiters.splice(at, 1);
+        resolve(registered);
+      };
+      const waiter = (): void => settle(true);
+      const ceiling = setTimeout(() => {
+        this.importerWaitExpired = true;
+        settle(false);
+      }, IMPORTER_WAIT_CEILING_MS);
+      this.importerWaiters.push(waiter);
+    });
+  }
+
+  private async joinDocument(
+    docId: string,
+    options: OpenDocumentByIdOptions | undefined,
+    consent: 'offer' | 'skip',
+    beside: boolean,
   ): Promise<OpenedDocument> {
     const factory = this.getDocumentFactory();
     // After getDocumentFactory() resolves, requireAppId() has run and
     // this.appId is a string.
     const appId = this.appId as string;
-    // An app that declared it opens these carries the answer on every open,
-    // so nothing is asked and nothing is refused.
-    const withConsent: OpenDocumentByIdOptions | undefined = this
-      .openIncompatibleDocuments
-      ? { ...options, acceptSchemaConflict: true }
-      : options;
     try {
-      const opened = await factory.open(docId, withConsent);
-      this.trackOpenDocument(opened);
+      const opened = await factory.open(docId, options);
+      // The tracked set is the live copy of each document, keyed by id; a
+      // copy read beside it must not replace it there.
+      if (!beside) this.trackOpenDocument(opened);
       return opened;
     } catch (err) {
       // The platform refuses to join a document this app's schema cannot
@@ -1074,10 +1539,10 @@ export class BrassClient {
         const { openAnyway } = await askSchemaConflict(err.message, err.title);
         if (!openAnyway) throw err;
         const opened = await factory.open(docId, {
-          ...withConsent,
+          ...options,
           acceptSchemaConflict: true,
         });
-        this.trackOpenDocument(opened);
+        if (!beside) this.trackOpenDocument(opened);
         return opened;
       }
       // A denial because the document's org has no install of this app
@@ -1090,7 +1555,7 @@ export class BrassClient {
       // before they touch anything.
       if (consent === 'offer' && (await this.offerInstallConsent(err))) {
         const opened = await factory.open(docId, options);
-        this.trackOpenDocument(opened);
+        if (!beside) this.trackOpenDocument(opened);
         return opened;
       }
       if (isAppNotInstalled(err)) throw err;
@@ -1122,7 +1587,9 @@ export class BrassClient {
 
   async createDocument(options?: CreateDocumentOptions): Promise<OpenedDocument> {
     const opened = await this.createDocumentInternal(options);
-    this.maybeWriteDocIdToUrl(opened.id);
+    // A document minted without an account is reached through the link
+    // token the URL already carries, never through its id.
+    if (this.guestLinkTokenValue === null) this.maybeWriteDocIdToUrl(opened.id);
     return opened;
   }
 
@@ -1132,18 +1599,34 @@ export class BrassClient {
     options?: CreateDocumentOptions,
   ): Promise<OpenedDocument> {
     const factory = this.getDocumentFactory();
-    try {
-      const opened = await factory.create(options);
-      this.trackOpenDocument(opened);
-      return opened;
-    } catch (err) {
-      if (await this.offerInstallConsent(err)) {
+    // No account: mint the document without one and open it through its
+    // link token, which becomes this page's credential.
+    if (this.authStatus === 'signed-out') {
+      const minted = await factory.mintAnonymousDocument(
+        options?.name !== undefined ? { name: options.name } : {},
+      );
+      this.enterGuestMode(minted.linkToken);
+      return this.openByLinkInternal(
+        minted.linkToken,
+        options?.documentOptions
+          ? { documentOptions: options.documentOptions }
+          : undefined,
+      );
+    }
+    return this.asOwnAccess(async () => {
+      try {
         const opened = await factory.create(options);
         this.trackOpenDocument(opened);
         return opened;
+      } catch (err) {
+        if (await this.offerInstallConsent(err)) {
+          const opened = await factory.create(options);
+          this.trackOpenDocument(opened);
+          return opened;
+        }
+        throw err;
       }
-      throw err;
-    }
+    });
   }
 
   // Create-only for the session: classify the outcome (created / needs a
@@ -1165,15 +1648,388 @@ export class BrassClient {
     }
   }
 
+  // The claim's install-consent retry, the same reactive install
+  // `createDocumentIdWithConsent` gives a create.
+  private async claimAnonymousDocumentWithConsent(
+    docId: string,
+    args: ClaimAnonymousDocumentArgs,
+  ): Promise<ClaimDocumentResult> {
+    const factory = this.getDocumentFactory();
+    try {
+      return await factory.claimAnonymousDocument(docId, args);
+    } catch (err) {
+      if (await this.offerInstallConsent(err)) {
+        return factory.claimAnonymousDocument(docId, args);
+      }
+      throw err;
+    }
+  }
+
+  // The app's upload-types read, once per page. A failed read is dropped so
+  // the next asks again.
+  private anonymousUploadTypes(): Promise<AnonymousUploadTypes> {
+    if (this.anonymousUploadTypesRead === null) {
+      const read = this.getDocumentFactory().anonymousUploadTypes();
+      this.anonymousUploadTypesRead = read;
+      read.catch(() => {
+        if (this.anonymousUploadTypesRead === read) this.anonymousUploadTypesRead = null;
+      });
+    }
+    return this.anonymousUploadTypesRead;
+  }
+  private anonymousUploadTypesRead: Promise<AnonymousUploadTypes> | null = null;
+
+  // Whether this app offers New, from its row on the platform. A failed read
+  // offers New, and the create reports at the press.
+  private async appOffersNew(): Promise<boolean> {
+    try {
+      return (await this.anonymousUploadTypes()).offersNew;
+    } catch {
+      return true;
+    }
+  }
+
+  // The file types a visitor can start a document of this app from.
+  private async anonymousUploadAccept(): Promise<AnonymousUploadAccept> {
+    const read = await this.anonymousUploadTypes();
+    if ('refusal' in read) throw read.refusal;
+    return read.accept;
+  }
+
+  // The refusal this app meets without an account, read off the same
+  // upload-types read a signed-out pick makes, so a later Upload reuses it.
+  // Only the `sign_in_required` answer withdraws New and Open; any
+  // other failure leaves them to report at the press.
+  private async signedOutUseRefusal(): Promise<BrassError | null> {
+    try {
+      await this.anonymousUploadAccept();
+      return null;
+    } catch (err) {
+      return err instanceof BrassError && err.code === 'sign_in_required' ? err : null;
+    }
+  }
+
+  // The file a signed-out pick starts a document from. An app that can start
+  // from no file type refuses rather than opening a dialog every file in
+  // which would be refused. The types are read at the press, inside the
+  // several seconds a browser lets that press open a file dialog.
+  private async chooseAnonymousFile(): Promise<File | null> {
+    const { accept, maxBytes } = await this.anonymousUploadAccept();
+    if (accept === '') {
+      throw new BrassError('This app cannot open a file without an account. Sign in to open one.', {
+        status: 400,
+      });
+    }
+    const file = await chooseFile(accept);
+    if (file !== null && file.size > maxBytes) {
+      const mb = Math.floor(maxBytes / (1024 * 1024));
+      throw new BrassError(
+        `That file is too large to open without an account (limit ${mb} MB). Sign in to import it.`,
+        { status: 400 },
+      );
+    }
+    return file;
+  }
+
+  // Make a link token the open document's credential, with the URL carrying
+  // it so a reload and a sign-in both return to the document. With nobody
+  // signed in `authStatus` reads `'guest'`; a signed-in person who did not
+  // keep the document stays signed in.
+  private enterGuestMode(token: string): void {
+    const credentialChanged = this.guestLinkTokenValue !== token;
+    this.guestLinkTokenValue = token;
+    writeGuestLinkToken(token);
+    // A guest socket is admitted to the one document its link names, so a
+    // socket opened under another credential cannot carry this one.
+    if (credentialChanged) this.docWsClient?.reconnect();
+    this.emitGuestModeChange();
+  }
+
+  // `authStatus` moved between 'signed-out' (or 'signed-in') and 'guest'
+  // without a sign-in or sign-out, which is still an auth change to an app
+  // that renders its shells off `onUserChange`.
+  private emitGuestModeChange(): void {
+    // With someone signed in, a link coming or going leaves `authStatus` as it
+    // was, so there is nothing to announce.
+    if (!this.bootstrapped || this.isHeadlessGuest() || this.user !== null) return;
+    for (const listener of Array.from(this.listeners)) {
+      if (this.sessionUserListeners.has(listener)) continue;
+      listener(this.user);
+    }
+  }
+
+  // Take a token back out of the page's credential and URL after it failed
+  // to open, so `authStatus` reads `'signed-out'` again. Only the session's
+  // continue path reaches this, from a page that held no session.
+  private leaveGuestMode(): void {
+    this.guestLinkTokenValue = null;
+    clearGuestLinkToken();
+    this.emitGuestModeChange();
+  }
+
+  // Where a refused link leads this person, when their own claim revoked it.
+  // For the claimant the page leaves the link signed in, with the document's
+  // id on the URL. A page with no session, in the browser that made the
+  // claim, leaves the link signed out with the id on the URL, so the sign-in
+  // the app offers returns to the document. Anyone else keeps the refusal.
+  private async followClaimedLink(token: string): Promise<ClaimedLinkTarget> {
+    if (this.guestLinkTokenValue !== token) return null;
+    const tokens = this.tokens;
+    if (this.user === null || tokens === null) {
+      const claimedHere = this.appId === null ? null : readClaimedLink(this.appId, token);
+      if (claimedHere === null) return null;
+      this.forgetUnsavedWorkFor(token);
+      this.leaveClaimedLink(claimedHere);
+      this.emitGuestModeChange();
+      return 'sign-in';
+    }
+    const docId = await this.readClaimedLink(token, tokens).catch(() => null);
+    if (docId === null || this.guestLinkTokenValue !== token) return null;
+    if (this.appId !== null) storeClaimedLink(this.appId, token, docId);
+    this.forgetUnsavedWorkFor(token);
+    this.leaveClaimedLink(docId);
+    await this.hydrateProfile();
+    this.docWsClient?.reconnect();
+    this.emitGuestModeChange();
+    return { docId };
+  }
+
+  // The way back to unsaved work, unless its token is one this browser has
+  // claimed: that work has an owner and a document id, and a page that opened
+  // the token from before the claim may have written it back.
+  private readLiveUnsavedWork(): UnsavedWorkEntry | null {
+    if (this.appId === null) return null;
+    const entry = readUnsavedWork(this.appId);
+    if (entry === null || readClaimedLink(this.appId, entry.token) === null) return entry;
+    clearUnsavedWork(this.appId);
+    return null;
+  }
+
+  private forgetUnsavedWorkFor(token: string): void {
+    if (this.appId !== null && readUnsavedWork(this.appId)?.token === token) {
+      clearUnsavedWork(this.appId);
+    }
+  }
+
+  private leaveClaimedLink(docId: string): void {
+    this.guestLinkTokenValue = null;
+    clearGuestLinkToken();
+    this.maybeWriteDocIdToUrl(docId);
+  }
+
+  private async readClaimedLink(token: string, tokens: TokenSet): Promise<string | null> {
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${tokens.accessToken}`,
+    };
+    applyClientVersionHeader(headers);
+    if (tokens.appAssertion) headers['x-brass-app-assertion'] = tokens.appAssertion;
+    const response = await fetch(
+      `${this.apiBaseUrl}/links/${encodeURIComponent(token)}/claimed`,
+      { method: 'GET', headers },
+    );
+    if (!response.ok) return null;
+    const body = (await response.json()) as { doc_id?: unknown };
+    return typeof body.doc_id === 'string' && body.doc_id !== '' ? body.doc_id : null;
+  }
+
+  // A page back from the back-forward cache, checked against what may have
+  // moved while it was frozen; see `page-restore.ts`.
+  private async reloadIfRestoredStale(): Promise<void> {
+    const appId = this.appId;
+    if (appId === null) return;
+    const stale = await restoredPageIsStale(
+      {
+        guestLinkToken: this.guestLinkTokenValue,
+        signedIn: this.user !== null,
+        sessionHinted: readLoginHint(appId),
+      },
+      (token) => this.linkStillOpen(token),
+    );
+    if (stale) window.location.reload();
+  }
+
+  private async linkStillOpen(token: string): Promise<boolean | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBaseUrl}/links/${encodeURIComponent(token)}/view`,
+        { method: 'GET', cache: 'no-store' },
+      );
+      if (response.ok) return true;
+      return response.status === 403 || response.status === 404 || response.status === 410
+        ? false
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Whether the signed-in person can keep the temporary document this page is
+  // on: only the browser that made it holds the secret its claim takes.
+  private canKeepTemporaryWork(): boolean {
+    const token = this.guestLinkTokenValue;
+    if (token === null || this.user === null || this.appId === null) return false;
+    if (this.session.document?.expiresAt == null) return false;
+    return readClaimSecret(this.appId, token) !== null;
+  }
+
+  // Keep the temporary document this page is on, signed in, without leaving
+  // the page: the claim a sign-in from the page would make, then the document
+  // opened by id. The claim evicts the link's own connections, so the page
+  // leaves the link before it reopens rather than following the eviction.
+  private async keepTemporaryWork(): Promise<boolean> {
+    const token = this.guestLinkTokenValue;
+    if (token === null || this.user === null || !this.canKeepTemporaryWork()) return false;
+    const appId = this.requireAppId();
+    const claimSecret = readClaimSecret(appId, token);
+    const anonymous = await this.probeAnonymousLink(token);
+    if (claimSecret === null || anonymous === null) return false;
+    if (!(await this.claimAnonymousLink({ ...anonymous, claimSecret }))) return false;
+    this.leaveLinkForOwnAccess();
+    try {
+      await this.session.open(anonymous.docId);
+    } catch (err) {
+      this.reportUncatchable(err instanceof Error ? err : new Error(String(err)));
+    }
+    return true;
+  }
+
+  // A signed-in person on a link page who opens or creates another document
+  // does so as themselves, so the page stops being on the link: the URL drops
+  // it and the socket reconnects with their own credential.
+  private leaveLinkForOwnAccess(): void {
+    if (this.guestLinkTokenValue === null || this.user === null) return;
+    this.guestLinkTokenValue = null;
+    clearGuestLinkToken();
+  }
+
+  // Run an open or create the person makes as themselves, off the link. One
+  // that fails leaves the page where it was, still on the link: the document
+  // it shows is the link's, and the URL is what brings a reload back to it.
+  private async asOwnAccess<T>(run: () => Promise<T>): Promise<T> {
+    const token = this.user !== null ? this.guestLinkTokenValue : null;
+    this.leaveLinkForOwnAccess();
+    try {
+      return await run();
+    } catch (err) {
+      if (token !== null && this.guestLinkTokenValue === null && this.user !== null) {
+        this.guestLinkTokenValue = token;
+        writeGuestLinkToken(token);
+      }
+      throw err;
+    }
+  }
+
+  // The signed-in person's credential, carried beside a link on its open: an
+  // app that opens links only for people signed in to it asks for it. Read
+  // through `getAccessToken`, which renews a token set near its expiry.
+  private async currentLinkCredential(): Promise<LinkCredential | null> {
+    if (this.user === null || (await this.getAccessToken()) === null) return null;
+    const tokens = this.tokens;
+    if (this.user === null || tokens === null || tokens.appAssertion === undefined) return null;
+    return { accessToken: tokens.accessToken, appAssertion: tokens.appAssertion };
+  }
+
+  // Whether a link token names a document created without an account, read
+  // off `GET /links/{token}/view` (no snapshot, no credential). Null for an
+  // ordinary share link, and for a token the server no longer answers.
+  private async probeAnonymousLink(
+    token: string,
+  ): Promise<Omit<AnonymousLinkClaim, 'claimSecret'> | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBaseUrl}/links/${encodeURIComponent(token)}/view`,
+        { method: 'GET' },
+      );
+      if (!response.ok) return null;
+      const body = (await response.json()) as {
+        doc_id?: unknown;
+        anonymous?: unknown;
+        name?: unknown;
+      };
+      if (body.anonymous !== true || typeof body.doc_id !== 'string') {
+        return null;
+      }
+      return {
+        token,
+        docId: body.doc_id,
+        ...(typeof body.name === 'string' ? { name: body.name } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // Claim a document created without an account into the signed-in person's
+  // organization, through the placement loop a create runs. On success the
+  // claimed id replaces the token in the URL and is stashed as the last
+  // selection, so the session's restore and an app reading `?doc=` both
+  // find it. A refused or dismissed claim reports through `onError` and
+  // enters guest mode on the token, editable until it expires; a reload
+  // carries no code, so it does not claim again.
+  private async claimAnonymousLink(claim: AnonymousLinkClaim): Promise<boolean> {
+    const appId = this.requireAppId();
+    let chosenName: string | undefined;
+    let result: ClaimDocumentResult | null = null;
+    try {
+      result = await placeThroughHostedSurfaces(
+        this.getHostedUiLauncher(),
+        (destination) =>
+          this.claimAnonymousDocumentWithConsent(claim.docId, {
+            linkToken: claim.token,
+            claimSecret: claim.claimSecret,
+            ...(destination !== undefined ? { destination } : {}),
+            ...(chosenName !== undefined ? { name: chosenName } : {}),
+          }),
+        claim.name,
+        (chosen) => {
+          chosenName = chosen.name;
+        },
+      );
+    } catch (err) {
+      this.reportUncatchable(err instanceof Error ? err : new Error(String(err)));
+    }
+    if (result === null) {
+      this.enterGuestMode(claim.token);
+      return false;
+    }
+    clearGuestLinkToken();
+    // Claimed, the document is reached by id like any other, so there is
+    // no unsaved work to come back to.
+    clearUnsavedWork(appId);
+    clearClaimSecret(appId, claim.token);
+    storeClaimedLink(appId, claim.token, claim.docId);
+    this.maybeWriteDocIdToUrl(claim.docId);
+    if (result.record) storeLastDocument(appId, result.record);
+    return true;
+  }
+
   // The `app_not_installed` denial names the org; open the hosted
   // install-consent dialog for it so the person decides: an admin (or a
   // member of an `open`-policy org) installs, a member under `request`
   // sends the admin request from the same dialog. Nothing is installed
   // or requested implicitly. Resolves true only when an install landed,
   // in which case the caller retries the denied call once.
-  private async offerInstallConsent(err: unknown): Promise<boolean> {
-    if (!isAppNotInstalled(err) || !err.organizationId) return false;
+  private offerInstallConsent(err: unknown): Promise<boolean> {
+    if (!isAppNotInstalled(err) || !err.organizationId) return Promise.resolve(false);
     const organizationId = err.organizationId;
+    // One dialog per organization, however many calls were refused. An app
+    // that opens a SET hits the same denial once per document, and each raise
+    // is a modal: the reader answers the one on top and finds another behind
+    // it, for work they already consented to. The install a dialog lands is
+    // the whole answer for every caller waiting on it, and each still retries
+    // its own denied call afterwards.
+    const inFlight = this.installConsentByOrganization.get(organizationId);
+    if (inFlight) return inFlight;
+    const raised = this.raiseInstallConsent(organizationId).finally(() => {
+      this.installConsentByOrganization.delete(organizationId);
+    });
+    this.installConsentByOrganization.set(organizationId, raised);
+    return raised;
+  }
+
+  // The dialog itself, held apart so the memo above is the only thing that
+  // decides whether one opens.
+  private async raiseInstallConsent(organizationId: string): Promise<boolean> {
     try {
       const result = await this.getHostedUiLauncher().installApp(organizationId);
       if (result === null) {
@@ -1232,7 +2088,7 @@ export class BrassClient {
   // Register the app's export backend. The platform calls it when a
   // hosted surface downloads an app-owned (blob) document: it receives
   // the open Document and returns the source file's bytes, the inverse of
-  // the parse the app ran on `doc.sourceBlob()`. The app never invokes it
+  // the app's importer. The app never invokes it
   // and never delivers the bytes itself; the platform stages + downloads
   // what it returns. One serializer per app.
   registerSerializer(serializer: DocumentSerializer): void {
@@ -1242,18 +2098,37 @@ export class BrassClient {
     this.exportGuest?.setSerializer(serializer);
   }
 
-  // Register the app's import backend: parses a stored source file into
-  // the document's records. The SDK claims the import with the platform
-  // on each open, so exactly one client runs it; the other open clients
-  // receive the records live. One importer per app; a later registration
+  // Register the app's import backend, `(file) => { streams, report? }`.
+  // The SDK claims the import with the platform on each open, so exactly one
+  // client runs it, and the platform seals what it returns as the document's
+  // first content. One importer per app; a later registration
   // replaces the earlier. Documents already open (registration raced the
-  // first open) get their attempt here.
+  // first open) get their attempt here, and so do inputs whose open stopped
+  // waiting for it.
   registerImporter(importer: DocumentImporter): void {
+    this.importer = importer;
     this.importRunner.setImporter(importer);
-    if (this.guestLinkTokenValue !== null) return;
-    for (const doc of this.liveOpenDocuments()) {
-      void this.importRunner.attempt(doc);
+    for (const registered of this.importerWaiters.splice(0)) registered();
+    if (this.importGuest !== null) {
+      this.importGuest.setImporter(importer);
+      return;
     }
+    if (this.importerWaitExpired) {
+      this.importerWaitExpired = false;
+      console.warn(
+        `[brass] Brass.registerImporter was called after an open had waited ${IMPORTER_WAIT_CEILING_MS / 1000}s for it and failed with not_imported. Call it before opening documents.`,
+      );
+    }
+    for (const doc of this.liveOpenDocuments()) {
+      if (this.importsInto(doc)) void this.importRunner.attempt(doc);
+      doc._importerRegistered();
+    }
+  }
+
+  // A bundle Brass loaded to run its serializer or importer headless holds
+  // no session and emits none.
+  private isHeadlessGuest(): boolean {
+    return this.exportGuest !== null || this.importGuest !== null;
   }
 
   // Track an opened document so an export request can resolve its id to
@@ -1266,11 +2141,8 @@ export class BrassClient {
       }
     });
     // Every open path funnels through here, so this is where a registered
-    // importer gets its per-document attempt. A guest open is read-only
-    // with no API credential, so no import runs for it.
-    if (this.guestLinkTokenValue === null) {
-      void this.importRunner.attempt(doc);
-    }
+    // importer gets its per-document attempt.
+    if (this.importsInto(doc)) void this.importRunner.attempt(doc);
   }
 
   // The tracked documents still open, dropping the rest as it goes.
@@ -1322,7 +2194,7 @@ export class BrassClient {
     const serialized = await this.serializeForExport(docId);
     if (!serialized.ok) {
       throw new BrassError(
-        `This app could not write the document out to publish it: ${serialized.message}`,
+        `This app could not write this out as a file to publish it: ${serialized.message}`,
         { status: 400 },
       );
     }
@@ -1349,7 +2221,7 @@ export class BrassClient {
       this.liveOpenDocument(docId) ??
       (sessionDoc && sessionDoc.id === docId && sessionDoc._isLive ? sessionDoc : null);
     if (!doc) {
-      return { ok: false, code: 'no_document', message: 'Document is not open.' };
+      return { ok: false, code: 'no_document', message: 'This is not open in the app.' };
     }
     try {
       // A serializer runs detached, with no subscription to have been fed by,
@@ -1400,8 +2272,11 @@ export class BrassClient {
         apiBaseUrl: this.apiBaseUrl,
         getAccessToken: () => this.getAccessToken(),
         getAppAssertion: () => this.getAppAssertion(),
+        getLinkCredential: () => this.currentLinkCredential(),
+        openAsMember: (docId, options) => this.openDocumentInternal(docId, options, 'skip'),
         identity: () => this.user?.sub ?? null,
         ...(wsClient ? { wsClient } : {}),
+        linkWsClient: (token) => this.getLinkWsClient(appId, token),
         branchProvider: {
           list: (docId) => docsInternal.listBranches(docId),
           create: (docId, input) => docsInternal.createBranch(docId, input),
@@ -1414,11 +2289,20 @@ export class BrassClient {
           create: (docId, branchId, name) =>
             docsInternal.createStream(docId, branchId, name),
         },
-        thumbnailUploader: (doc, image, width, height) =>
-          docsNs.setThumbnail(doc, { image, width, height }),
-        checkpointCreator: (doc) => docsInternal.createCheckpoint(doc),
+        thumbnailUploader: (doc, image, width, height, version) =>
+          version === undefined
+            ? docsNs.setThumbnail(doc, { image, width, height })
+            : docsInternal.setThumbnailAt(doc, { image, width, height }, version),
+        checkpointCreator: (doc, anchor) =>
+          docsInternal.createCheckpoint(doc, anchor),
         drivePusher: (doc, input) => this.pushDocumentToDrive(doc, input),
         sourceBlobFetcher: (doc) => docsInternal.sourceBlob(doc),
+        provisionalInputsPoster: (docId, body, opts) =>
+          docsInternal.postProvisionalInputs(docId, body, opts),
+        inputsRuntime: (docId) => ({
+          readKey: (key, query) => docsInternal.readInputKeyStatus(docId, key, query),
+          open: (inputId, options) => this.openDocumentById(inputId, options),
+        }),
         hostedUiProvider: {
           documentHistory: (docId, options) =>
             this.documentHistory(docId, options),
@@ -1451,7 +2335,7 @@ export class BrassClient {
           // the active-doc swap consistent (URL sync, command list
           // re-render, branch-list refresh on the new doc).
           openSiblingDoc: async (docId, options) => {
-            await this.session.open(docId, options);
+            await this.session._openSibling(docId, options);
           },
           selectBranch: (docId, options) =>
             this.getHostedUiLauncher().selectBranch(docId, options),
@@ -1481,16 +2365,31 @@ export class BrassClient {
       wsBaseUrl: this.wsBaseUrl,
       appId,
       getAccessToken: () => this.getAccessToken(),
-      // Anonymous link guest: with no access token the socket connects with
-      // this link token and the server admits a read-only doc subscription.
-      getGuestLinkToken: () => this.guestLinkTokenValue,
-      // Attests the socket with the same assertion the HTTP calls carry so
-      // the server enforces Layer 2 on op-write; a first-party client
-      // resolves null here and connects un-gated.
+      // With nobody signed in the page socket connects with the link token;
+      // a signed-in person's carries their own credential, and a document
+      // opened through a link uses that link's socket (`getLinkWsClient`).
+      getGuestLinkToken: () => (this.user === null ? this.guestLinkTokenValue : null),
+      // Attests the socket with the same assertion the HTTP calls carry.
       getAppAssertion: () => this.getAppAssertion(),
       fireError: (error) => this.fireError(error),
     });
     return this.docWsClient;
+  }
+
+  private getLinkWsClient(appId: string, token: string): BrassWsClient | undefined {
+    if (!this.wsBaseUrl) return undefined;
+    let client = this.linkWsClients.get(token);
+    if (client === undefined) {
+      client = new BrassWsClient({
+        wsBaseUrl: this.wsBaseUrl,
+        appId,
+        getAccessToken: () => Promise.resolve(null),
+        getGuestLinkToken: () => token,
+        fireError: (error) => this.fireError(error),
+      });
+      this.linkWsClients.set(token, client);
+    }
+    return client;
   }
 
   // Resolves null only when the server answered that this app has no live
@@ -1502,13 +2401,11 @@ export class BrassClient {
   // blipped, and hides the transient from every layer that self-heals on it.
   async getAccessToken(): Promise<string | null> {
     this.requireInit();
-    // On a `?brass_link=` page the link token is the credential and `init`
-    // runs no auth bootstrap, so answer null rather than probing /refresh.
-    // A visitor with no session would draw a 401 the browser logs; one who
-    // holds a session for this app would get a real token, and a caller
-    // that prefers a token over the link token (the socket does) would then
-    // present membership where the page's whole authority is the link.
-    if (this.guestLinkTokenValue !== null) return null;
+    // A `?brass_link=` page with nobody signed in answers null rather than
+    // probing /refresh, which would draw a 401 the browser logs. A signed-in
+    // person's token serves what they do as themselves; the link document's
+    // own requests and the socket carry the link instead.
+    if (this.guestLinkTokenValue !== null && this.user === null) return null;
     const current = this.tokens;
     if (current && current.expiresAt - REFRESH_LEEWAY_MS > Date.now()) {
       return current.accessToken;
@@ -1656,7 +2553,8 @@ export class BrassClient {
   // document picked through the hosted picker already named its organization
   // on the way in, which answers with no request at all.
   private activeDocumentOrganizationId(): Promise<string | null> {
-    // A link guest holds no API credential, so there is nothing to read with.
+    // A document opened through a link is read through the link alone, so its
+    // record is not the person's to read.
     if (this.guestLinkTokenValue !== null) return Promise.resolve(null);
     const docId = this.session.document?.id;
     if (!docId) return Promise.resolve(null);
@@ -1979,10 +2877,9 @@ export class BrassClient {
 
   async getAppAssertion(): Promise<string | null> {
     this.requireInit();
-    // Paired with `getAccessToken`: a link guest holds no token to assert
-    // an acting app against, and reaching /refresh here would authenticate
-    // the page the same way.
-    if (this.guestLinkTokenValue !== null) return null;
+    // Paired with `getAccessToken`: a link page with nobody signed in holds
+    // no token to assert an acting app against.
+    if (this.guestLinkTokenValue !== null && this.user === null) return null;
     const current = this.tokens;
     if (current && current.expiresAt - REFRESH_LEEWAY_MS > Date.now()) {
       return current.appAssertion ?? null;
@@ -1997,16 +2894,15 @@ export class BrassClient {
     const appId = this.requireAppId();
     // Every successful sign-in 302s back to return_to with the
     // platform-session cookie set AND a one-time `brass_code` query
-    // parameter. The cookie
-    // is the primary channel; the code is the incognito / Safari ITP /
-    // post-third-party-cookie fallback for when the browser drops the
-    // cross-site cookie on our /refresh XHR.
+    // parameter. The first refresh exchanges the code with the cookie
+    // alongside, and the server answers in cookie mode when the cookie came
+    // with it, or hands back the fallback pointer when the browser dropped
+    // it (incognito / Safari ITP / post-third-party-cookie browsers).
     //
     // Pull the code off the URL immediately (before any /refresh)
     // and strip it via history.replaceState so it never lingers in the
     // address bar, browser history, or a referrer header. It is held in
-    // memory and consumed at most once, only if the cookie refresh
-    // turns out to fail (see refresh()).
+    // memory and consumed at most once (see runRefresh()).
     //
     // No app-controlled silent-mint path: the SDK never auto-fires
     // Brass.signIn() based on a URL hint. New app approvals always
@@ -2114,12 +3010,12 @@ export class BrassClient {
     return this.inflightRefresh;
   }
 
-  // Picks the credential channel for a single /refresh round-trip. The
-  // cookie path is primary and untouched for browsers that send the
-  // third-party cookie; the one-time code is consumed only when that
-  // cookie path resolved no session. Once a fallback session
-  // token is in hand (the cross-site cookie is proven unavailable for
-  // this page's life), every later refresh uses it directly.
+  // Picks the credential channel for a single /refresh round-trip. A landed
+  // one-time code goes first, on the same credentialed request as the cookie,
+  // so a browser that drops the cross-site cookie signs in on one request
+  // rather than after a cookie refresh it was always going to refuse. Once a
+  // fallback session token is in hand (the cross-site cookie is proven
+  // unavailable for this page's life), every later refresh uses it directly.
   //
   // A rung falls through to the next only on `no_session`. Each one discards
   // a credential as it passes (the stale sid, the one-time code), and an
@@ -2140,15 +3036,15 @@ export class BrassClient {
       this.sessionToken = null;
       clearSessionToken(appId);
     }
-    const viaCookie = await refreshTokens(this.authBaseUrl, appId);
-    if (viaCookie.status !== 'no_session') return viaCookie;
-    // Cookie channel resolved no session. Fall back to the one-time code if
-    // we landed with one. Clear it first: it is single-use server-side, so a
+    // Clear the code before spending it: it is single-use server-side, so a
     // failed exchange must not be retried.
     const code = this.pendingAuthCode;
-    if (!code) return viaCookie;
-    this.pendingAuthCode = null;
-    return refreshTokens(this.authBaseUrl, appId, { kind: 'code', code });
+    if (code) {
+      this.pendingAuthCode = null;
+      const viaCode = await refreshTokens(this.authBaseUrl, appId, { kind: 'code', code });
+      if (viaCode.status !== 'no_session') return viaCode;
+    }
+    return refreshTokens(this.authBaseUrl, appId);
   }
 
   private setTokens(next: TokenSet | null): void {
@@ -2203,8 +3099,10 @@ export class BrassClient {
     // it hears the sign-out and a close PARKS the Document. A parked Document
     // answers the next open of its key out of memory, with no token and no
     // request, so one left behind here is the previous person's document
-    // handed to whoever signs in next.
+    // handed to whoever signs in next. Frozen bytes kept on the device go with
+    // it for the same reason.
     if (nextUser === null) clearParkedDocuments();
+    adoptSealedCacheOwner(nextUser?.sub ?? null);
   }
 
   private async hydrateProfile(): Promise<void> {
@@ -2273,6 +3171,18 @@ export class BrassClient {
 // works and the proxy's code went unused). Best-effort: any failure
 // (exotic URL, history API unavailable) just yields null and the SDK
 // falls back to the cookie-only path.
+// Whether a sign-in this page started has just returned: the auth proxy
+// appends `brass_code` to `return_to` on every successful sign-in. Read
+// without consuming, since `bootstrap` spends it.
+function signInReturned(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return new URL(window.location.href).searchParams.has('brass_code');
+  } catch {
+    return false;
+  }
+}
+
 function consumeAuthCodeParam(): string | null {
   try {
     const url = new URL(window.location.href);

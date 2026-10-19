@@ -90,8 +90,9 @@ export interface Splice<E> {
 }
 
 /**
- * What changed in a list. Fires once on registration carrying the whole list
- * as a single splice, then on every change carrying only what moved.
+ * What changed in a list. Fires once on registration carrying the whole list,
+ * then on every change carrying only what moved. No splice inserts more than
+ * 10,000 elements, so a spread apply stays inside the engine's argument limit.
  *
  * A registration fire and a resync are not special cases a subscriber has to
  * recognise: both arrive as splices that replace what it was last told, so
@@ -137,28 +138,47 @@ export interface HandleOwner {
   // Stamps the next commit with the mutate origin tag and commits, so the
   // change's `origin.source` reads `'local'`.
   commitMutate(): void;
+  // Runs a handle's `mutate` body, so every commit it takes carries the
+  // origin `options` asks for and the reference writes queued inside it
+  // commit after its last one.
+  runMutate(options: MutateOptions | undefined, fn: () => void): void;
   // Classify a Loro event by what produced it. Derived from the commit's
   // `by` + origin tag, so it survives microtask-deferred delivery.
   originOf(event: unknown): ChangeSource;
+  // Report an app subscriber that threw. The handle carries on delivering to
+  // the others; this is how the app hears that its own callback failed.
+  reportSubscriberThrow(err: unknown): void;
+}
+
+/** Options every `mutate` takes. */
+export interface MutateOptions {
+  /**
+   * `false` keeps the write off the reader's Undo stack, for a pass the app
+   * runs on its own rather than one the reader asked for. Defaults to true.
+   */
+  undoable?: boolean;
 }
 
 // Public handle interfaces. Concrete classes below.
 
 export interface MapHandle<T = unknown> {
-  // Per-entry read. Returns undefined when missing.
+  /** Per-entry read. Returns undefined when missing. */
   get(entryKey: string): T | undefined;
-  // Keys currently in the map.
+  /** Keys currently in the map. */
   keys(): string[];
-  // Whether an entry exists at `entryKey`.
+  /** Whether an entry exists at `entryKey`. */
   has(entryKey: string): boolean;
-  // Mutate through a typed JS-proxy, scoped to this container; same
-  // ergonomics as `doc.mutate(d => { d.entities[id].field = ... })`.
-  mutate(fn: (draft: Record<string, T>) => void): void;
-  // ONE channel for every change whatever produced it (local / remote / undo
-  // / redo / checkout): the projection reconciles by value. The callback gets
-  // `change` and optional `origin` a render ignores. Fires once on
-  // registration with the whole map as `change.set`, then on every change
-  // (each later fire proportional to what that change wrote).
+  /** Every `[key, value]`, as a walk. Each step hands over one entry, so a
+   *  caller that does not keep them never holds the whole map at once. */
+  entries(): IterableIterator<[string, T]>;
+  /** Mutate through a typed JS-proxy, scoped to this container; same
+   *  ergonomics as `doc.mutate(d => { d.entities[id].field = ... })`. */
+  mutate(fn: (draft: Record<string, T>) => void, options?: MutateOptions): void;
+  /** ONE channel for every change whatever produced it (local / remote / undo
+   *  / redo / checkout): the projection reconciles by value. The callback gets
+   *  `change` and optional `origin` a render ignores. Fires once on
+   *  registration with the whole map as `change.set`, then on every change
+   *  (each later fire proportional to what that change wrote). */
   subscribe(cb: MapSubscriber<T>): HandleUnsubscribe;
   /**
    * Report each time this container has been delivered whole: on
@@ -175,10 +195,10 @@ export interface MapHandle<T = unknown> {
    */
   onSettled(cb: () => void): HandleUnsubscribe;
 
-  // Child handle for `entries[entryKey]` when that entry is itself a map /
-  // list. Reads see empty until the container exists; the first mutate
-  // creates it, and a subscription taken before that delivers the container
-  // whole on whichever write creates it.
+  /** Child handle for `entries[entryKey]` when that entry is itself a map /
+   *  list. Reads see empty until the container exists; the first mutate
+   *  creates it, and a subscription taken before that delivers the container
+   *  whole on whichever write creates it. */
   map<U>(entryKey: string): MapHandle<U>;
   list<U>(entryKey: string): ListHandle<U>;
 }
@@ -202,12 +222,16 @@ export interface ListDraft<T> extends Array<T> {
 
 export interface ListHandle<T = unknown> {
   length(): number;
-  mutate(fn: (draft: ListDraft<T>) => void): void;
-  // Fires once on registration carrying the whole list as one splice, then on
-  // every change carrying only what moved, so a subscriber applies splices to
-  // what it already holds and never re-reads. A keyed collection belongs in a
-  // map (or `orderedMap`), which reconciles by key; a list is for ordering
-  // keys and small positional data.
+  /** The element at `index`, or undefined outside the list. */
+  get(index: number): T | undefined;
+  /** Every element in order, as a walk. */
+  values(): IterableIterator<T>;
+  mutate(fn: (draft: ListDraft<T>) => void, options?: MutateOptions): void;
+  /** Fires once on registration carrying the whole list, then on
+   *  every change carrying only what moved, so a subscriber applies splices to
+   *  what it already holds and never re-reads. A keyed collection belongs in a
+   *  map (or `orderedMap`), which reconciles by key; a list is for ordering
+   *  keys and small positional data. */
   subscribe(cb: ListSubscriber<T>): HandleUnsubscribe;
   /**
    * Report each time this container has been delivered whole: on
@@ -255,36 +279,38 @@ export type OrderedMapPosition =
   | { index: number };
 
 export interface OrderedMapHandle<T = unknown> {
-  // Per-entry read. Returns undefined when missing.
+  /** Per-entry read. Returns undefined when missing. */
   get(entryKey: string): T | undefined;
-  // Whether an entry exists in the map.
+  /** Whether an entry exists in the map. */
   has(entryKey: string): boolean;
-  // Keys in order-list order, filtered to keys still present in the map.
+  /** Keys in order-list order, filtered to keys still present in the map. */
   keys(): string[];
-  // `[key, value]` records walking the order list, so an app reading in
-  // source order doesn't re-walk the order list by hand.
+  /** Every `[key, value]` in order, as a walk. */
+  entries(): IterableIterator<[string, T]>;
+  /** @deprecated Use `entries()`, which walks the same records in the same
+   *  order without building the array. */
   ordered(): { key: string; value: T }[];
-  // Mutate the map; the sibling order list reconciles in the same commit
-  // (new keys appended in insertion order, deleted keys pruned). Drive it
-  // like `MapHandle.mutate`: `m[key] = record`, `delete m[key]`,
-  // `m[key].field = ...`.
-  mutate(fn: (draft: Record<string, T>) => void): void;
-  // Write `value` under `entryKey` and put that key at `at`, both in ONE
-  // commit (one undo step) like every other structural edit here. A key the
-  // map already holds is written and repositioned rather than named twice.
+  /** Mutate the map; the sibling order list reconciles in the same commit
+   *  (new keys appended in insertion order, deleted keys pruned). Drive it
+   *  like `MapHandle.mutate`: `m[key] = record`, `delete m[key]`,
+   *  `m[key].field = ...`. */
+  mutate(fn: (draft: Record<string, T>) => void, options?: MutateOptions): void;
+  /** Write `value` under `entryKey` and put that key at `at`, both in ONE
+   *  commit (one undo step) like every other structural edit here. A key the
+   *  map already holds is written and repositioned rather than named twice. */
   insert(entryKey: string, value: T, at: OrderedMapPosition): void;
-  // Reposition a key the map already holds, writing the order list alone. A
-  // key the map does not hold does nothing, so a reorder racing a peer's
-  // delete of the same key leaves the delete standing.
+  /** Reposition a key the map already holds, writing the order list alone. A
+   *  key the map does not hold does nothing, so a reorder racing a peer's
+   *  delete of the same key leaves the delete standing. */
   move(entryKey: string, to: OrderedMapPosition): void;
-  // Fires once on registration (the whole map as `change.set` in order),
-  // then on every change. A field edit carries only `set` / `deleted`; a
-  // change that moves the order also carries `change.order` (live keys in
-  // order) so the app re-sequences the views it holds. A move the map does
-  // not see (an edit of the sibling order list, a merge that resequences
-  // keys already present) arrives as an `order` of its own with an empty
-  // `set`. Content stays proportional to what the change wrote; re-sequencing
-  // happens only when the order moves, and at most once per change.
+  /** Fires once on registration (the whole map as `change.set` in order),
+   *  then on every change. A field edit carries only `set` / `deleted`; a
+   *  change that moves the order also carries `change.order` (live keys in
+   *  order) so the app re-sequences the views it holds. A move the map does
+   *  not see (an edit of the sibling order list, a merge that resequences
+   *  keys already present) arrives as an `order` of its own with an empty
+   *  `set`. Content stays proportional to what the change wrote; re-sequencing
+   *  happens only when the order moves, and at most once per change. */
   subscribe(cb: MapSubscriber<T>): HandleUnsubscribe;
   /**
    * Report each time this container has been delivered whole: on

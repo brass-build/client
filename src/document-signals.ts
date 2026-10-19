@@ -67,8 +67,10 @@ export interface DocumentDriveStatus {
   driveName: string;
   // The divergence state. `ahead` / `diverged` mean unpublished local edits.
   state: DocumentDriveTrackingState;
-  // True when publishing would do something (local edits to save back and the
-  // link is not broken): the cue to surface a "Publish" affordance.
+  // True when publishing would do something now, as the server decides it:
+  // edits the drive takes and something here can write, or a rename or move
+  // to carry, on an unbroken link with no publish in flight. The cue to
+  // surface a "Publish" affordance.
   canPush: boolean;
   // Server-authored short pill text (`null` when nothing worth surfacing).
   label: string | null;
@@ -81,9 +83,14 @@ export interface DocumentDriveStatus {
   // (the file-roundtrip path), so an app can warn that the source's newer
   // version will be replaced, not merged.
   pushReplacesRemote: boolean;
+  /** @internal True when the drive keeps every prior version of the item,
+   *  so a version a publish replaces stays in the item's history on the
+   *  drive. The SDK's own drive surface words its publish confirm from it. */
+  keepsPriorVersions: boolean;
   // Whether the link round-trips (`two_way`) or only imports (`import_only`).
-  // On `import_only`, `canPush` is always false; an app surfaces the class so
-  // a one-way import doesn't read as a live two-way mirror.
+  // An `import_only` link publishes no content, so `canPush` is true there
+  // only for a rename or a move; an app surfaces the class so a one-way
+  // import doesn't read as a live two-way mirror.
   mirrorDirection: DriveMirrorDirection;
   // Current external head ref, empty when the adapter could not produce one.
   ref: string;
@@ -135,6 +142,9 @@ export interface DrivePublishTarget {
   // The last publish attempt failed, in which case `detail` carries the
   // server's account of why rather than the resting sentence.
   publishFailed: boolean;
+  // The drive does not take this document's file; `detail` says why, and
+  // there is nothing to publish.
+  unpublishable: boolean;
 }
 
 // Each signal is a `createEmitter` composed with the retain / attach / dedup
@@ -178,9 +188,19 @@ export class GoneSignal {
   }
 }
 
+const NO_WORK_STATUS: DocumentWorkStatus = { message: '', pending: false, blocking: false };
+
 // Latest-retained, re-emit-per-phase signal for `doc_status`. Not one-shot:
 // phases arrive repeatedly until terminal (`pending: false`), and the latest
 // is retained so a late subscriber still sees the final state.
+//
+// A notice is the SDK's own status, raised over the platform's work rather
+// than replacing it: `status` reads the notice while one is up, and `work`
+// keeps answering what the platform reported, which is what every SDK-side
+// decision about pending work reads. A work status arriving under a notice
+// still reaches the listeners (the SDK's own import waiters attach here and
+// wait for a terminal one), and the notice is re-emitted straight after it so
+// the last thing a listener hears matches `status`.
 export class WorkStatusSignal {
   private readonly _emitter = createEmitter<DocumentWorkStatus>({
     fireOnAttach: true,
@@ -189,9 +209,19 @@ export class WorkStatusSignal {
       console.error('[Brass] onStatus listener threw:', err);
     },
   });
+  private _work: DocumentWorkStatus | null = null;
+  private _notice: DocumentWorkStatus | null = null;
 
   get status(): DocumentWorkStatus | null {
-    return this._emitter.retained ?? null;
+    return this._notice ?? this._work;
+  }
+
+  get work(): DocumentWorkStatus | null {
+    return this._work;
+  }
+
+  get notice(): DocumentWorkStatus | null {
+    return this._notice;
   }
 
   on(cb: DocumentStatusListener): DocumentStatusUnsubscribe {
@@ -199,7 +229,18 @@ export class WorkStatusSignal {
   }
 
   emit(status: DocumentWorkStatus): void {
+    this._work = status;
     this._emitter.emit(status);
+    if (this._notice !== null) this._emitter.emit(this._notice);
+  }
+
+  // Raise or clear the notice. Clearing hands listeners the work status it
+  // covered, or a terminal empty one when there is none, since a listener
+  // takes a status rather than `null`.
+  setNotice(notice: DocumentWorkStatus | null): void {
+    if (notice === this._notice) return;
+    this._notice = notice;
+    this._emitter.emit(notice ?? this._work ?? NO_WORK_STATUS);
   }
 
   clearListeners(): void {
@@ -335,6 +376,7 @@ function driveStatusEqual(
     a.detail === b.detail &&
     a.broken === b.broken &&
     a.pushReplacesRemote === b.pushReplacesRemote &&
+    a.keepsPriorVersions === b.keepsPriorVersions &&
     a.mirrorDirection === b.mirrorDirection &&
     a.ref === b.ref &&
     a.refUpdatedAt === b.refUpdatedAt &&

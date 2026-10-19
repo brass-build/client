@@ -13,10 +13,17 @@ import type {
   OpenDocumentByIdOptions,
   OpenedDocument,
 } from './open-document.js';
-import type { SelectDocumentResult } from './hosted-ui.js';
+import type {
+  ChooseInputOptions,
+  ChooseInputsOptions,
+  DocumentFamilies,
+  InputReference,
+  SelectDocumentResult,
+} from './hosted-ui.js';
 import type { AppServiceState, CallServiceOptions } from './call-service.js';
 import type { DocumentsNamespace } from './documents-namespace.js';
-import type { DocumentImporter } from './importer.js';
+import type { OpenDocumentById } from './read-only-document.js';
+import type { DocumentImporter } from './import-contract.js';
 import type { DocumentSerializer } from './serializer.js';
 import type { DocumentSession } from './session.js';
 import type {
@@ -44,15 +51,18 @@ export type {
 } from './call-service.js';
 export {
   type HostedUiTheme,
+  type ChooseInputOptions,
+  type ChooseInputsOptions,
+  type DocumentFamilies,
   type SelectDocumentResult,
+  type SelectionAccept,
+  type SelectionNarrowing,
 } from './hosted-ui.js';
 export {
   type DocumentMember,
   type DocumentRecord,
   type DocumentRole,
-  type DocumentCheckpoint,
   type DocumentSourceBlob,
-  type DocumentSourceStream,
   type DocumentStreamInfo,
   type DocumentSummary,
   type DocumentThumbnail,
@@ -60,6 +70,15 @@ export {
   type GetThumbnailOptions,
   type SetThumbnailInput,
 } from './documents-namespace.js';
+export {
+  type ReadOnlyDocument,
+  type ReadOnlyStream,
+  type ReadOnlyListHandle,
+  type ReadOnlyMapHandle,
+  type ReadOnlyOrderedMapHandle,
+  type ReadOnlyTextHandle,
+  type OpenModeOptions,
+} from './read-only-document.js';
 export {
   type CanvasSource,
   type Command,
@@ -115,11 +134,18 @@ export type {
   Splice,
   MapHandle,
   MapSubscriber,
+  MutateOptions,
   OrderedMapHandle,
   OrderedMapPosition,
   TextHandle,
   TextSubscriber,
 } from './handle-types.js';
+export type {
+  InputDocument,
+  InputDocumentHandlers,
+  InputDocumentOpen,
+  InputDocumentOptions,
+} from './input-documents.js';
 
 export type {
   DocumentSerializer,
@@ -127,7 +153,22 @@ export type {
   StoredList,
   StoredMap,
 } from './serializer.js';
-export type { DocumentImporter } from './importer.js';
+export type {
+  DocumentImporter,
+  ImportContent,
+  ImportFile,
+  ImportResult,
+} from './import-contract.js';
+export type {
+  ImportFinding,
+  ImportFindingKind,
+  ImportReport,
+} from './import-report.js';
+export type {
+  InputReference,
+  InputStatus,
+  InputStatusDocument,
+} from './inputs-status.js';
 export { DocumentStream } from './document-streams.js';
 export {
   type CreateDocumentOptions,
@@ -220,7 +261,7 @@ export const Brass = {
     return client.connectService(host);
   },
   // Metadata read for a known id (`get`) plus thumbnails. Create / move /
-  // list / grant access are hosted-only.
+  // grant access are hosted-only.
   get documents(): DocumentsNamespace {
     return client.documents;
   },
@@ -274,20 +315,40 @@ export const Brass = {
   mountVersionPreview(container: HTMLElement): MountedPiece {
     return client.mountVersionPreview(container);
   },
+  /** @deprecated Use `Brass.session.open()` with no id. */
   selectDocument(): Promise<SelectDocumentResult | null> {
     return client.selectDocument();
+  },
+  // Files, folders and projects as references, or `null` when the person
+  // closes the picker. A folder or project reference keeps including what is
+  // filed there later: record the references with `doc.dependsOn`, and the
+  // key's status lists the files they include. Rejects with
+  // `iframe_unavailable` where the browser blocks the picker.
+  chooseInputs(
+    families: DocumentFamilies,
+    options?: ChooseInputsOptions,
+  ): Promise<InputReference[] | null> {
+    return client.chooseInputs(families, options);
+  },
+  // One file as a reference, such as a standard a model is checked against.
+  // Resolves with that reference, or `null` when the person closes the
+  // picker; keep the reference you already have on `null`. Rejects with
+  // `iframe_unavailable` where the browser blocks the picker.
+  chooseInput(
+    families: DocumentFamilies,
+    options?: ChooseInputOptions,
+  ): Promise<InputReference | null> {
+    return client.chooseInput(families, options);
   },
   // Opens the hosted multi-tier share dialog (document / project /
   // organization in one UI) focused on the given document.
   shareDocument(docId: string): Promise<void> {
     return client.shareDocument(docId);
   },
-  openDocumentById(
-    docId: string,
-    options?: OpenDocumentByIdOptions,
-  ): Promise<OpenedDocument> {
-    return client.openDocumentById(docId, options);
-  },
+  // `readOnly: true` opens a live copy with nothing on it that writes
+  // (`ReadOnlyDocument`).
+  openDocumentById: ((docId: string, options?: OpenDocumentByIdOptions) =>
+    client.openDocumentById(docId, options)) as OpenDocumentById,
   // `true` when the page was opened as an anonymous link guest
   // (`?brass_link=`): no signed-in user, a read-only document. Apps render
   // their working surface for a guest as they do for a signed-in user (the
@@ -305,10 +366,9 @@ export const Brass = {
   registerSerializer(serializer: DocumentSerializer): void {
     client.registerSerializer(serializer);
   },
-  // Register the app's import backend: parses a stored source file into
-  // the document's records. Brass runs it when a document's file needs
-  // importing; the records reach every open client live. Call once at
-  // boot beside `registerSerializer`.
+  // Register the app's import backend: given a document's stored files, it
+  // returns the document's content. Brass seals what it returns as the
+  // document's first content. Call once at boot beside `registerSerializer`.
   registerImporter(importer: DocumentImporter): void {
     client.registerImporter(importer);
   },

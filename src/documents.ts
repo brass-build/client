@@ -9,16 +9,63 @@
 //      `Object.keys`; doing `loroMap.keys().includes(key)` there makes
 //      `Object.keys()` O(N^2). It reads a single `loroMap.get(key)`.
 
+import type { ImportReport } from './import-report.js';
+import { INPUTS_READ_ROOT, INPUTS_REFS_ROOT } from './inputs.js';
+import { importTailOp } from './tail-op-import.js';
+import {
+  InputStatusHub,
+  type InputStatus,
+  type InputsLocalRoots,
+  type InputsStatusRuntime,
+} from './inputs-status.js';
+import {
+  InputFollowers,
+  type InputDocumentHandlers,
+  type InputDocumentOptions,
+} from './input-documents.js';
 import {
   LoroDoc,
   LoroMap,
   type LoroText,
   type PeerID,
+  type Value,
   VersionVector,
   decodeImportBlobMeta,
 } from './wasm-runtime.js';
 
-import { PAGING_COMMIT_ORIGIN, UndoController } from './undo.js';
+import {
+  NON_UNDOABLE_COMMIT_ORIGIN,
+  PAGING_COMMIT_ORIGIN,
+  UndoController,
+  UndoGroup,
+} from './undo.js';
+import { joinStampOf } from './join-stamp.js';
+import {
+  decodeInputsRoots,
+  inputReadClearWrites,
+  inputReadMarkFor,
+  inputReadMarkWrites,
+  inputRemovalMark,
+  inputRefsWrites,
+  inputStampFromUpdatedAt,
+  isInputDocId,
+  isInputKey,
+  parseInputReference,
+  type InputReadMark,
+  type InputReferenceWire as WireReference,
+  type InputsRootWrites,
+} from './inputs.js';
+import {
+  ProvisionalInputsTracker,
+  isReservedRootName,
+  latestReadMark,
+  type InputsWrite,
+  type MarkReadEntry,
+  type MarkReadHandle,
+  type MarkReadOptions,
+  type MarkReadStatus,
+  type ProvisionalInputsPoster,
+} from './references.js';
 import type { DocSyncDiagnostics, UndoControllerOptions } from './types.js';
 import {
   createOrderedMapHandle,
@@ -37,26 +84,30 @@ import type {
   HandleOwner,
   ListHandle,
   MapHandle,
+  MutateOptions,
   OrderedMapHandle,
   TextHandle,
   TextSubscriber,
 } from './handle-types.js';
+import { appCallbackError } from './subscriber-delivery.js';
 import {
   flattenPagedLookup,
   isPagedMarker,
+  isPagedMarkerEntry,
   META_KEY,
   pagedRootKey,
+  RECORDS_KEY,
+  rootCarriesMarkers,
 } from './record-paging.js';
 import { MAX_OP_BLOB_CHARS } from './ws-frame-limit.js';
 import type {
   BranchSummary,
-  DocumentCheckpoint,
   DocumentSourceBlob,
   DocumentStreamInfo,
   PushToDriveInput,
   PushToDriveResult,
 } from './documents-namespace.js';
-import type { DriveResolveResult } from './hosted-ui.js';
+import type { DriveResolveResult, InputReference } from './hosted-ui.js';
 import {
   GoneSignal,
   WorkStatusSignal,
@@ -86,6 +137,9 @@ import {
   type CheckpointCreator,
 } from './document-checkpoints.js';
 import { whenSaved } from './when-saved.js';
+import { BrassError } from './errors.js';
+import type { OpenedDocument } from './open-document.js';
+import type { OpenModeOptions, ReadOnlyDocument } from './read-only-document.js';
 import {
   BranchController,
   type BranchProvider,
@@ -100,6 +154,15 @@ import {
 } from './document-commands.js';
 import { DocumentStream, type StreamRuntime } from './document-streams.js';
 import { createEmitter } from './emitter.js';
+import {
+  CONVERSION_PEER_ID,
+  SealedContent,
+  type SealedContentJson,
+  type SealedStore,
+} from './sealed-store.js';
+import { sealedRoots, type SealedRoots } from './sealed-handles.js';
+import { StableHandles } from './stable-handles.js';
+import type { JoinContent } from './join-content.js';
 
 // The stream name `doc.stream()` resolves to the document's own default
 // state; mirrors the server's reserved name.
@@ -190,6 +253,22 @@ function rootKindOf(containerId: string): KnownRootKind | null {
 
 // Maps count entries, lists and text count length. Both are the container's
 // own counter rather than a projection of what it holds.
+/** Whether a root map holds nothing but paged markers, which its handle hides,
+ *  so the collection reads as empty. */
+function holdsOnlyMarkers(rootKey: string, container: unknown): boolean {
+  if (!rootCarriesMarkers(rootKey) || !(container instanceof LoroMap)) return false;
+  return container.keys().every((key) => isPagedMarkerEntry(rootKey, key));
+}
+
+// A root's projected value when the collection holds nothing: a map, list
+// or text with no content.
+function projectsEmpty(value: unknown): boolean {
+  if (value === '') return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value !== null && typeof value === 'object') return Object.keys(value).length === 0;
+  return false;
+}
+
 function rootIsEmpty(container: unknown): boolean {
   const sized = container as { size?: number; length?: number };
   if (typeof sized.size === 'number') return sized.size === 0;
@@ -247,6 +326,26 @@ const REDO_COMMIT_ORIGIN = 'brass.redo';
 // this (it reconciles by value); it backs a change's `origin.source` for
 // attribution and the SDK's own local-vs-remote side-effect gating
 // (thumbnail capture, auto-checkpoint).
+// A reserved root map as plain entries, the view the write rules diff against.
+function rootView(map: LoroMap): Record<string, unknown> {
+  return map.toJSON() as Record<string, unknown>;
+}
+
+// Applies one reserved root's writes per entry. Returns whether anything moved.
+function applyRootWrites<V>(map: LoroMap, writes: InputsRootWrites<V>): boolean {
+  for (const key of writes.delete) map.delete(key);
+  for (const [key, value] of Object.entries(writes.set)) map.set(key, value as unknown as Value);
+  return writes.delete.length > 0 || Object.keys(writes.set).length > 0;
+}
+
+// The reserved roots hold the document's references and read marks, which
+// only `dependsOn` and `markRead` write.
+function assertAppRootName(key: string): void {
+  if (isReservedRootName(key)) {
+    throw new TypeError(`"${key}" is reserved for Brass; choose another collection name`);
+  }
+}
+
 function changeSourceOf(event: unknown): ChangeSource {
   const by = (event as { by?: unknown }).by;
   if (by === 'import') return 'remote';
@@ -322,24 +421,84 @@ export type ResyncPushOutcome =
   | 'undecodable'
   | 'closed';
 
-// Element-wise max of two Loro version vectors. `VersionVector` exposes
-// no public join, so round-trip through its `Map<PeerID, number>` JSON
-// form. Counters are exclusive ends, so the larger is more advanced.
-// Used by the durability handshake to fold the durable tail into the
-// snapshot's version vector.
-function mergeVersionVectors(
-  a: VersionVector,
-  b: VersionVector,
-): VersionVector {
-  const merged = a.toJSON();
-  for (const [peer, counter] of b.toJSON()) {
-    const current = merged.get(peer);
-    if (current === undefined || counter > current) merged.set(peer, counter);
+type CounterRange = { peer: PeerID; from: number; to: number };
+
+// Per author, the sorted, disjoint half-open counter ranges a server holds.
+//
+// A version vector cannot describe this: it says an author's ops are held up
+// to a counter, and a server's op log can hold an author's later ops while
+// missing an earlier one. Each tail blob therefore contributes its own range
+// rather than raising a per-author maximum, which would read the hole as held.
+type HeldRanges = Map<PeerID, [number, number][]>;
+
+function holdRange(held: HeldRanges, peer: PeerID, from: number, to: number): void {
+  if (to <= from) return;
+  const merged: [number, number][] = [];
+  let next: [number, number] = [from, to];
+  for (const range of held.get(peer) ?? []) {
+    if (range[1] < next[0] || range[0] > next[1]) {
+      merged.push(range);
+    } else {
+      next = [Math.min(range[0], next[0]), Math.max(range[1], next[1])];
+    }
   }
-  return VersionVector.parseJSON(merged);
+  merged.push(next);
+  merged.sort((a, b) => a[0] - b[0]);
+  held.set(peer, merged);
 }
 
-type CounterRange = { peer: PeerID; from: number; to: number };
+// What the durable state holds: the snapshot, which is causally complete so
+// every author's ops from zero, plus each tail blob's own per-author range.
+// Throws on a malformed vector or blob.
+function durableHoldings(
+  persistedSnapshotVersionVector: Uint8Array,
+  durableTailBlobs: readonly Uint8Array[],
+): HeldRanges {
+  const held: HeldRanges = new Map();
+  for (const [peer, to] of VersionVector.decode(persistedSnapshotVersionVector).toJSON()) {
+    holdRange(held, peer, 0, to);
+  }
+  for (const blob of durableTailBlobs) {
+    const meta = decodeImportBlobMeta(blob, false);
+    const start = meta.partialStartVersionVector.toJSON();
+    for (const [peer, to] of meta.partialEndVersionVector.toJSON()) {
+      holdRange(held, peer, start.get(peer) ?? 0, to);
+    }
+  }
+  return held;
+}
+
+// The ranges of `local` the durable state does not hold, in counter order
+// per author.
+function rangesMissingFrom(local: VersionVector, held: HeldRanges): CounterRange[] {
+  const missing: CounterRange[] = [];
+  for (const [peer, to] of local.toJSON()) {
+    let from = 0;
+    for (const [heldFrom, heldTo] of held.get(peer) ?? []) {
+      if (heldFrom >= to) break;
+      if (heldFrom > from) missing.push({ peer, from, to: heldFrom });
+      from = Math.max(from, heldTo);
+    }
+    if (from < to) missing.push({ peer, from, to });
+  }
+  return missing;
+}
+
+// Group ranges so no group carries two ranges of one author. A blob's header
+// names one start and one end per author, so a blob spanning two separate
+// ranges of an author would read, to whoever folds it into a frontier, as
+// holding the ops between them as well.
+function oneRangePerAuthor(ranges: readonly CounterRange[]): CounterRange[][] {
+  const groups: CounterRange[][] = [];
+  const seen = new Map<PeerID, number>();
+  for (const range of ranges) {
+    const index = seen.get(range.peer) ?? 0;
+    seen.set(range.peer, index + 1);
+    (groups[index] ??= []).push(range);
+  }
+  return groups;
+}
+
 
 function rangeOpCount(ranges: readonly CounterRange[]): number {
   return ranges.reduce((n, r) => n + (r.to - r.from), 0);
@@ -504,8 +663,29 @@ function pageRoot(
 // Why a live Document refuses local writes. Each names a refusal the server
 // would make, so `mutate` can say which one applies rather than answering
 // every refusal with one message.
-/** @internal */
-export type ReadOnlyReason =
+/**
+ * Why a reader may not write, where the refusal comes from somewhere OUTSIDE
+ * this document: the server, the link they arrived through, or the caller's
+ * own ask. `_markReadOnly` takes one of these and nothing else, because the
+ * reasons below it are states the document computes for itself and could not
+ * be handed one of.
+ * @internal
+ */
+/** The three ways a document is open: editable, read-only and following
+ *  edits, or frozen at what it loaded.
+ *  @internal */
+export type ReopenMode = 'edit' | 'read' | 'frozen';
+
+interface PendingReopen {
+  mode: ReopenMode;
+  // What the reopen produced, whether or not a later reopen superseded it.
+  result: Promise<OpenedDocument>;
+  superseded: boolean;
+  // What the call that started it receives.
+  promise: Promise<OpenedDocument>;
+}
+
+export type ForcedReadOnlyReason =
   // Opened through a view-only share link.
   | 'link'
   // The reader's grant on this document does not carry write access.
@@ -523,7 +703,55 @@ export type ReadOnlyReason =
   | 'capacity'
   // The document opened with no live connection to write through, so a
   // change would stay on this device.
-  | 'no_connection';
+  | 'no_connection'
+  // The caller asked for a snapshot of the document rather than a session on
+  // it. Unlike every reason above, this one is the caller's own choice rather
+  // than a limit on them, so a reader seeing it may well hold write access and
+  // reach it by opening the document again without asking for a snapshot.
+  | 'snapshot'
+  // The document is too large for the platform to make editable, so it opens
+  // as a copy to read and no reload changes that.
+  | 'too_large'
+  // The document still holds only the file it was uploaded as, and no
+  // importer takes that file's type, so the file is its content.
+  | 'not_imported';
+
+/**
+ * Why a reader may not write, in the vocabulary `mutate` refuses in.
+ *
+ * The four beyond the forced ones are states this document computes for
+ * itself: it is showing a historical version, its reader has the version bar
+ * open, its content has not arrived, or the work that would bring it ended
+ * with nothing. They are derived rather than set, which is why one function
+ * (`_readOnlyBecause`) answers both `readOnly` and the refusal message. Two
+ * ladders over the same conditions is what they replace, and the pair could
+ * disagree about whether a document was writable and about why.
+ * @internal
+ */
+export type ReadOnlyReason =
+  | ForcedReadOnlyReason
+  // A historical version is showing (a checkout).
+  | 'version'
+  // The reader has the version bar open. Browsing locks the document at the
+  // live head as well as at an earlier point: stepping moves between the
+  // points history KEEPS, and an edit at the head makes no such point, so an
+  // edit made under the open bar puts the reader's own newest work somewhere
+  // the bar cannot travel to. Reading history and writing it are separate
+  // modes, and the bar carries the Close that leaves this one.
+  | 'browsing'
+  // Content-replacing work is still coming. Editing would write ops onto a
+  // document the incoming bytes are about to replace, and it is also what
+  // stops an app's "seed an empty doc" path from clobbering a document that
+  // only looks empty because it has not loaded yet.
+  | 'loading'
+  // That work ended with no content. A document nothing could prepare is
+  // empty, and an edit there writes ops into one the app is about to be told
+  // could not be opened.
+  | 'load_failed'
+  // `reopen` is replacing this copy. The copy closes once the new one has
+  // joined, and closing it drops whatever it has not sent, so an edit made
+  // here in the meantime would be lost.
+  | 'reopening';
 
 const READ_ONLY_MESSAGES: Record<ReadOnlyReason, string> = {
   link: 'Document is read-only: it was opened via a view-only share link.',
@@ -538,12 +766,80 @@ const READ_ONLY_MESSAGES: Record<ReadOnlyReason, string> = {
   no_connection:
     'Document is read-only: it opened with no live connection, so a change ' +
     'would stay on this device.',
+  snapshot:
+    'Document is read-only: it was opened as a snapshot. Open it without ' +
+    'asking for one to edit.',
+  too_large:
+    'Document is read-only: it is too large for Brass to make editable ' +
+    '(see `doc.status`).',
+  not_imported:
+    'Document is read-only: it holds an uploaded file that has not been ' +
+    'imported, and no importer takes its type.',
+  version:
+    'Document is read-only: it is showing a historical version. ' +
+    'Return to the latest version to edit.',
+  browsing:
+    'Document is read-only: the reader is browsing its versions. ' +
+    'Close the version bar to edit.',
+  loading:
+    'Document is still loading its content; wait for the load to finish ' +
+    'before editing (see `doc.onStatus`).',
+  reopening:
+    'Document is read-only while it reopens; edit the copy `reopen` resolves with.',
+  load_failed:
+    'Document is read-only: its content could not be prepared ' +
+    '(see `doc.status`). Reopen it to try again.',
 };
+
+// What `status` reads while this client's edits wait on a connection that has
+// never opened. Pending, because Brass keeps trying and the edits save the
+// moment it connects; not blocking, because editing stays open.
+const NOT_SAVED_NOTICE: DocumentWorkStatus = {
+  message:
+    'Your changes are not saved yet. Brass cannot connect to save them and ' +
+    'keeps trying. Keep this page open until they are saved.',
+  pending: true,
+  blocking: false,
+};
+
+// What `status` reads while one of this client's edits goes unanswered by a
+// connection that answers its others. Pending and not blocking for the same
+// reasons as `NOT_SAVED_NOTICE`.
+const UNANSWERED_NOTICE: DocumentWorkStatus = {
+  message:
+    'Some of your changes are not saved yet. Brass keeps trying to save them. ' +
+    'Keep this page open until they are saved.',
+  pending: true,
+  blocking: false,
+};
+
+const SAVE_NOTICES = { never_opened: NOT_SAVED_NOTICE, unanswered: UNANSWERED_NOTICE };
 
 export interface DocumentOptions {
   // Root key the Document wraps. Defaults to `"entities"` to match the
   // wire protocol's top-level shape.
   rootKey?: string;
+  /** The document's content in its frozen form, for a stream the platform
+   *  holds that way. Its roots answer every read, and no CRDT engine
+   *  materialises them.
+   *  @internal */
+  frozenContent?: SealedContent;
+  /** The seq `frozenContent` was sealed at, as the join named it.
+   *  @internal */
+  frozenSeal?: number;
+  /** Author every commit as this peer rather than a random one.
+   *
+   *  What it buys is a DETERMINISTIC document: the same records written under
+   *  the same peer produce the same ops, so two sides that build a document
+   *  from one record set independently build the same one, and their later
+   *  edits merge instead of doubling every record. That is what lets a stored
+   *  record set become a CRDT wherever it is first needed, with nothing
+   *  coordinating which side does it.
+   *
+   *  Only a conversion sets this. A live editor keeps its own peer, so the
+   *  ops it writes after a conversion are its own.
+   *  @internal */
+  peerId?: `${number}`;
   // The server-minted `doc_id`. Set by the SDK's open / create paths so
   // callers read `doc.id` to track the active doc. `null` on
   // direct-construction (`Document.create()` / `openFromSnapshot`),
@@ -555,11 +851,12 @@ export interface DocumentOptions {
   branchId?: string;
   // True when opened at a historical version. A read-only Document
   // throws from `mutate` and carries no live WS transport.
+  /** @deprecated Pass `readOnly: true` to `session.open` / `Brass.openDocumentById`, which types the result `ReadOnlyDocument`. */
   readOnly?: boolean;
   // Why `readOnly` was set, which picks the message `mutate` throws.
   // Defaults to the view-only link.
   /** @internal */
-  readOnlyReason?: ReadOnlyReason;
+  readOnlyReason?: ForcedReadOnlyReason;
   // The historical version materialized at, when opened via `{ version
   // }`; `null` for a live (head) open. The server's *effective* version,
   // which may round down when compaction has TTL'd the exact op.
@@ -588,9 +885,242 @@ interface RootTextHandle extends TextHandle {
   _teardown(): void;
 }
 
+// The roots a document's referenced inputs live in are written only by the
+// SDK's own input writers, so a frozen root carrying one of those names
+// converts to nothing.
+const INPUTS_ROOTS: ReadonlySet<string> = new Set([INPUTS_REFS_ROOT, INPUTS_READ_ROOT]);
+
+/**
+ * The CRDT a frozen stream becomes: its content written through the same
+ * handles an app writes through, so what a conversion produces is what an app
+ * writing the same content would have produced, paging and all.
+ *
+ * Every side converts by calling this. It is authored by the pinned
+ * conversion peer (`CONVERSION_PEER_ID`) over the content in stored order, so
+ * one frozen stream always converts to the same document; it is NOT a licence
+ * for two builds to convert separately and expect to agree, because the rest
+ * of the output moves with the paging constants and the batching budget, which
+ * is why the platform converts once and stores the result.
+ *
+ * A list that is a map's key walk is that map's order, so the two are written
+ * as one ordered map.
+ *
+ * @internal
+ */
+export function snapshotFromSealedContent(content: SealedContent): Uint8Array {
+  const names = content.rootNames().filter((n) => !INPUTS_ROOTS.has(n));
+  const walked = new Map<string, string>();
+  for (const name of names) {
+    const map = content.keyWalkOf(name);
+    if (map !== null && !walked.has(map)) walked.set(map, name);
+  }
+  // A `Document` registers its root container on construction, so the root
+  // key is one the content writes anyway rather than an empty `entities` map
+  // in every snapshot.
+  const rootKey =
+    [...walked.keys()][0] ??
+    names.find((n) => content.kindOf(n) === 'map') ??
+    'entities';
+  const doc = Document.create({ rootKey, peerId: CONVERSION_PEER_ID });
+  try {
+    for (const name of names) {
+      // A reserved root is written only through `dependsOn` / `markRead`.
+      if (isReservedRootName(name)) continue;
+      const kind = content.kindOf(name);
+      if (kind === 'map') {
+        const order = walked.get(name);
+        const write = (draft: Record<string, unknown>): void => {
+          content.forEachMapEntry(name, (key, value) => {
+            draft[key] = value;
+          });
+        };
+        if (order !== undefined) doc.orderedMap<unknown>(name, order).mutate(write);
+        else doc.map<unknown>(name).mutate(write);
+      } else if (kind === 'list') {
+        const map = content.keyWalkOf(name);
+        if (map !== null && walked.get(map) === name) continue;
+        const items = content.list(name) ?? [];
+        if (items.length === 0) continue;
+        doc.list<unknown>(name).mutate((list) => {
+          for (const item of items) list.push(item);
+        });
+      } else if (kind === 'text') {
+        const text = content.text(name) ?? '';
+        if (text !== '') doc.text(name).update(text);
+      }
+    }
+    return doc._exportSnapshot();
+  } finally {
+    doc.close();
+  }
+}
+
+/**
+ * A CRDT snapshot's content as JSON, read the way an app reads it (a paged
+ * root flattened to its records), holding exactly the roots the snapshot
+ * holds. A Document registers its root map on construction, so it is opened
+ * on a root the snapshot already has rather than on the default.
+ * @internal
+ */
+export function snapshotContentJSON(snapshot: Uint8Array): Record<string, unknown> {
+  // One engine, and the roots named from its shallow value: a whole-engine
+  // `toJSON` here would hold a second copy of the content beside the one the
+  // read below builds.
+  const engine = new LoroDoc();
+  engine.import(snapshot);
+  const shallow = engine.getShallowValue() as Record<string, unknown>;
+  const held = Object.keys(shallow);
+  const rootKey = held.find((k) => {
+    if (isReservedRootName(k)) return false;
+    const id = shallow[k];
+    return typeof id === 'string' && id.endsWith(':Map');
+  });
+  const doc = Document._fromEngine(engine, rootKey !== undefined ? { rootKey } : undefined);
+  try {
+    const json = doc.toJSON();
+    for (const key of Object.keys(json)) if (!held.includes(key)) delete json[key];
+    return json;
+  } finally {
+    doc.close();
+  }
+}
+
+/** The CRDT a stored record store becomes. The same conversion as
+ *  `snapshotFromSealedContent`, reached from the record-store view.
+ *  @internal */
+/** A whole CRDT document as plain JSON, its paged roots as records. */
+function engineJSON(source: LoroDoc): Record<string, unknown> {
+  const json = source.toJSON() as Record<string, unknown>;
+  // The document's references and read marks are the platform's, read
+  // through `dependsOn` and the input status rather than as content.
+  for (const key of Object.keys(json)) if (isReservedRootName(key)) delete json[key];
+  const meta = json[META_KEY];
+  if (isRootLookup(meta)) {
+    for (const key of Object.keys(meta)) {
+      if (isPagedMarkerEntry(META_KEY, key)) delete meta[key];
+    }
+  }
+  // A paged root holds its records inside page entries beside the store's
+  // own edit bookkeeping, so flatten it to the same record lookup
+  // `doc.map(root).read()` hands back: a serializer and a whole-document
+  // renderer read this surface, and a store that crossed the paging
+  // threshold has to reach them as records. Every root is asked, because a
+  // root no handle was ever taken on is paged by the same rule as one that
+  // was; a root the marker does not name comes back as loro produced it.
+  for (const [rootKey, value] of Object.entries(json)) {
+    if (!isRootLookup(value)) continue;
+    if (!readRootPaged(source, rootKey)) continue;
+    json[rootKey] = flattenPagedLookup(value, true);
+  }
+  return json;
+}
+
+/** A CRDT engine holding decoded join content. */
+function engineFrom(content: JoinContent): LoroDoc {
+  const doc = new LoroDoc();
+  if (content.kind === 'crdt') doc.import(content.bytes);
+  else if (content.kind === 'frozen') doc.import(snapshotFromSealedContent(content.content));
+  return doc;
+}
+
+/**
+ * A version of a Document over frozen content, as the content its handles read.
+ *
+ * Frozen content with nothing above it is the version itself. Anything else
+ * (a version stored as a CRDT, or a tail over the seal) is materialised and
+ * read back as content: a preview takes no write, so the engine it needs is
+ * built for the read and freed after it.
+ */
+function frozenPreview(content: JoinContent, tailOpBlobs: Uint8Array[]): SealedContent {
+  if (content.kind === 'frozen' && tailOpBlobs.length === 0) return content.content;
+  const engine = engineFrom(content);
+  try {
+    for (const blob of tailOpBlobs) importTailOp(engine, blob);
+    return SealedContent.fromJSON(engineJSON(engine) as SealedContentJson);
+  } finally {
+    engine.free();
+  }
+}
+
+export function snapshotFromSealedStore(store: SealedStore): Uint8Array {
+  return snapshotFromSealedContent(store.content);
+}
+
+/** What a record-store writer is handed. */
+export interface RecordStoreSource {
+  schemaVersion: string;
+  header: readonly { tag: string; body: unknown }[];
+  /** Walks every record, in order. */
+  forEachRecord(
+    visit: (key: string, tag: string | null, body: unknown) => void,
+  ): void;
+}
+
+/**
+ * Write a record store as a CRDT snapshot through the one conversion every
+ * frozen stream takes.
+ */
+export function recordStoreSnapshot(source: RecordStoreSource): Uint8Array {
+  const records: [string, string | null, unknown][] = [];
+  source.forEachRecord((key, tag, body) => {
+    records.push([key, tag, body]);
+  });
+  return snapshotFromSealedContent(
+    SealedContent.fromRecords({
+      schemaVersion: source.schemaVersion,
+      header: source.header,
+      records,
+    }),
+  );
+}
+
+/**
+ * Materialises a line at a version: the content the join names, the tail
+ * above it, and the version the server resolved. `streamSeqs` is the per-stream
+ * seq vector at that version (from the newest checkpoint at or below it),
+ * `{ line_id: seq }`, which lets a preview bring every opened stream to the
+ * same point; absent for a stream line's own timeline and before any
+ * checkpoint recorded one.
+ * @internal
+ */
+export type CheckoutFetcher = (
+  docId: string,
+  version: number,
+  branchId: string,
+) => Promise<{
+  content: JoinContent;
+  tailOpBlobs: Uint8Array[];
+  effectiveVersion: number;
+  streamSeqs?: Record<string, number>;
+}>;
+
 export class Document {
-  private readonly _doc: LoroDoc;
-  private readonly _rootKey: string;
+  private _importReport: ImportReport | null = null;
+  private _changed = false;
+  private _changeNotice: ((fire: () => void) => () => void) | null = null;
+  private _stopChangeNotice: (() => void) | null = null;
+  private readonly _changedListeners = new Set<() => void>();
+  // A frozen copy's reload, wired by the transport: re-joins and applies the
+  // result in place. `null` on every other open.
+  private _frozenReloader: (() => Promise<void>) | null = null;
+  // Opens this document again in another mode. Installed by whichever layer
+  // opened it: the session for the document it holds, the client otherwise.
+  private _reopener: ((mode: ReopenMode) => Promise<OpenedDocument>) | null = null;
+  private _reloading: Promise<void> | null = null;
+  // `onStatus` listeners on a frozen copy, which hears status on the same
+  // notice the change report rides.
+  private _statusWatches = 0;
+  private _inputsRuntime: InputsStatusRuntime | null = null;
+  // Built on the first status subscription.
+  private _inputStatusHub: InputStatusHub | null = null;
+  // The `subscribeInputDocuments` followers, which close and park stop so no
+  // retry, handler or kept copy outlives the document.
+  private readonly _inputFollowers = new InputFollowers();
+
+  // The CRDT engine. `null` until something reads it: a Document over frozen
+  // content never does, so it holds no engine at all.
+  private _engine: LoroDoc | null;
+  private _rootKey: string;
   // Server-minted `doc_id`, or `null` when constructed without one
   // (test / offline path).
   private readonly _docId: string | null;
@@ -622,6 +1152,32 @@ export class Document {
   // and `returnToHead` reject. The live + checkout-on-demand path
   // leaves this `false`.
   private readonly _isFrozen: boolean;
+  // The frozen content this Document reads, when the platform holds its
+  // content in that encoding. Its roots serve `map` / `list` / `orderedMap`
+  // and `toJSON` in place of the CRDT's, so an app reads one document
+  // surface whichever way the content is stored. `null` for a CRDT document.
+  private _sealedRoots: SealedRoots | null;
+  // The frozen content at the head, and the content the roots read now: the
+  // head, or a version a checkout swapped in. `null` with `_sealedRoots`.
+  private _frozenHead: SealedContent | null;
+  private _frozenShown: SealedContent | null;
+  // The version a Document over frozen content is showing, or `null` for its
+  // head.
+  private _frozenVersion: number | null = null;
+  // The seq the frozen content was sealed at, which is what says whether a
+  // later join's frozen content is the same content.
+  private _frozenSeal: number | null;
+  // What `map` / `list` / `text` / `orderedMap` hand out: one handle per
+  // root, over whichever storage this Document holds now.
+  private readonly _handles = new StableHandles((err) => this._handleOwner.reportSubscriberThrow(err));
+  // What an engine built for this Document after construction is built with:
+  // the root a CRDT open would root `mutate` at, and the caller's engine
+  // options.
+  private _engineRootKey: string;
+  private readonly _engineOptions: Pick<DocumentOptions, 'peerId' | 'undo'>;
+  // Swaps this Document's frozen content for the CRDT the server now holds,
+  // wired by the transport. Absent, a remote op over frozen content reloads.
+  private _storageUpgrader: (() => void) | null = null;
   // Forced read-only on a LIVE head open (distinct from `_isFrozen`, which
   // is a version-pinned open with no live channel): the Document keeps a
   // live WS subscription and applies incoming remote ops, but local
@@ -630,8 +1186,11 @@ export class Document {
   // grant, a view-only link), and latched on afterwards by
   // `_markReadOnly` when the server refuses a write on the same grounds.
   private _forcedReadOnly: boolean;
+  // Set while `reopen` replaces this copy (see the `reopening` reason).
+  private _reopening = false;
+  private _pendingReopen: PendingReopen | null = null;
   // Which refusal `_forcedReadOnly` stands for, so `mutate` names it.
-  private _readOnlyReason: ReadOnlyReason;
+  private _readOnlyReason: ForcedReadOnlyReason;
   // The UndoManager is constructed eagerly so the first call to
   // `doc.mutate(...)` lands in the undo stack. Lazy construction
   // (deferred to first `doc.undo()`) would miss every commit made
@@ -640,6 +1199,10 @@ export class Document {
   // only; it does NOT fire on snapshot import, so the
   // cold-load contract is unaffected (imports are not local commits).
   private _undo: UndoController | null;
+  // The document's one undo stack across its streams. A Document owns the
+  // group it was created with; a stream's own Document joins its document's
+  // group when the stream opens (`_joinUndoGroup`).
+  private _undoGroup: UndoGroup = new UndoGroup();
   // One subscriber channel. Every event reaches every subscriber, whatever
   // produced it (local mutate, remote import, undo, redo, checkout); the
   // app reconciles by value and reads `origin.source` only when it has a
@@ -657,6 +1220,11 @@ export class Document {
   private readonly _undoStateSubs: Set<UndoStateSubscriber> = new Set();
   private _lastCanUndo = false;
   private _lastCanRedo = false;
+  private _replayingUndo = false;
+  // The change a replay produced, held until the replay ends so `subscribe`
+  // fires once per `undo()` / `redo()`. A listener that writes in reaction
+  // would otherwise commit mid-replay, joining the step being replayed.
+  private _replayChange: ChangeSource | null = null;
   private _unsubLoro: (() => void) | null = null;
   private _unsubLocal: (() => void) | null = null;
   // Local commits drive this hook with the resulting op blob; the hook
@@ -667,23 +1235,7 @@ export class Document {
   private _localOpHook: LocalOpSendHook | null = null;
   // Materialises a historical version against the server; returns the
   // snapshot bytes (or null) + tail op blobs + effective version.
-  private _checkoutFetcher:
-    | ((
-        docId: string,
-        version: number,
-        branchId: string,
-      ) => Promise<{
-        snapshotBytes: Uint8Array | null;
-        tailOpBlobs: Uint8Array[];
-        effectiveVersion: number;
-        // The per-stream seq vector at this version (from the newest
-        // checkpoint at or below it): `{ line_id: seq }`. Lets a preview
-        // re-materialize every opened stream at the same point in time.
-        // Absent for a stream line's own timeline (no checkpoints) and
-        // before any checkpoint recorded one.
-        streamSeqs?: Record<string, number>;
-      }>)
-    | null = null;
+  private _checkoutFetcher: CheckoutFetcher | null = null;
   // The stream seq vector from the active preview, so a stream opened WHILE
   // a preview is active can open at its historical seq too. Cleared on
   // `returnToHead`.
@@ -715,22 +1267,30 @@ export class Document {
     // still hydrating is exactly the one the seed watch is armed for, and
     // the arm happens while that lock is still on.
     isCaptureAllowed: (): boolean =>
-      this._isLive && this._checkout === null && !this._forcedReadOnly,
+      this._isLive && this._previewVersion === null && !this._forcedReadOnly,
     isAttached: (): boolean => this._isLive,
-    onCaptured: (): void => {
-      this._thumbnailVersion = this.currentSeq ?? 0;
+    currentVersion: (): number | null => this.currentSeq,
+    onCaptured: (version?: number): void => {
+      this._thumbnailVersion = version ?? this.currentSeq ?? 0;
     },
   });
   private readonly _checkpoints = new CheckpointScheduler({
     docId: (): string | null => this._docId,
     isAttached: (): boolean => this._isLive,
     isAutoAllowed: (): boolean =>
-      this._isLive && this._checkout === null,
+      this._isLive && this._previewVersion === null,
     currentSeq: (): number | null => this.currentSeq,
     sealUndoStep: (): void => {
-      if (this._undo) this._undo.sealStep();
+      this._undoGroup.seal();
     },
+    hasUnsavedOps: (): boolean => this.savingCount > 0,
     whenLocalOpsSaved: (): Promise<boolean> => whenSaved(this),
+    captureFrame: () => this._thumbnails.captureFrame(),
+    uploadFrame: (frame, version): void => {
+      // The debounced capture usually lands first, at the same version.
+      if (this._thumbnailVersion === version) return;
+      void this._thumbnails.uploadFrame(frame, version);
+    },
   });
   // Drive push hook. `null` on the offline / test path; `pushToDrive`
   // then throws with a clear message rather than silently dropping.
@@ -751,6 +1311,9 @@ export class Document {
   private _sourceBlobFetcher: (() => Promise<DocumentSourceBlob>) | null = null;
   // Cached doc name. `null` on offline / test docs.
   private _name: string | null = null;
+  // When the platform will remove this document, for one created without an
+  // account; `null` for every other document.
+  private _expiresAt: Date | null = null;
   // True once the reader has asked for the version-browsing surface without
   // checking anything out (the hosted history dialog's browse-in-the-app
   // outcome). The host's version bar latches on this as well as on a live
@@ -868,9 +1431,21 @@ export class Document {
   // below (or `documentFromEngine`, for in-repo tooling that brings its own).
   // Owning construction is what lets this class declare an engine-neutral
   // surface: app code holds a Document, never the doc underneath it.
-  private constructor(loroDoc: LoroDoc, options?: DocumentOptions) {
-    this._doc = loroDoc;
+  private constructor(loroDoc: LoroDoc | null, options?: DocumentOptions) {
+    this._undoGroup.setOwner(this, {
+      blocked: (): boolean => this._undoGroupBlocked(),
+      notify: (): void => this._maybeFireUndoState(),
+      // A write to another stream is an edit like one here, so it arms the
+      // same idle checkpoint, which is what seals the step it opened.
+      memberCommitted: (): void => this._checkpoints.scheduleAuto(),
+    });
+    this._engine = loroDoc;
     this._rootKey = options?.rootKey ?? 'entities';
+    this._engineRootKey = this._rootKey;
+    this._engineOptions = {
+      ...(options?.peerId !== undefined ? { peerId: options.peerId } : {}),
+      ...(options?.undo !== undefined ? { undo: options.undo } : {}),
+    };
     this._docId = options?.docId ?? null;
     this._branchId = options?.branchId ?? null;
     // A Document constructed with a `version` is a "frozen" cold-link
@@ -878,14 +1453,20 @@ export class Document {
     // `loroDoc` and there is no live WS channel. The Document is
     // permanently in checkout against itself; `returnToHead` /
     // `_checkoutVersion` are not meaningful on this shape.
+    const frozen = options?.frozenContent;
     const initialVersion = options?.version ?? null;
     if (initialVersion !== null) {
       this._isFrozen = true;
-      this._checkout = {
-        previewDoc: loroDoc,
-        previewRoot: loroDoc.getMap(this._rootKey),
-        version: initialVersion,
-      };
+      if (loroDoc !== null) {
+        this._checkout = {
+          previewDoc: loroDoc,
+          previewRoot: loroDoc.getMap(this._rootKey),
+          version: initialVersion,
+        };
+      } else {
+        this._checkout = null;
+        this._frozenVersion = initialVersion;
+      }
     } else {
       this._isFrozen = false;
       this._checkout = null;
@@ -894,12 +1475,63 @@ export class Document {
     // reader the server will not accept writes from, whether because their
     // grant is view-only or because the link they came through is. A
     // version open is already frozen, so it does not also need the flag.
+    // A stored record set answers every read directly, and takes no write: a
+    // record set holds no op log for an edit to become, and making one is the
+    // platform's (see `open-document.ts`, where the join serves a record set
+    // only to a reader). So an app reads one document surface and never
+    // learns which encoding it was handed, and the write it cannot make is
+    // refused by the same read-only gate every other unwritable open uses.
+    this._frozenHead = frozen ?? null;
+    this._frozenShown = frozen ?? null;
+    this._frozenSeal = options?.frozenSeal ?? null;
+    this._sealedRoots =
+      frozen === undefined
+        ? null
+        : sealedRoots(
+            () => this._frozenShown!,
+            () => this._handleOwner.assertWritable(),
+          );
     this._forcedReadOnly = options?.readOnly === true && initialVersion === null;
     this._readOnlyReason = options?.readOnlyReason ?? 'link';
-    // Materialize the root container, so a document nothing has written to
-    // still carries its root in the shape a reader opens it with.
-    loroDoc.getMap(this._rootKey);
-    this._undo = new UndoController(this._doc, options?.undo);
+    if (loroDoc !== null) {
+      if (options?.peerId !== undefined) loroDoc.setPeerId(options.peerId);
+      // Materialize the root container, so a document nothing has written to
+      // still carries its root in the shape a reader opens it with.
+      loroDoc.getMap(this._rootKey);
+      this._undo = this._newUndoController(loroDoc, options?.undo);
+    } else {
+      this._undo = null;
+    }
+  }
+
+  // The engine, built on first use for a Document constructed without one.
+  private get _doc(): LoroDoc {
+    if (this._engine === null) {
+      this._engine = new LoroDoc();
+      this._engine.getMap(this._rootKey);
+    }
+    return this._engine;
+  }
+
+  /** Whether this Document has been closed. @internal */
+  get _isClosed(): boolean {
+    return this._closed;
+  }
+
+  /** Whether this Document has built a CRDT engine. @internal */
+  _holdsEngine(): boolean {
+    return this._engine !== null;
+  }
+
+  /** The seq this Document's frozen content was sealed at, or `null` for a
+   *  CRDT document or a seal the join did not name. @internal */
+  get _frozenSealSeq(): number | null {
+    return this._frozenSeal;
+  }
+
+  // The version this Document is showing instead of its head, or `null`.
+  private get _previewVersion(): number | null {
+    return this._checkout?.version ?? this._frozenVersion;
   }
 
   // ---- Typed container handles (the primary read/write/subscribe surface) --
@@ -933,15 +1565,31 @@ export class Document {
     return this._doc.peerIdStr;
   }
 
+  /** Whether this document's reads are answered by a stored record set.
+   *  @internal */
+  _holdsRecordSet(): boolean {
+    return this._sealedRoots !== null;
+  }
+
   // Get a handle for a top-level LoroMap at `key`. The container is
   // materialized in the underlying LoroDoc immediately (Loro's
   // `getMap` is "get or create"); mutations through the handle do
   // not need to create the container themselves.
   map<T = unknown>(key: string): MapHandle<T> {
     this._assertOpen();
+    assertAppRootName(key);
+    return this._handles.root(`map:${key}`, 'map', () => this._rootMap<T>(key));
+  }
+
+  private _rootMap<T>(key: string): MapHandle<T> {
     const cacheKey = `map:${key}`;
     const existing = this._rootHandles.get(cacheKey);
     if (existing) return existing.handle as unknown as MapHandle<T>;
+    if (this._sealedRoots !== null) {
+      const handle = this._sealedRoots.map<unknown>(key);
+      this._rootHandles.set(cacheKey, { kind: 'map', key, handle });
+      return handle as unknown as MapHandle<T>;
+    }
     // Source the LoroMap from the active source (live or checkout
     // preview), same as `toJSON` does. Handles bound to a Document
     // in checkout see the historical state via the preview doc.
@@ -972,7 +1620,7 @@ export class Document {
       },
       sessionToken: (): string => this._pagingSessionToken,
       stateVersion: (): StateVersion => activeSource().frontiers(),
-    });
+    }, key);
     this._rootHandles.set(cacheKey, { kind: 'map', key, handle });
     return handle as unknown as MapHandle<T>;
   }
@@ -980,9 +1628,19 @@ export class Document {
   // Get a handle for a top-level LoroMovableList at `key`.
   list<T = unknown>(key: string): ListHandle<T> {
     this._assertOpen();
+    assertAppRootName(key);
+    return this._handles.root(`list:${key}`, 'list', () => this._rootList<T>(key));
+  }
+
+  private _rootList<T>(key: string): ListHandle<T> {
     const cacheKey = `list:${key}`;
     const existing = this._rootHandles.get(cacheKey);
     if (existing) return existing.handle as unknown as ListHandle<T>;
+    if (this._sealedRoots !== null) {
+      const handle = this._sealedRoots.list<unknown>(key);
+      this._rootHandles.set(cacheKey, { kind: 'list', key, handle });
+      return handle as unknown as ListHandle<T>;
+    }
     const source =
       this._checkout !== null ? this._checkout.previewDoc : this._doc;
     const loroList = source.getMovableList(key);
@@ -1013,9 +1671,15 @@ export class Document {
    */
   text(key: string): TextHandle {
     this._assertOpen();
+    assertAppRootName(key);
+    return this._handles.root(`text:${key}`, 'text', () => this._rootText(key));
+  }
+
+  private _rootText(key: string): TextHandle {
     const cacheKey = `text:${key}`;
     const existing = this._rootHandles.get(cacheKey);
     if (existing) return existing.handle as TextHandle;
+    if (this._sealedRoots !== null) return this._sealedRoots.text(key);
     const owner = this._handleOwner;
     const activeSource = (): LoroDoc =>
       this._checkout !== null ? this._checkout.previewDoc : this._doc;
@@ -1127,12 +1791,25 @@ export class Document {
     orderKey: string,
   ): OrderedMapHandle<T> {
     this._assertOpen();
+    return this._handles.root(`ordered:${mapKey}\u0000${orderKey}`, 'map', () =>
+      this._rootOrderedMap<T>(mapKey, orderKey),
+    );
+  }
+
+  private _rootOrderedMap<T>(mapKey: string, orderKey: string): OrderedMapHandle<T> {
     const cacheKey = `${mapKey}\u0000${orderKey}`;
     let h = this._orderedMapHandles.get(cacheKey);
+    if (!h && this._sealedRoots !== null) {
+      // Taken from the store rather than composed from this document's own
+      // map + list handles: the composition exists to keep a map and its
+      // order list in step through writes, and a stored record set has none.
+      h = this._sealedRoots.orderedMap<unknown>(mapKey, orderKey);
+      this._orderedMapHandles.set(cacheKey, h);
+    }
     if (!h) {
       h = createOrderedMapHandle<unknown>(
-        this.map(mapKey),
-        this.list<string>(orderKey),
+        this._rootMap(mapKey),
+        this._rootList<string>(orderKey),
         this._handleOwner,
       );
       this._orderedMapHandles.set(cacheKey, h);
@@ -1154,42 +1831,23 @@ export class Document {
       },
       assertWritable: (): void => {
         this._assertOpen();
-        if (this._checkout !== null) {
-          throw new Error(
-            'Document is read-only: it is showing a historical version. ' +
-              'Call `doc.returnToHead()` to edit.',
-          );
-        }
-        if (this._versionBrowsing) {
-          throw new Error(
-            'Document is read-only: the reader is browsing its versions. ' +
-              'Close the version bar to edit.',
-          );
-        }
-        if (this._forcedReadOnly) {
-          throw new Error(READ_ONLY_MESSAGES[this._readOnlyReason]);
-        }
-        if (this._loadFailed) {
-          throw new Error(
-            'Document is read-only: its content could not be prepared ' +
-              '(see `doc.status`). Reopen it to try again.',
-          );
-        }
-        if (this._isLoadLocked()) {
-          throw new Error(
-            'Document is still loading its content; wait for the load to ' +
-              'finish before editing (see `doc.onStatus`).',
-          );
-        }
+        const reason = this._readOnlyBecause;
+        if (reason !== null) throw new Error(READ_ONLY_MESSAGES[reason]);
       },
       ensureLocalUpdatesSubscribed: (): void => {
         this._ensureLocalUpdatesSubscribed();
       },
       commitMutate: (): void => {
-        this._doc.setNextCommitOrigin(MUTATE_COMMIT_ORIGIN);
+        this._doc.setNextCommitOrigin(this._mutateCommitOrigin);
         this._doc.commit();
       },
+      runMutate: (options: MutateOptions | undefined, fn: () => void): void => {
+        this._runInMutate(options?.undoable !== false, fn);
+      },
       originOf: (event: unknown): ChangeSource => changeSourceOf(event),
+      reportSubscriberThrow: (err: unknown): void => {
+        this._reportSubscriberThrow(err);
+      },
     };
     return this._handleOwnerCache;
   }
@@ -1221,28 +1879,45 @@ export class Document {
   // and follows a grant the server withdraws mid-session as well as a
   // checkout the reader entered.
   get readOnly(): boolean {
-    // A doc that is still loading its first content (a drive-linked
-    // stub hydrating on first open) is read-only until the bytes
-    // arrive: editing it would write ops onto an empty doc that the
-    // incoming snapshot is about to replace. The SDK reloads the
-    // content automatically when the work finishes (see open-document's
-    // `reloadAfterHydration`); until then mutation is rejected. This is
-    // also what stops an app's "seed an empty doc" path from clobbering
-    // a doc that only looks empty because it has not loaded yet.
-    // Browsing versions locks the document at the live head as well as at an
-    // earlier one. Stepping moves between the points history KEEPS, and an
-    // edit at the head makes no such point, so an edit made under the open
-    // bar puts the reader's own newest work somewhere the bar cannot travel
-    // to: Back then steps past it to the newest marker, and the way forward
-    // is a different number of presses from the way back. Reading history
-    // and writing it are separate modes, and the bar carries the Close that
-    // leaves this one.
-    return (
-      this._forcedReadOnly ||
-      this._checkout !== null ||
-      this._versionBrowsing ||
-      this._isLoadLocked()
-    );
+    return this._readOnlyBecause !== null;
+  }
+
+  /**
+   * The refusal message when this reader's access, a view-only link, or this
+   * app's standing keeps them from writing however the document is opened,
+   * else null. `session.edit()` rejects with it rather than reopening.
+   * @internal
+   */
+  get _editRefusal(): string | null {
+    const reason = this._forcedReadOnly ? this._readOnlyReason : null;
+    if (reason === 'grant' || reason === 'link' || reason === 'app') {
+      return READ_ONLY_MESSAGES[reason];
+    }
+    return null;
+  }
+
+  /**
+   * Why this reader cannot write, or null when they can.
+   *
+   * The one place the conditions are listed. `readOnly` asks whether there is
+   * a reason and `mutate` refuses with the reason's own message, so the two
+   * cannot answer differently about the same document, and a new reason
+   * reaches both by being added here.
+   *
+   * Order decides which message a reader sees when several hold at once, and
+   * it runs from the state they are in to the state they were put in: a
+   * checkout and an open version bar are things this reader did and can
+   * undo, so naming those first tells them what to do. A load that has not
+   * finished comes last because it clears on its own.
+   */
+  private get _readOnlyBecause(): ReadOnlyReason | null {
+    if (this._previewVersion !== null) return 'version';
+    if (this._versionBrowsing) return 'browsing';
+    if (this._forcedReadOnly) return this._readOnlyReason;
+    if (this._reopening) return 'reopening';
+    if (this._loadFailed) return 'load_failed';
+    if (this._isLoadLocked()) return 'loading';
+    return null;
   }
 
   // True when content-replacing work (hydration / extraction) is pending
@@ -1257,7 +1932,7 @@ export class Document {
   // blocking so hydration stays locked.
   private _isLoadLocked(): boolean {
     if (this._loadFailed) return true;
-    const s = this._workStatus.status;
+    const s = this._workStatus.work;
     return s?.pending === true && s.blocking !== false;
   }
 
@@ -1286,8 +1961,8 @@ export class Document {
    * `doc.readOnly` (true for a preview, a view-only link, or a load lock).
    * @internal
    */
-  get version(): number | null {
-    return this._checkout?.version ?? null;
+  get previewVersion(): number | null {
+    return this._previewVersion;
   }
 
   /** @internal Whether the host should be showing its version-browsing
@@ -1314,7 +1989,8 @@ export class Document {
    *  upload pins to it); no app-facing operation takes a seq, since version
    *  history is hosted chrome the app does not drive with numbers. */
   get currentSeq(): number | null {
-    if (this._checkout !== null) return this._checkout.version;
+    const previewing = this._previewVersion;
+    if (previewing !== null) return previewing;
     if (this._currentSeqProvider) return this._currentSeqProvider();
     return null;
   }
@@ -1332,6 +2008,38 @@ export class Document {
     const loroDoc = new LoroDoc();
     loroDoc.import(snapshot);
     return new Document(loroDoc, options);
+  }
+
+  /**
+   * Open a Document over frozen content: the document's content as it was
+   * sealed, read with no CRDT engine.
+   *
+   * No CRDT engine is built: every root answers from the content, and the
+   * machinery a Document carries regardless (its id, its subscriber channel,
+   * its close path) runs without one.
+   * @internal
+   */
+  static openFromSealedContent(content: SealedContent, options?: DocumentOptions): Document {
+    // Rooted at a map the content holds, so a document reading frozen content
+    // registers no empty root of its own.
+    //
+    // Read-only is stated here rather than left to the caller, because it is
+    // a property of the bytes: frozen content holds no op log, so there is
+    // nothing an edit could be written into, and making one is the platform's
+    // (`runRecordSetConversion`). Stating it at the factory is what lets the
+    // refusal come from the document's own gate, which names the reader's
+    // actual limit, instead of from each handle describing the encoding.
+    const rootKey =
+      content.rootNames().find((n) => content.kindOf(n) === 'map') ?? RECORDS_KEY;
+    const doc = new Document(null, {
+      ...options,
+      readOnly: true,
+      readOnlyReason: options?.readOnlyReason ?? 'snapshot',
+      rootKey,
+      frozenContent: content,
+    });
+    doc._engineRootKey = options?.rootKey ?? 'entities';
+    return doc;
   }
 
   /**
@@ -1373,7 +2081,17 @@ export class Document {
       // subscribers.
       return;
     }
-    this._doc.import(opBlob);
+    // An op exists, so the document is now a CRDT and somebody has edited it.
+    // The op is authored against that CRDT, so imported over frozen content it
+    // would land on an empty LoroDoc and sit causally incomplete. The storage
+    // is upgraded instead: the transport re-joins, and the join's CRDT
+    // replaces the frozen content under the same handles (`_upgradeStorage`).
+    // The op is in what that join serves.
+    if (this._sealedRoots !== null) {
+      this._requestStorageUpgrade();
+      return;
+    }
+    importTailOp(this._doc, opBlob);
   }
 
   // Apply a snapshot blob over the top of an existing Document.
@@ -1390,6 +2108,12 @@ export class Document {
     // arrives and the Loro subscriber cannot be relied on to report it: it is
     // attached lazily, so a document whose content lands before the session has
     // bound its canvas has nobody subscribed and the import fires nothing.
+    // CRDT bytes over frozen content are a storage upgrade, which keeps the
+    // app's handles (see `_upgradeStorage`).
+    if (this._sealedRoots !== null) {
+      if (!this._upgradeStorage(snapshot, [])) this._reopen();
+      return;
+    }
     this._armSeedIfPictureIsStale();
     this._doc.import(snapshot);
     // The undo stack pre-snapshot referenced ops the new snapshot
@@ -1400,7 +2124,112 @@ export class Document {
     if (this._undo) this._undo.clear();
   }
 
-  // Revert the most recent local commit. Returns `true` if an undo
+  /** @internal Wire the re-join that upgrades this Document's frozen content
+   *  to the CRDT the server now holds. */
+  _setStorageUpgrader(upgrade: () => void): void {
+    this._storageUpgrader = upgrade;
+  }
+
+  private _requestStorageUpgrade(): void {
+    const upgrade = this._storageUpgrader;
+    if (upgrade === null) {
+      this._reopen();
+      return;
+    }
+    upgrade();
+  }
+
+  /**
+   * Swap this Document's storage from frozen content to a CRDT, in place.
+   * @internal
+   *
+   * Every handle an app took over the frozen content keeps working, now over
+   * the CRDT, and its subscribers move there as a whole-container resync (keys
+   * the CRDT does not hold arrive as `deleted`, and `onSettled` fires again).
+   * Read-only state is unchanged, because the reader's intent is.
+   *
+   * Returns false, leaving the frozen content in place, when the Document is
+   * showing a version of the frozen content: the preview has no CRDT
+   * counterpart to rebind to, so the caller reloads instead.
+   */
+  _upgradeStorage(snapshot: Uint8Array | null, tailOps: readonly Uint8Array[]): boolean {
+    if (this._closed) return false;
+    if (this._sealedRoots === null) return true;
+    if (this._frozenVersion !== null) return false;
+    const engine = new LoroDoc();
+    if (snapshot !== null) engine.import(snapshot);
+    for (const op of tailOps) importTailOp(engine, op);
+    if (this._engineOptions.peerId !== undefined) engine.setPeerId(this._engineOptions.peerId);
+    this._handles.swap(() => {
+      this._rootKey = this._engineRootKey;
+      engine.getMap(this._rootKey);
+      this._engine = engine;
+      this._undo = this._newUndoController(engine, this._engineOptions.undo);
+      this._sealedRoots = null;
+      this._frozenHead = null;
+      this._frozenShown = null;
+      this._frozenSeal = null;
+      this._rootHandles.clear();
+      this._orderedMapHandles.clear();
+    });
+    this._fireSubscribers({ kind: 'change', source: 'remote' });
+    return true;
+  }
+
+  /**
+   * Swap this Document's storage from a CRDT to frozen content, in place: the
+   * counterpart of `_upgradeStorage`, for a frozen copy whose reload is served
+   * the line as stored after the copy was opened on a CRDT.
+   * @internal
+   *
+   * Returns false, leaving the CRDT in place, when the Document is showing a
+   * version: the preview has no frozen counterpart, so the caller reloads.
+   */
+  _downgradeStorage(content: SealedContent, seal: number | null): boolean {
+    if (this._closed || this._sealedRoots !== null || this._checkout !== null) return false;
+    this._handles.swap(() => {
+      this._frozenHead = content;
+      this._frozenShown = content;
+      this._frozenSeal = seal;
+      this._sealedRoots = sealedRoots(
+        () => this._frozenShown!,
+        () => this._handleOwner.assertWritable(),
+      );
+      this._rootHandles.clear();
+      this._orderedMapHandles.clear();
+      // Nothing reads the engine from here on. It is dropped rather than
+      // freed, because a watcher an input follower attached to it may still
+      // detach.
+      this._unsubLoro?.();
+      this._unsubLoro = null;
+      this._unsubLocal?.();
+      this._unsubLocal = null;
+      this._undo?.free();
+      this._undo = null;
+      this._engine = null;
+    });
+    this._fireSubscribers({ kind: 'change', source: 'remote' });
+    return true;
+  }
+
+  /**
+   * Replace this Document's frozen content with other frozen content, in
+   * place, re-delivering every handle's subscribers. A join serves a newer
+   * seal when the document was edited and frozen again in between.
+   * @internal
+   */
+  _replaceSealedContent(content: SealedContent, seal: number | null): boolean {
+    if (this._closed || this._sealedRoots === null) return false;
+    if (this._frozenVersion !== null) return false;
+    this._frozenHead = content;
+    this._frozenShown = content;
+    this._frozenSeal = seal;
+    this._sealedRoots.resync();
+    this._fireSubscribers({ kind: 'change', source: 'remote' });
+    return true;
+  }
+
+  // Revert the most recent local step. Returns `true` if an undo
   // step was applied, `false` if the stack is empty. Remote peers'
   // edits are not in this stack: Loro's UndoManager is local-peer-
   // scoped, which is the user-visible behaviour every collaborative
@@ -1409,23 +2238,17 @@ export class Document {
   // The reverted change is itself a local commit, so it ships over
   // the WS transport like any other mutation and other peers see the
   // state revert.
+  //
+  // The stack is the document's, across its streams: a step is every local
+  // commit between two seals in whichever streams took one, and one `undo()`
+  // reverts it in each of them. A stream that refuses writes takes no part.
   undo(): boolean {
     this._assertOpen();
-    // During a checkout the UndoManager still tracks the live head, but reads
-    // go through the preview. Undoing would commit against the live `_doc` and
-    // ship over the WS transport while the previewing user sees nothing, a
-    // silent live edit. Match `canUndo()` (false during a checkout) and no-op.
-    if (this._checkout !== null) return false;
-    // An undo produces a local commit exactly as `mutate` does, so it obeys
-    // the same read-only gates: a view-only guest link (`_forcedReadOnly`)
-    // and a pending content-replacing work-status (`_isLoadLocked()`), whose
-    // whole purpose is to keep local ops from racing the incoming bytes.
-    if (this._forcedReadOnly || this._isLoadLocked()) return false;
-    this._ensureLocalUpdatesSubscribed();
-    // Tag the commit the UndoManager is about to make so the resulting
-    // change reads back as `origin.source === 'undo'`, not `'local'`.
-    this._doc.setNextCommitOrigin(UNDO_COMMIT_ORIGIN);
-    return this._undo!.undo();
+    try {
+      return this._undoGroup.replay('undo');
+    } finally {
+      this._maybeFireUndoState();
+    }
   }
 
   // Re-apply the most recently undone local commit. Returns `true`
@@ -1437,13 +2260,69 @@ export class Document {
   // composes correctly.
   redo(): boolean {
     this._assertOpen();
-    // No-op during a checkout, same reasoning as `undo()`.
-    if (this._checkout !== null) return false;
-    // Same read-only gates as `undo()` / `mutate()`.
-    if (this._forcedReadOnly || this._isLoadLocked()) return false;
+    try {
+      return this._undoGroup.replay('redo');
+    } finally {
+      this._maybeFireUndoState();
+    }
+  }
+
+  // Whether `undo()` / `redo()` must no-op. A replay produces local commits
+  // exactly as `mutate` does, so it obeys every gate `mutate` does. During a
+  // checkout the UndoManager still tracks the live head while reads go
+  // through the preview, so a replay would be a silent live edit. A copy with
+  // no CRDT (frozen content) has no undo stack at all. `undo()` / `redo()`
+  // also no-op inside a `mutate` callback, whose open transaction holds
+  // writes the replay would commit outside the op it ships.
+  private _undoBlocked(): boolean {
+    return this._checkout !== null || this._undo === null || this._readOnlyBecause !== null;
+  }
+
+  // Tags each commit the step's replay makes, so the resulting change reads
+  // back as `origin.source === 'undo'` / `'redo'`, not `'local'`.
+  //
+  // A step replays as one commit per commit it took, and those ship as ONE op
+  // exported from the version before the replay, so an Undo of a long step is
+  // one write for the server and one import for each peer.
+  /** @internal Replay this stream's own part of the newest step that touched
+   *  it (undo) or of the step it most recently undid (redo), leaving the
+   *  document's other streams alone. `DocumentStream.undo` / `redo`. */
+  _replayOwnUndoStep(dir: 'undo' | 'redo'): boolean {
+    this._assertOpen();
+    try {
+      if (this._mutateDepth > 0 || this._undoBlocked()) return false;
+      const tag = this._undo!.peek(dir);
+      return tag !== undefined && this._replayUndoStep(dir, tag);
+    } finally {
+      this._maybeFireUndoState();
+    }
+  }
+
+  /** @internal */
+  _replayUndoStep(dir: 'undo' | 'redo', tag: number): boolean {
     this._ensureLocalUpdatesSubscribed();
-    this._doc.setNextCommitOrigin(REDO_COMMIT_ORIGIN);
-    return this._undo!.redo();
+    const origin = dir === 'undo' ? UNDO_COMMIT_ORIGIN : REDO_COMMIT_ORIGIN;
+    const tagCommit = (): void => this._doc.setNextCommitOrigin(origin);
+    const before = this._doc.oplogVersion();
+    const beforeHead = JSON.stringify(this._doc.oplogFrontiers());
+    this._replayingUndo = true;
+    this._replayChange = null;
+    try {
+      return this._undo!.replayStep(dir, tag, tagCommit);
+    } finally {
+      this._replayingUndo = false;
+      // Whatever the replay committed ships, a replay that threw part-way included.
+      if (this._unsubLocal && JSON.stringify(this._doc.oplogFrontiers()) !== beforeHead) {
+        this._shipLocalUpdate(this._doc.export({ mode: 'update', from: before }));
+      }
+      before.free();
+      const source = this._replayChange;
+      this._replayChange = null;
+      if (source !== null) {
+        this._subs.emit({ kind: 'change', source } satisfies SyntheticSubscribeEvent);
+      }
+      this._maybeFireUndoState();
+    }
   }
 
   /**
@@ -1455,33 +2334,74 @@ export class Document {
    * @internal
    */
   _sealUndoStep(): void {
-    if (this._undo) this._undo.sealStep();
+    this._undoGroup.seal();
+  }
+
+  /** @internal */
+  _undoController(): UndoController | null {
+    return this._undo;
+  }
+
+  /** @internal */
+  _undoEligible(): boolean {
+    return !this._closed && !this._undoBlocked();
+  }
+
+  /** @internal */
+  _undoMutating(): boolean {
+    return this._mutateDepth > 0;
+  }
+
+  // A version on screen holds every stream of the document at that moment,
+  // so no stream replays a step while the document shows one, even a stream
+  // whose own preview has not landed yet.
+  private _undoGroupBlocked(): boolean {
+    return (
+      this._closed ||
+      this._checkout !== null ||
+      this._previewVersion !== null ||
+      this._versionBrowsing
+    );
+  }
+
+  private _newUndoController(
+    loroDoc: LoroDoc,
+    options: UndoControllerOptions | undefined,
+  ): UndoController {
+    return new UndoController(loroDoc, options, this._undoGroup, {
+      onFreshCommit: (): void => this._undoGroup.freshCommit(this),
+      onStackChange: (): void => {
+        if (!this._undoGroup.isOwner(this)) this._undoGroup.changed();
+      },
+    });
+  }
+
+  /** @internal Make this stream's undo part of its document's stack. Called
+   *  when the stream opens, before it has taken a local commit. */
+  _joinUndoGroup(group: UndoGroup): void {
+    this._undoGroup.delete(this);
+    this._undoGroup = group;
+    group.add(this);
+    this._undo?.useClock(group);
   }
 
   // Whether `undo()` would have an effect right now. Feeds the
   // commands machinery and the undo-state notifier; apps consume it
   // through `subscribeUndoState` snapshots.
+  //
+  // The gates `undo()` enforces, so a subscribeUndoState-bound button
+  // disables rather than inviting an undo the call would refuse: during a
+  // checkout the stacks still track the live head while the UI shows the
+  // preview, and a stream that refuses writes has nothing it may replay.
   private canUndo(): boolean {
     if (this._closed) return false;
-    // During a checkout, the undo stack still tracks the live doc's
-    // history, but the UI is showing the historical preview and
-    // mutate is rejected. Surface that as "can't undo right now" so
-    // subscribeUndoState-bound buttons disable correctly.
-    if (this._checkout !== null) return false;
-    // Fold the same read-only gates `undo()` enforces so a
-    // subscribeUndoState-bound button disables while the doc is a view-only
-    // guest link or load-locked, rather than inviting an undo the call
-    // would refuse.
-    if (this._forcedReadOnly || this._isLoadLocked()) return false;
-    return this._undo!.canUndo();
+    return this._undoGroup.canUndo();
   }
 
   // Whether `redo()` would have an effect right now. As above.
   private canRedo(): boolean {
     if (this._closed) return false;
-    if (this._checkout !== null) return false;
-    if (this._forcedReadOnly || this._isLoadLocked()) return false;
-    return this._undo!.canRedo();
+    return this._undoGroup.canRedo();
   }
 
   // The plain-object proxy callers mutate. The mutation runs against
@@ -1514,10 +2434,11 @@ export class Document {
   // either.
   mutate<E extends object = EntityProxy>(
     fn: (d: DocumentMutator<E>) => void,
+    options?: MutateOptions,
   ): void {
     this.map<E>(this._rootKey).mutate((entities) => {
       fn({ entities });
-    });
+    }, options);
   }
 
   // Install / replace the local-op send hook; `null` detaches it.
@@ -1551,20 +2472,7 @@ export class Document {
   // `_checkoutVersion`. A Document without one rejects the checkout
   // with a clear error.
   /** @internal */
-  setCheckoutFetcher(
-    fetcher:
-      | ((
-          docId: string,
-          version: number,
-          branchId: string,
-        ) => Promise<{
-          snapshotBytes: Uint8Array | null;
-          tailOpBlobs: Uint8Array[];
-          effectiveVersion: number;
-          streamSeqs?: Record<string, number>;
-        }>)
-      | null,
-  ): void {
+  setCheckoutFetcher(fetcher: CheckoutFetcher | null): void {
     this._checkoutFetcher = fetcher;
   }
 
@@ -1577,7 +2485,7 @@ export class Document {
   /** @internal Whether this Document is currently showing a historical
    * preview rather than its live head. */
   _isCheckedOut(): boolean {
-    return this._checkout !== null;
+    return this._previewVersion !== null;
   }
 
   /** @internal Whether this Document is pinned to the version it was opened
@@ -1590,7 +2498,7 @@ export class Document {
   // Switch the Document to a historical version, in place. @internal
   // (the hosted `history` command drives this). After the promise
   // resolves, `doc.readOnly` is `true`,
-  // `doc.version` is the server's effective version (which may round
+  // `doc.previewVersion` is the server's effective version (which may round
   // down from the requested one when compaction has TTL'd the exact
   // op), and `mutate` throws. `subscribe` fires once after the swap so
   // the app's render loop redraws, and the app returns to live through
@@ -1622,7 +2530,7 @@ export class Document {
       );
     }
     const generation = ++this._checkoutGeneration;
-    const { snapshotBytes, tailOpBlobs, effectiveVersion, streamSeqs } =
+    const { content, tailOpBlobs, effectiveVersion, streamSeqs } =
       await this._checkoutFetcher(this._docId, version, this._branchId);
     if (this._closed || this._suspended) return;
     // A `returnToHead` or a newer `_checkoutVersion` fired while this fetch
@@ -1630,11 +2538,20 @@ export class Document {
     // than clobbering the live head (or a newer checkout) the user asked for.
     if (generation !== this._checkoutGeneration) return;
     this._checkoutStreamSeqs = streamSeqs ?? {};
+    // Handles over frozen content read frozen content, so the version is
+    // swapped in as frozen content whatever encoding the server stores it in.
+    if (this._sealedRoots !== null) {
+      this._frozenShown = frozenPreview(content, tailOpBlobs);
+      this._frozenVersion = effectiveVersion;
+      this._sealedRoots.resync();
+      this._fireSubscribers({ kind: 'history', version: effectiveVersion });
+      await this._checkoutOpenStreams(generation);
+      return;
+    }
     // Materialise the preview into a fresh LoroDoc. The previous
     // checkout's preview LoroDoc, if any, is freed.
-    const previewDoc = new LoroDoc();
-    if (snapshotBytes !== null) previewDoc.import(snapshotBytes);
-    for (const blob of tailOpBlobs) previewDoc.import(blob);
+    const previewDoc = engineFrom(content);
+    for (const blob of tailOpBlobs) importTailOp(previewDoc, blob);
     const previewRoot = previewDoc.getMap(this._rootKey);
     const old = this._checkout;
     // Snapshot the handles' keys before the active-source pointer moves (see
@@ -1660,7 +2577,7 @@ export class Document {
     // container captured at attach time (the OLD preview's); freeing first
     // would run that detach against a freed LoroDoc. This is the same
     // teardown-before-free order `close()` documents.
-    if (old && old.previewDoc !== this._doc) {
+    if (old && old.previewDoc !== this._engine) {
       try {
         old.previewDoc.free();
       } catch {
@@ -1729,6 +2646,14 @@ export class Document {
     // `_checkout` still null, and this is the signal that supersedes it when
     // it resolves.
     const generation = (this._checkoutGeneration += 1);
+    if (this._sealedRoots !== null && this._frozenVersion !== null) {
+      this._frozenShown = this._frozenHead;
+      this._frozenVersion = null;
+      this._sealedRoots.resync();
+      this._fireSubscribers({ kind: 'return-to-head' });
+      this._returnOpenStreams(generation);
+      return;
+    }
     if (this._checkout === null) return;
     const old = this._checkout;
     // Symmetric with `_checkoutVersion`: snapshot before the active-source
@@ -1742,7 +2667,7 @@ export class Document {
     // Free the preview only after the rebind: `_rebindRootHandles` detaches
     // each subscriber against the preview container it was attached to, so
     // freeing first would be a use-after-free (see `_checkoutVersion`).
-    if (old.previewDoc !== this._doc) {
+    if (old.previewDoc !== this._engine) {
       try {
         old.previewDoc.free();
       } catch {
@@ -1751,9 +2676,13 @@ export class Document {
     }
     this._fireSubscribers({ kind: 'return-to-head' });
     this._maybeFireUndoState();
-    // Return every opened stream to its live head too, symmetric with the
-    // checkout path. Fire-and-forget (returnToHead is synchronous and has no
-    // fetch): a stream not previewing is a no-op.
+    this._returnOpenStreams(generation);
+  }
+
+  // Return every opened stream to its live head too, symmetric with the
+  // checkout path. Fire-and-forget (returnToHead is synchronous and has no
+  // fetch): a stream not previewing is a no-op.
+  private _returnOpenStreams(generation: number): void {
     this._checkoutStreamSeqs = null;
     for (const openPromise of this._streamOpens.values()) {
       void openPromise
@@ -1778,7 +2707,20 @@ export class Document {
   // and the caller moves the active-source pointer between the two calls.
   // Callers must not return early in that window; a snapshot left unconsumed
   // would be diffed against a later, unrelated swap.
+  // Detach every cached root handle's live subscriptions. Reached only on a
+  // CRDT document: the teardown, the key snapshot and the rebind below are
+  // `handles.ts`'s own internal protocol, spoken by the handles it produces,
+  // and a stored record set's roots hold no container subscription to detach,
+  // no anchor to re-point and no prior keys to diff against a swap.
+  private _teardownRootHandles(): void {
+    for (const entry of this._rootHandles.values()) {
+      if (entry.kind === 'text') entry.handle._teardown();
+      else teardownRootHandle(entry.handle);
+    }
+  }
+
   private _snapshotRootHandleKeys(): void {
+    if (this._sealedRoots !== null) return;
     for (const entry of this._rootHandles.values()) {
       if (entry.kind === 'map') snapshotRootMapKeys(entry.handle);
     }
@@ -1791,6 +2733,7 @@ export class Document {
   // `getMap` / `getList` are get-or-create, so a container absent in the
   // preview resolves to an empty one and its subscribers redraw to empty.
   private _rebindRootHandles(source: LoroDoc): void {
+    if (this._sealedRoots !== null) return;
     // Two passes, not one per handle: rebind every anchor to the new source
     // first, then resync. A composed handle can read a sibling root while
     // firing (the ordered map reads its order list during its map redraw), so
@@ -1980,13 +2923,11 @@ export class Document {
   // both alongside the publish-over that `pushToDrive` does. Driven by the
   // hosted toolbar.
   //
-  // Unlike `pushToDrive`, the resolution can mint a NEW mirror doc that
-  // takes over the drive link (take-source trashes this doc, keep-both
-  // detaches it into a standalone fork). For a session-backed app the
-  // SDK re-opens onto that new doc automatically (the resolver routes it
-  // through the same `openSiblingDoc` path the history fork uses); the
-  // returned `newDocId` lets a multi-doc app do its own switch. Resolves
-  // with the outcome, or `null` when the user dismissed the dialog.
+  // Taking the drive's version keeps this document's id: the open copy moves
+  // onto that version when it lands (`onGone('moved')`, which a session
+  // re-opens). A `newDocId` in the result is opened through the same
+  // `openSiblingDoc` path the history fork uses. Resolves with the outcome,
+  // or `null` when the user dismissed the dialog.
   // Throws when there is no doc identity or no resolver is attached.
   /** @internal */
   async resolveDrive(): Promise<DriveResolveResult | null> {
@@ -2003,20 +2944,8 @@ export class Document {
   }
 
   // Fetch the file a document was uploaded as: a short-lived presigned GET
-  // plus the file's name / content type / size. An app that knows the format
-  // fetches the bytes from `url`, parses them, and writes the structured
-  // content into this document through the normal handle surface
-  // (`doc.map('instances').mutate(...)`):
-  //
-  //   const src = await doc.sourceBlob();
-  //   const bytes = new Uint8Array(await (await fetch(src.url)).arrayBuffer());
-  //   const records = parseMyFormat(bytes); // app's own parser
-  //   doc.map('instances').mutate((m) => { for (const r of records) m[r.id] = r; });
-  //
-  // A source file is a set of one or more streams: `src.streams` lists
-  // every stream (primary first, so a single-stream file has one entry),
-  // each with its own URL, so a multi-stream format (a glTF with its
-  // `.bin` buffer) fetches only the streams it needs.
+  // plus the file's name / content type / size. The document's content is
+  // what its importer returned for this file, sealed by the platform.
   //
   // Rejects with a `BrassError` when the document holds no such file, or
   // the caller cannot reach it (both 404).
@@ -2117,23 +3046,24 @@ export class Document {
             `doc.getOrCreateStream(${JSON.stringify(name)}) makes one.`,
         );
       }
-      // Only a CRDT stream opens as live collaborative state. Any other
-      // value fails loudly here rather than joining a line that is not
-      // one, so a format added after this SDK shipped is refused by the
-      // version that cannot read it.
+      // Every stream the platform writes is a document line and reports
+      // `'crdt'`, whether it is stored as a CRDT or frozen. Any other value
+      // names a kind this version does not know, so it is refused rather
+      // than joined as a line.
       if (info.format !== 'crdt') {
         throw new Error(
           `Stream "${name}" has format "${info.format}", which this ` +
-            'SDK version cannot open as a live stream.',
+            'SDK version cannot open.',
         );
       }
       const inner = await runtime.openLine(info.line_id);
+      inner._joinUndoGroup(this._undoGroup);
       const stream = new DocumentStream(name, inner, true);
       try {
         // Opened while a version preview is active: bring the new stream to
         // the same point in time rather than showing it live under a
         // historical default.
-        if (this._checkout !== null) {
+        if (this._previewVersion !== null) {
           await stream._previewAt(this._checkoutStreamSeqs?.[info.line_id], true);
         }
       } catch (err) {
@@ -2163,6 +3093,9 @@ export class Document {
         // to the document has to hear the stream's writes land.
         stream._inner._observeSavingCount(() => {
           this._fireSubscribers({ kind: 'saving-count' });
+        });
+        stream._inner._observeConnectionNotice((kind) => {
+          this._showConnectionNotice(kind);
         });
         if (this._suspended) stream._suspend();
       },
@@ -2251,6 +3184,7 @@ export class Document {
     // transport about to be torn down and is never persisted.
     for (const stream of this._openStreams.values()) {
       stream._inner._observeSavingCount(null);
+      stream._inner._observeConnectionNotice(null);
       stream._close();
     }
     // An open still in flight has no Document to close yet, so it closes on
@@ -2282,17 +3216,20 @@ export class Document {
     }
   }
 
-  // Seal a deliberate checkpoint on this document's version-
-  // history timeline. Compaction snapshots continue to appear as
-  // no-action fallback markers, so an app that never calls this still
-  // gets a usable history.
-  //
-  // Anchors to `doc.currentSeq` synchronously, so a concurrent
-  // editor's op landing mid-call cannot shift the anchor. Pass an
-  // explicit `version` to seal at a different point in history (the
-  // server validates it's `<=` the branch's live head).
-  async createCheckpoint(): Promise<DocumentCheckpoint> {
-    return this._checkpoints.create();
+  // Mark the end of a user action: seals the undo step at once, and records a
+  // version-history marker covering this call (calls made while a write is
+  // in flight share the next one, written at the latest state). Call it
+  // after every action and do not await it in the action's handler.
+  // Resolves once the marker covering the call is written. While `readOnly`
+  // is true it writes nothing and resolves at once (as `undo` / `redo` do
+  // nothing there).
+  createCheckpoint(): Promise<void> {
+    if (this._isLive && this.readOnly) return Promise.resolve();
+    const written = this._checkpoints.create().then(() => undefined);
+    // Apps call this without awaiting it; a rejection still reaches a caller
+    // that awaits.
+    written.catch(() => {});
+    return written;
   }
 
   // Configure the implicit auto-checkpoint debounce. Default is 60s
@@ -2322,6 +3259,25 @@ export class Document {
   _setName(name: string | null): void {
     if (this._name === name) return;
     this._name = name;
+    this._fireSubscribers({ kind: 'commands' });
+  }
+
+  /** When Brass will remove this document, or `null` when it is kept. Set
+   *  for a document created while signed out; a sign-in claims it and the
+   *  claimed document reads `null`. */
+  get expiresAt(): Date | null {
+    return this._expiresAt;
+  }
+
+  /** @internal */
+  _setExpiresAt(expiresAt: Date | null): void {
+    const same =
+      (this._expiresAt === null && expiresAt === null) ||
+      (this._expiresAt !== null &&
+        expiresAt !== null &&
+        this._expiresAt.getTime() === expiresAt.getTime());
+    if (same) return;
+    this._expiresAt = expiresAt;
     this._fireSubscribers({ kind: 'commands' });
   }
 
@@ -2392,6 +3348,13 @@ export class Document {
     else console.error('[Brass]', err);
   }
 
+  // The console keeps the original stack for the developer; the app's
+  // `onError` gets a sentence it can show the reader.
+  private _reportSubscriberThrow(err: unknown): void {
+    console.error('[Brass] subscriber threw:', err);
+    if (this._errorReporter) this._errorReporter(appCallbackError(err));
+  }
+
   /** @internal Report a failure from the SDK's own chrome (the version
    * bar's intents) through the same sink the built-in commands use, so a
    * refused checkout reaches the app's `onError` rather than being dropped
@@ -2416,6 +3379,9 @@ export class Document {
       // itself, so the registry's total already carries one entry per stream.
       trackUnsavedWork(this, this._outstandingByClientId.size);
       this._savingCountObserver?.();
+      if (this._workStatus.notice !== null && this.savingCount === 0) {
+        this._workStatus.setNotice(null);
+      }
     }
     this._ensureLoroSubscribed();
     this._subs.emit(event);
@@ -2537,8 +3503,9 @@ export class Document {
   // Returns true if the clientOpId was tracked (lets the caller detect
   // a stale ack).
   /** @internal */
-  resolveOutstandingOp(clientOpId: string): boolean {
+  resolveOutstandingOp(clientOpId: string, seq?: number): boolean {
     const wasTracked = this._outstandingByClientId.delete(clientOpId);
+    this._provisionalInputs.acked(clientOpId, seq);
     // Release this chunk from the resync-push loop guard once its op is
     // acked: the pushed op is now in the log, so the next handshake's
     // tail covers it and a fresh push is welcome (it would be a genuine
@@ -2566,7 +3533,7 @@ export class Document {
   // grant restored afterwards is refused by the server too until the
   // connection recycles, and a reopen is what picks the wider grant up.
   /** @internal */
-  _markReadOnly(reason: ReadOnlyReason): void {
+  _markReadOnly(reason: ForcedReadOnlyReason): void {
     if (this._forcedReadOnly) return;
     this._forcedReadOnly = true;
     this._readOnlyReason = reason;
@@ -2590,8 +3557,187 @@ export class Document {
    * telling the reader first, because an app that renders nothing for it is
    * exactly the case that must not leave someone on a diverged copy.
    */
-  reload(): void {
+  _reopen(): void {
     this._markGone('moved');
+  }
+
+  /** @internal The app registered its importer, so inputs whose open stopped
+   *  waiting for it run again. */
+  _importerRegistered(): void {
+    this._inputFollowers.importerRegistered();
+  }
+
+  /**
+   * @internal Typed on `ReadOnlyDocument`. A frozen copy loads the document as
+   * it stands now, in place: the handles stay the same and their subscribers
+   * are told what changed. A live read-only copy already holds the document as
+   * it stands, so there is nothing to load. An editable copy is reopened
+   * (`_reopen`).
+   */
+  reload(): Promise<void> {
+    this._assertOpen();
+    const reloader = this._frozenReloader;
+    if (reloader === null) {
+      if (!this.readOnly) this._reopen();
+      return Promise.resolve();
+    }
+    // One reload at a time: a call while one runs shares it, since both ask
+    // for the document as it stands once it lands.
+    if (this._reloading !== null) return this._reloading;
+    const run = (async () => {
+      try {
+        // Cleared before the join, so a change landing during it is reported
+        // against the load it may or may not have reached.
+        this._changed = false;
+        this._stopChangeNotice?.();
+        this._stopChangeNotice = null;
+        await reloader();
+      } finally {
+        this._reloading = null;
+        if (!this._closed && (this._changedListeners.size > 0 || this._statusWatches > 0)) {
+          this._watchForChange();
+        }
+      }
+    })();
+    this._reloading = run;
+    return run;
+  }
+
+  /**
+   * Opens this document again in another mode, on the same branch. With no
+   * options the new copy is editable; `{ readOnly: true }` follows other
+   * people's edits with nothing on it that writes; `{ frozen: true }` keeps
+   * what it loaded until `reload()`. Resolves with this document when it is
+   * already in that mode, and otherwise with the new copy, closing this one.
+   *
+   * Rejects with a `BrassError` (status 403), without a request, when the
+   * reader may not edit and the reopen asks for an editable copy. Leaving an
+   * editable copy first waits for its changes to save, and rejects, keeping
+   * this copy open, when they do not.
+   */
+  reopen(options: { frozen: true; readOnly?: true }): Promise<ReadOnlyDocument>;
+  reopen(options: { readOnly: true; frozen?: false }): Promise<ReadOnlyDocument>;
+  reopen(options?: { readOnly?: false; frozen?: false }): Promise<OpenedDocument>;
+  reopen(options: OpenModeOptions): Promise<OpenedDocument | ReadOnlyDocument>;
+  async reopen(options?: {
+    readOnly?: boolean;
+    frozen?: boolean;
+  }): Promise<OpenedDocument | ReadOnlyDocument> {
+    this._assertOpen();
+    if (options?.frozen === true && options.readOnly === false) {
+      throw new TypeError('reopen: a frozen copy is read-only, so `readOnly: false` cannot apply');
+    }
+    const mode: ReopenMode =
+      options?.frozen === true ? 'frozen' : options?.readOnly === true ? 'read' : 'edit';
+    const pending = this._pendingReopen;
+    if (pending !== null) {
+      if (pending.mode === mode) return pending.promise;
+      // The later mode wins: the earlier call rejects and the copy it opens is
+      // reopened in this mode, so every copy opened is either returned or closed.
+      pending.superseded = true;
+      return this._trackReopen(mode, async () => {
+        const earlier = await pending.result.catch(() => null);
+        if (earlier !== null) {
+          return earlier.reopen(
+            mode === 'frozen' ? { frozen: true } : { readOnly: mode === 'read' },
+          ) as Promise<OpenedDocument>;
+        }
+        const reopener = this._reopenerFor(mode);
+        if (reopener === null) return this as unknown as OpenedDocument;
+        return this._runReopen(mode, reopener);
+      });
+    }
+    const reopener = this._reopenerFor(mode);
+    if (reopener === null) return this as unknown as OpenedDocument;
+    return this._trackReopen(mode, () => this._runReopen(mode, reopener));
+  }
+
+  // The layer that reopens this copy in `mode`, or `null` when it is already
+  // in that mode. Throws when it cannot be reopened so.
+  private _reopenerFor(mode: ReopenMode): ((mode: ReopenMode) => Promise<OpenedDocument>) | null {
+    // A copy showing a historical version is not at the head in any mode, so
+    // every reopen loads the head.
+    // A copy locked over a refused change shows something the platform does
+    // not, so even a reopen to read builds a new one.
+    const diverged = this._forcedReadOnly && this._readOnlyReason === 'unsaved';
+    if (mode === this._openMode && this._previewVersion === null && !diverged) {
+      return null;
+    }
+    if (mode === 'edit') {
+      const refusal = this._editRefusal;
+      if (refusal !== null) throw new BrassError(refusal, { status: 403 });
+    }
+    const reopener = this._reopener;
+    if (reopener === null) {
+      throw new BrassError('This document cannot be reopened', { status: 0 });
+    }
+    return reopener;
+  }
+
+  private async _runReopen(
+    mode: ReopenMode,
+    reopener: (mode: ReopenMode) => Promise<OpenedDocument>,
+  ): Promise<OpenedDocument> {
+    if (this._openMode === 'edit') {
+      // A reopen called from inside a `mutate` callback runs before that
+      // mutation commits, so the wait starts once it has.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (!(await whenSaved(this))) {
+        throw new BrassError('Changes to this document have not finished saving', {
+          status: 0,
+        });
+      }
+    }
+    return reopener(mode);
+  }
+
+  // Records `run` as the reopen in flight, which a second call to the same
+  // mode shares and a call to another mode supersedes. `reopening` holds until
+  // the last overlapping reopen settles.
+  private _trackReopen(
+    mode: ReopenMode,
+    run: () => Promise<OpenedDocument>,
+  ): Promise<OpenedDocument> {
+    this._setReopening(true);
+    const entry = { mode, superseded: false } as PendingReopen;
+    this._pendingReopen = entry;
+    entry.result = run().finally(() => {
+      if (this._pendingReopen !== entry) return;
+      this._pendingReopen = null;
+      this._setReopening(false);
+    });
+    entry.promise = entry.result.then((next) => {
+      if (entry.superseded) {
+        throw new BrassError('The reopen was replaced by a later reopen', { status: 0 });
+      }
+      return next;
+    });
+    return entry.promise;
+  }
+
+  private _setReopening(reopening: boolean): void {
+    if (this._reopening === reopening) return;
+    this._reopening = reopening;
+    if (!this._isLive) return;
+    this._fireSubscribers({ kind: 'commands' });
+    this._maybeFireUndoState();
+  }
+
+  /** @internal Which of the three open modes this copy is in. */
+  get _openMode(): ReopenMode {
+    if (this._frozenReloader !== null) return 'frozen';
+    return this._forcedReadOnly ? 'read' : 'edit';
+  }
+
+  /** @internal Install what `reopen` calls. */
+  _setReopener(reopener: ((mode: ReopenMode) => Promise<OpenedDocument>) | null): void {
+    this._reopener = reopener;
+  }
+
+  /** @internal What `reopen` calls, so a layer that takes over this copy can
+   *  fall back to the one it replaced. */
+  get _reopenerFn(): ((mode: ReopenMode) => Promise<OpenedDocument>) | null {
+    return this._reopener;
   }
 
   // Internal: forget an outstanding op the server TERMINALLY rejected (an
@@ -2615,6 +3761,7 @@ export class Document {
   ): boolean {
     const wasTracked = this._outstandingByClientId.delete(clientOpId);
     this._resyncPushClientOpIds.delete(clientOpId);
+    this._provisionalInputs.failed(clientOpId);
     if (wasTracked) {
       this._fireSubscribers({ kind: 'saving-count' });
       if (opts.report !== false) this._reportError(new Error(message));
@@ -2675,6 +3822,8 @@ export class Document {
 
   private _ensureLocalUpdatesSubscribed(): void {
     if (this._unsubLocal) return;
+    // Frozen content takes no write, so there is no local update to send.
+    if (this._sealedRoots !== null) return;
     if (!this._localOpHook) {
       this._reportTransportUnavailable();
       return;
@@ -2684,23 +3833,28 @@ export class Document {
     // does NOT trigger this callback, so we don't risk feeding the
     // same op back to the server in a loop.
     this._unsubLocal = this._doc.subscribeLocalUpdates((bytes: Uint8Array) => {
-      const hook = this._localOpHook;
-      if (!hook) return;
-      // Copy: Loro reuses its internal buffer across callback calls in
-      // some builds. Hand the consumer a stable view so the eventual
-      // WS send sees the correct bytes regardless of when the send
-      // actually flushes (the WS client may queue the frame).
-      const copy = new Uint8Array(bytes.byteLength);
-      copy.set(bytes);
-      const chunks = this.splitLocalUpdate(copy);
-      if (chunks === null) {
-        this._shipLocalOp(copy);
-        return;
-      }
-      // In order: each chunk continues the one before it, so a peer applying
-      // them out of sequence holds the tail unapplied until the gap closes.
-      for (const chunk of chunks) this._shipLocalOp(chunk);
+      // A replay's commits ship together once it ends (`_replayUndo`).
+      if (this._replayingUndo) return;
+      this._shipLocalUpdate(bytes);
     });
+  }
+
+  private _shipLocalUpdate(bytes: Uint8Array): void {
+    if (!this._localOpHook) return;
+    // Copy: Loro reuses its internal buffer across callback calls in
+    // some builds. Hand the consumer a stable view so the eventual
+    // WS send sees the correct bytes regardless of when the send
+    // actually flushes (the WS client may queue the frame).
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    const chunks = this.splitLocalUpdate(copy);
+    if (chunks === null) {
+      this._shipLocalOp(copy);
+      return;
+    }
+    // In order: each chunk continues the one before it, so a peer applying
+    // them out of sequence holds the tail unapplied until the gap closes.
+    for (const chunk of chunks) this._shipLocalOp(chunk);
   }
 
   // Hand one op blob to the transport and count it as unsaved, or keep it
@@ -2723,6 +3877,7 @@ export class Document {
     if (this._gone.reason !== null) return null;
     const clientOpId = hook(copy);
     this._outstandingByClientId.set(clientOpId, copy);
+    this._shipCapture?.push(clientOpId);
     // The local mutate has already fired `subscribe` (the Loro
     // event), but `savingCount` just incremented; fire one more
     // synthetic event so a subscribe handler bound on `savingCount`
@@ -2747,6 +3902,8 @@ export class Document {
     // it: close set it to null.
     if (this._closed) return;
     if (this._unsubLoro) return;
+    // Frozen roots deliver their own subscribers; there is no engine to hear.
+    if (this._sealedRoots !== null) return;
     this._unsubLoro = this._doc.subscribe((event) => {
       // One channel: every event reaches every subscriber, whatever
       // produced it. The app reconciles by value and reads the cause off
@@ -2758,10 +3915,14 @@ export class Document {
       // build on them, which pins the storage engine through a surface that
       // never promised it. The cause survives as `source`, the same
       // engine-neutral vocabulary the handle surface reports.
-      this._subs.emit({
-        kind: 'change',
-        source: changeSourceOf(event),
-      } satisfies SyntheticSubscribeEvent);
+      if (this._replayingUndo) {
+        this._replayChange = changeSourceOf(event);
+      } else {
+        this._subs.emit({
+          kind: 'change',
+          source: changeSourceOf(event),
+        } satisfies SyntheticSubscribeEvent);
+      }
       const isLocalCommit = (event as { by?: unknown }).by === 'local';
       this._maybeFireUndoState();
       // A local commit (mutate / undo / redo) schedules a debounced
@@ -2832,7 +3993,11 @@ export class Document {
   // suspend like every other app-side subscriber.
   subscribeUndoState(cb: UndoStateSubscriber): DocumentUnsubscribe {
     this._assertOpen();
-    this._ensureLoroSubscribed();
+    // A copy that cannot write never has anything of its own to undo (the
+    // reason it cannot write does not lift while it is open), so it does not
+    // listen to its own engine. A stream of the document can still take
+    // writes, and reports them through the undo group.
+    if (!this._forcedReadOnly) this._ensureLoroSubscribed();
     this._undoStateSubs.add(cb);
     // Fire immediately with current state so the consumer does
     // not need separate initial-paint code. Capture the values
@@ -2859,7 +4024,13 @@ export class Document {
   // Internal: fire `_undoStateSubs` if canUndo / canRedo flipped.
   // Called from `_ensureLoroSubscribed`'s event dispatch.
   private _maybeFireUndoState(): void {
+    // A stream's undo state is its document's: whatever moved here (a write
+    // landing, the stream turning read-only) re-reads the document's.
+    if (!this._undoGroup.isOwner(this)) this._undoGroup.changed();
     if (this._undoStateSubs.size === 0) return;
+    // A step can replay as several commits, and each fires a Loro event
+    // before the stacks settle; `_replayUndo` fires once at the end.
+    if (this._replayingUndo) return;
     const canUndo = this.canUndo();
     const canRedo = this.canRedo();
     if (canUndo === this._lastCanUndo && canRedo === this._lastCanRedo) {
@@ -2902,31 +4073,264 @@ export class Document {
     return this._gone.on(cb);
   }
 
-  // The latest opaque work-status for this document, or `null` when no
-  // slow server-side work is in flight. An app renders `message`
-  // verbatim, draws a bar from `progress` when present, and shows a
-  // waiting state while `pending`. When a freshly-opened drive-linked
-  // doc is still hydrating, `open()` surfaces the initial `pending`
-  // status here; subsequent phases arrive via `onStatus`.
+  /** What the importer reported about the file this document was read
+   *  from, as the open found it. `null` on a document no import produced and
+   *  on a clean import. */
+  get importReport(): ImportReport | null {
+    return this._importReport;
+  }
+
+  /** @internal Seeded from the join. */
+  _setImportReport(report: ImportReport | null): void {
+    this._importReport = report;
+  }
+
+  /** @internal On a frozen open: whether the document has moved since this
+   *  copy last loaded. False on every other open, which applies changes as
+   *  they come. */
+  get changed(): false {
+    return this._changed as false;
+  }
+
+  /** @internal On a frozen open, fires when the copy learns the document
+   *  moved since it last loaded (a content edit, an import landing or
+   *  failing, the document being deleted): once per load, and again after a
+   *  `reload()` once the document moves past what that load brought. Never
+   *  fires on any other open. The document is watched only while a listener is
+   *  registered and until the copy is closed. */
+  onChanged(cb: () => void): () => void {
+    this._assertOpen();
+    this._changedListeners.add(cb);
+    if (this._changed) {
+      queueMicrotask(() => {
+        if (!this._closed && this._changed && this._changedListeners.has(cb)) cb();
+      });
+    } else {
+      this._watchForChange();
+    }
+    return () => {
+      this._changedListeners.delete(cb);
+      this._unwatchIfIdle();
+    };
+  }
+
+  private _unwatchIfIdle(): void {
+    if (this._changedListeners.size === 0 && this._statusWatches === 0) {
+      this._stopChangeNotice?.();
+      this._stopChangeNotice = null;
+    }
+  }
+
+  private _watchForChange(): void {
+    if (this._stopChangeNotice === null && this._changeNotice !== null) {
+      this._stopChangeNotice = this._changeNotice(() => this._markChanged());
+    }
+  }
+
+  /**
+   * Calls the handlers with the input files of `key`. `loaded` gets every
+   * file on each subscribe, then each new version, on any copy. `changed`
+   * gets the files changed since this document last read them, on a copy
+   * that can edit, each recorded as read off the Undo stack once its handler
+   * resolves. `removed` gets each file that left. Calls for one file never
+   * overlap. Subscriptions to one key share one set of calls, and each
+   * subscription's handlers are called for every input; a `changed` input is
+   * recorded as read once all of them resolve. Returns an unsubscribe.
+   */
+  subscribeInputDocuments(
+    key: string,
+    handlers: InputDocumentHandlers,
+    options?: InputDocumentOptions,
+  ): () => void {
+    this._assertOpen();
+    if (handlers === null || typeof handlers !== 'object') {
+      throw new TypeError('subscribeInputDocuments: pass an object of handlers');
+    }
+    if (!isInputKey(key)) throw new TypeError(`subscribeInputDocuments: "${String(key)}" is not a valid key`);
+    const named = handlers as Record<string, unknown>;
+    if (!['loaded', 'changed', 'removed', 'status', 'settled'].some((name) => typeof named[name] === 'function')) {
+      throw new TypeError('subscribeInputDocuments: handlers must include loaded, changed, removed, status or settled');
+    }
+    const hub = this._inputStatus();
+    return this._inputFollowers.subscribe(
+      {
+        subscribeStatus: (k, cb) => hub.subscribeKey(k, cb),
+        canWrite: () => !this._closed && !this.readOnly,
+        markRead: (status, options) => this.markRead(status, options),
+        open: this._inputsRuntime?.open ?? null,
+      },
+      key,
+      handlers,
+      options,
+    );
+  }
+
+  /**
+   * @internal Calls `cb` with the status of `key` once it is read, and again
+   * whenever it changes: an input file was added, modified or removed, the
+   * key's references changed, or this document's read marks moved (an Undo
+   * of `markRead` included, which reports at once). Returns an unsubscribe.
+   */
+  subscribeInputStatus(key: string, cb: (status: InputStatus) => void): () => void {
+    this._assertOpen();
+    if (typeof cb !== 'function') throw new TypeError('subscribeInputStatus: pass a callback');
+    if (!isInputKey(key)) throw new TypeError(`subscribeInputStatus: "${String(key)}" is not a valid key`);
+    return this._inputStatus().subscribeKey(key, cb);
+  }
+
+  /** @internal Wired by the SDK's open factory. */
+  _setInputsRuntime(runtime: InputsStatusRuntime | null): void {
+    this._inputsRuntime = runtime;
+  }
+
+  /** @internal The platform moved `key`'s status to `rev`; both null after a
+   *  resubscribe, which may have missed a nudge for any key. */
+  _inputStatusNudged(key: string | null, rev: number | null): void {
+    this._inputStatusHub?.nudged(key, rev);
+  }
+
+  private _inputStatus(): InputStatusHub {
+    if (this._inputStatusHub !== null) return this._inputStatusHub;
+    const runtime = this._inputsRuntime;
+    if (runtime === null) {
+      throw new Error('subscribeInputStatus: Document has no server identity. Opened via the SDK factory?');
+    }
+    this._inputStatusHub = new InputStatusHub({
+      runtime,
+      lineId: () => this._branchId,
+      localRoots: () => this._inputsLocalRoots(),
+      watchLocalRoots: (cb) => this._watchInputsRoots(cb),
+    });
+    return this._inputStatusHub;
+  }
+
+  // The reserved roots' plain values. A root nobody has written is read as
+  // empty without asking the engine for it, since asking creates it.
+  private _inputsLocalRoots(): InputsLocalRoots | null {
+    if (this._sealedRoots !== null || this._closed) return null;
+    const engine = this._doc;
+    const present = engine.getShallowValue() as Record<string, unknown>;
+    return {
+      refs: INPUTS_REFS_ROOT in present ? engine.getMap(INPUTS_REFS_ROOT).toJSON() : {},
+      read: INPUTS_READ_ROOT in present ? engine.getMap(INPUTS_READ_ROOT).toJSON() : {},
+    };
+  }
+
+  private _watchInputsRoots(cb: () => void): () => void {
+    if (this._sealedRoots !== null || this._closed) return () => {};
+    const targets = new Set([`cid:root-${INPUTS_REFS_ROOT}:Map`, `cid:root-${INPUTS_READ_ROOT}:Map`]);
+    return this._doc.subscribe((batch) => {
+      if (batch.events.some((event) => targets.has(String(event.target)))) cb();
+    });
+  }
+
+  /** @internal How a frozen copy watches its document: starts watching,
+   *  calls `fire` when the document moves, and returns the stop. */
+  _setChangeNotice(start: ((fire: () => void) => () => void) | null): void {
+    this._changeNotice = start;
+  }
+
+  /** @internal Stops a frozen copy's notice once it has reported a move and
+   *  nobody is waiting on pending work. */
+  _settleChangeNotice(): void {
+    if (!this._changed) return;
+    if (this._statusWatches > 0 && this._workStatus.work?.pending === true) return;
+    this._stopChangeNotice?.();
+    this._stopChangeNotice = null;
+  }
+
+  /** @internal Wire a frozen copy's reload: re-join, apply the result in
+   *  place, and re-point the change notice at what that join brought. */
+  _setFrozenReloader(reload: () => Promise<void>): void {
+    this._frozenReloader = reload;
+  }
+
+  // The notice is spent on its first frame, so the watch stops here: the topic
+  // carries every op of the document, and a copy that already knows it moved
+  // has no use for the rest until it reloads. A copy whose work is still
+  // pending keeps it while an `onStatus` listener waits, because the import
+  // landing moves the document before its terminal status arrives.
+  private _markChanged(): void {
+    if (this._changed || this._closed) return;
+    this._changed = true;
+    this._settleChangeNotice();
+    const listeners = [...this._changedListeners];
+    for (const cb of listeners) {
+      try {
+        cb();
+      } catch (err) {
+        console.error('Brass: an onChanged listener threw', err);
+      }
+    }
+  }
+
+  /**
+   * The work in flight on this document (a new version importing, a drive
+   * sync), or `null` when there is none. Render `message` verbatim, draw a
+   * bar from `progress` when present, and show a waiting state while
+   * `pending`. Later phases arrive through `onStatus`.
+   */
   get status(): DocumentWorkStatus | null {
     return this._workStatus.status;
   }
 
-  // Subscribe to opaque work-status updates. The callback fires on
-  // every phase the server pushes; when `status.pending` flips to
-  // `false` the work is terminal (a success the app reacts to by
-  // re-opening the doc to load the now-available content, or a failure
-  // whose `message` the app shows). Fires once on attach with the
-  // current status when one is already known, so a late subscriber is
-  // not stranded. Returns an unsubscribe.
-  //
-  // The app must not parse `message` or infer phases from it: the
-  // server owns the wording and the lifecycle. This surface exists so
-  // the app can *display* progress, not understand it.
+  // The platform's work status alone, without the SDK's own notice over it.
+  // Every SDK-side decision about whether work is pending reads this, since
+  // the notice describes this client's connection rather than the platform's
+  // work.
+  /** @internal */
+  get _workStatusNow(): DocumentWorkStatus | null {
+    return this._workStatus.work;
+  }
+
+  // Tell the reader their edits are waiting to save, through `status`, while
+  // they wait: on a connection that has not opened (`NEVER_OPENED_NOTICE_MS`),
+  // or on one that leaves an edit unanswered (`UNANSWERED_OP_NOTICE_AFTER`).
+  // The doc transport decides when; the notice clears itself once nothing is
+  // waiting (`_fireSubscribers`). A stream raises it on the document that
+  // opened it as well, since the app renders that document's status.
+  /** @internal */
+  _showConnectionNotice(kind: keyof typeof SAVE_NOTICES = 'never_opened'): void {
+    if (this._closed || this.savingCount === 0) return;
+    this._workStatus.setNotice(SAVE_NOTICES[kind]);
+    this._connectionNoticeObserver?.(kind);
+  }
+
+  private _connectionNoticeObserver: ((kind: keyof typeof SAVE_NOTICES) => void) | null = null;
+
+  /** @internal */
+  _observeConnectionNotice(observer: ((kind: keyof typeof SAVE_NOTICES) => void) | null): void {
+    this._connectionNoticeObserver = observer;
+  }
+
+  /**
+   * Calls `cb` with every work-status update, and once on attach when a
+   * status is already known. `pending: false` marks the work finished, as a
+   * success or as a failure whose `message` the app shows. Returns an
+   * unsubscribe.
+   *
+   * Do not parse `message` or infer phases from it: its wording changes
+   * without an SDK release.
+   */
   onStatus(cb: DocumentStatusListener): DocumentStatusUnsubscribe {
     // See `onGone`: guard the cross-session listener leak.
     this._assertOpen();
-    return this._workStatus.on(cb);
+    const stop = this._workStatus.on(cb);
+    // A frozen copy hears the work that was pending when it loaded on its
+    // change notice, which runs only while somebody listens. A live copy's
+    // transport always delivers status.
+    if (this._changeNotice === null || this._workStatus.work?.pending !== true) return stop;
+    this._statusWatches += 1;
+    if (!this._changed) this._watchForChange();
+    let stopped = false;
+    return () => {
+      stop();
+      if (stopped) return;
+      stopped = true;
+      this._statusWatches -= 1;
+      this._unwatchIfIdle();
+      this._settleChangeNotice();
+    };
   }
 
   // Internal: store the latest status and fire listeners. Not
@@ -2935,7 +4339,7 @@ export class Document {
   // final state.
   /** @internal */
   _emitStatus(
-    status: DocumentWorkStatus,
+    incoming: DocumentWorkStatus,
     opts?: {
       // The caller imported the document's content immediately before this
       // emit, so the work delivered what it promised whatever the terminal
@@ -2946,6 +4350,16 @@ export class Document {
     // A late reload/reconcile closure that resolved after `close()` must not
     // re-emit onto a torn-down doc (its undo stack is freed below in `close`).
     if (this._closed) return;
+    // An import in flight holds the document against a settled status from
+    // anywhere else (a late frame for the work that stored the file), because
+    // an edit made before the import lands leaves the file unimportable. A
+    // join reporting the import done clears `_awaitsImport`, which releases
+    // it for a client waiting on another's import.
+    const status =
+      this._importHold !== null && this._awaitsImport && incoming.pending !== true
+        ? this._importHold
+        : incoming;
+    const wasReadOnly = this.readOnly;
     // Terminal work that still reports itself as locking editing is inbound
     // work that ended without content: the platform clears the status when
     // hydration / extraction succeeds, so what it reports terminally is a
@@ -2962,6 +4376,10 @@ export class Document {
     // Refresh the undo-state notifier here so a subscribeUndoState-bound
     // button tracks the lock, not only CRDT edits.
     this._maybeFireUndoState();
+    // An app re-reads `readOnly` in its `subscribe` handler, so a status that
+    // locks or releases a document it has already bound has to reach that
+    // handler, or its edit controls stay as they were.
+    if (this.readOnly !== wasReadOnly) this._fireSubscribers({ kind: 'commands' });
   }
 
   // The current drive sync state of this document, or `null` when the
@@ -3064,7 +4482,241 @@ export class Document {
       this._resyncPushClientOpIds.clear();
       this._fireSubscribers({ kind: 'saving-count' });
     }
+    this._provisionalInputs.clear();
     this._gone.mark(reason);
+  }
+
+  // --- References and read marks -------------------------------------------
+
+  // How many handle `mutate` calls are running, and how many of those asked
+  // to stay off the Undo stack. A commit inside any of them carries the
+  // non-undoable origin, so a write the app asked to keep off the stack does
+  // not reach it through a batch boundary or a nested handle.
+  private _mutateDepth = 0;
+  private _nonUndoableDepth = 0;
+  // `dependsOn` / `markRead` writes waiting for the running mutate to finish.
+  // A mutate can commit several times (`mutate-batching.ts`), and a write
+  // left in the open transaction rides whichever commit comes next, so a
+  // read mark could arrive before the results it acknowledges. Each runs as
+  // a commit of its own after the mutate's last one.
+  private _inputsQueue: InputsWrite[] = [];
+  // The client op ids `_shipLocalOp` mints while a reference commit runs.
+  private _shipCapture: string[] | null = null;
+  private readonly _provisionalInputs = new ProvisionalInputsTracker();
+
+  /**
+   * @internal The document's `updated_at` as this copy read it when it
+   * opened. `markRead` records a document at this value. `null` for a
+   * document not opened from the platform.
+   */
+  get updatedAt(): string | null {
+    return joinStampOf(this) ?? null;
+  }
+
+  /** @internal Where a key's provisional entry is posted once the op
+   *  carrying its change is acknowledged. */
+  _setProvisionalInputsPoster(poster: ProvisionalInputsPoster | null): void {
+    this._provisionalInputs.setPoster(poster);
+    // A post's answer names the key's revision after it, which reads the same
+    // as a nudge: a status behind it fetches the change.
+    this._provisionalInputs.onAnswer(
+      poster === null ? null : (answer) => this._inputStatusNudged(answer.key, answer.rev),
+    );
+  }
+
+  /** @internal Run a handle's mutate, so its commits carry the origin it asked
+   *  for and the reference writes queued inside it commit after it. */
+  _runInMutate(undoable: boolean, fn: () => void): void {
+    // A nested mutate that changes the origin first commits what the enclosing
+    // one has written so far, and commits its own writes before handing back,
+    // so each write reaches the Undo stack per the mutate that made it.
+    const switchesOrigin = !undoable && this._nonUndoableDepth === 0 && this._mutateDepth > 0;
+    if (switchesOrigin) this._commitPendingMutate();
+    this._mutateDepth += 1;
+    if (!undoable) this._nonUndoableDepth += 1;
+    let threw = true;
+    try {
+      fn();
+      threw = false;
+    } finally {
+      if (switchesOrigin) this._commitPendingMutate();
+      this._mutateDepth -= 1;
+      if (!undoable) this._nonUndoableDepth -= 1;
+      if (this._mutateDepth === 0) {
+        const queued = this._inputsQueue;
+        this._inputsQueue = [];
+        // A mutate that threw left its results partly written, so the marks
+        // that acknowledge them are not written either.
+        if (!threw) this._flushInputs(queued);
+      }
+    }
+  }
+
+  private _commitPendingMutate(): void {
+    if (this._doc.getPendingTxnLength() > 0) this._handleOwner.commitMutate();
+  }
+
+  private get _mutateCommitOrigin(): string {
+    return this._nonUndoableDepth > 0 ? NON_UNDOABLE_COMMIT_ORIGIN : MUTATE_COMMIT_ORIGIN;
+  }
+
+  /**
+   * Records the documents `key` depends on, replacing what it held. `null`
+   * removes the key and its read marks. Writes only what differs from this
+   * copy, so a reference another reader adds or removes at the same time
+   * keeps their change. Undoable, as part of the current step, unless called
+   * inside `mutate(fn, { undoable: false })`.
+   */
+  dependsOn(key: string, refs: readonly InputReference[] | null): void {
+    this._handleOwner.assertWritable();
+    if (!isInputKey(key)) throw new TypeError(`dependsOn: "${String(key)}" is not a valid key`);
+    if (refs !== null && !Array.isArray(refs)) {
+      throw new TypeError('dependsOn: refs must be an array of references or null');
+    }
+    const parsed: WireReference[] = [];
+    for (const ref of refs ?? []) {
+      const one = parseInputReference(ref);
+      if (one === null) throw new TypeError('dependsOn: refs holds a value that is not a reference');
+      if (one.extent === 'document' && this._docId !== null && one.doc_id === this._docId) {
+        throw new Error('dependsOn: a document cannot reference itself');
+      }
+      parsed.push(one);
+    }
+    const refusal = this._inputsRuntime?.refusesReferences;
+    if (refusal !== undefined && parsed.length > 0) throw new BrassError(refusal);
+    const next = refs === null ? null : parsed;
+    this._queueInputs(this._nonUndoableDepth === 0, () => {
+      const refsMap = this._doc.getMap(INPUTS_REFS_ROOT);
+      let changed = applyRootWrites(refsMap, inputRefsWrites(rootView(refsMap), key, next));
+      if (next === null) {
+        const readMap = this._doc.getMap(INPUTS_READ_ROOT);
+        changed = applyRootWrites(readMap, inputReadClearWrites(rootView(readMap), key)) || changed;
+      }
+      return changed ? key : null;
+    });
+  }
+
+  /**
+   * @internal Records that this reader read files for the key `status` reports, and
+   * acknowledged the removed files that status lists. With no `files`, every
+   * file the status lists as added or modified is recorded at the version the
+   * status reports. Otherwise each entry of `files` is recorded: an opened
+   * copy at the `updatedAt` it was opened at (left out while its import is
+   * pending, so it stays changed), and an entry of the status's own `files`
+   * or `changed` at the version the status reports. Joins the current Undo
+   * step unless `undoable` is false.
+   */
+  markRead(status: MarkReadStatus, options?: MarkReadOptions): void {
+    this._handleOwner.assertWritable();
+    const key = status?.key;
+    if (!isInputKey(key)) throw new TypeError('markRead: pass the status `subscribeInputStatus` reported');
+    // A list of files passed where the options go would otherwise read as no
+    // files, and record every changed one.
+    if (Array.isArray(options)) throw new TypeError('markRead: pass the files as `{ files }`');
+    const files = options?.files;
+    if (files !== undefined && !Array.isArray(files)) {
+      throw new TypeError('markRead: `files` must be an array');
+    }
+    // The version the status reports for each file, which is what an entry
+    // taken from the status is recorded at: an edit that lands after the
+    // status stays changed.
+    const reported = new Map<string, string>();
+    for (const file of status.inputs ?? []) reported.set(file.doc_id, file.updated_at);
+    const items: ReadonlyArray<MarkReadHandle | MarkReadEntry> =
+      files ?? status.changed.filter((c) => c.change !== 'removed');
+    const reads: Array<{ docId: string; stamp: number }> = [];
+    for (const item of items) {
+      let docId: string | null;
+      let version: string | null;
+      if ('doc_id' in item) {
+        // A removed file is acknowledged from `status.changed` below.
+        if ((item as { change?: string }).change === 'removed') continue;
+        docId = item.doc_id;
+        version = reported.get(docId) ?? null;
+        if (version === null) {
+          throw new TypeError(`markRead: the status reports no version for ${docId}`);
+        }
+      } else {
+        if (item.status?.pending === true) continue;
+        docId = item.id;
+        version = item.updatedAt;
+      }
+      const stamp = typeof version === 'string' ? inputStampFromUpdatedAt(version) : null;
+      if (!isInputDocId(docId) || stamp === null) {
+        throw new TypeError('markRead: each file must be a document opened from Brass or an entry of the status');
+      }
+      reads.push({ docId, stamp });
+    }
+    const removed = status.changed
+      .filter((c) => c.change === 'removed')
+      .filter((c) => isInputDocId(c.doc_id))
+      .map((c) => ({ docId: c.doc_id, leftAt: c.updated_at ?? null }));
+    this._queueInputs(options?.undoable !== false, () => {
+      const readMap = this._doc.getMap(INPUTS_READ_ROOT);
+      const view = rootView(readMap);
+      let changed = false;
+      const write = (docId: string, mark: InputReadMark): void => {
+        const writes = inputReadMarkWrites(view, key, docId, mark);
+        for (const k of writes.delete) delete view[k];
+        Object.assign(view, writes.set);
+        changed = applyRootWrites(readMap, writes) || changed;
+      };
+      for (const { docId, stamp } of reads) {
+        write(docId, inputReadMarkFor(latestReadMark(view, key, docId), stamp));
+      }
+      for (const { docId, leftAt } of removed) {
+        write(docId, inputRemovalMark(latestReadMark(view, key, docId), leftAt));
+      }
+      return changed ? key : null;
+    });
+  }
+
+  private _queueInputs(undoable: boolean, apply: () => string | null): void {
+    const entry: InputsWrite = { undoable, apply };
+    if (this._mutateDepth > 0) {
+      this._inputsQueue.push(entry);
+      return;
+    }
+    this._flushInputs([entry]);
+  }
+
+  // Commit queued reference writes in call order, one commit per run of
+  // writes that share an origin, and wait to post each key they changed.
+  private _flushInputs(entries: readonly InputsWrite[]): void {
+    if (entries.length === 0 || this._readOnlyBecause !== null) return;
+    this._ensureLocalUpdatesSubscribed();
+    let i = 0;
+    while (i < entries.length) {
+      const undoable = entries[i]!.undoable;
+      const keys = new Set<string>();
+      for (; i < entries.length && entries[i]!.undoable === undoable; i += 1) {
+        const key = entries[i]!.apply();
+        if (key !== null) keys.add(key);
+      }
+      if (keys.size === 0) continue;
+      this._shipCapture = [];
+      let shipped: string[];
+      try {
+        this._doc.setNextCommitOrigin(undoable ? MUTATE_COMMIT_ORIGIN : NON_UNDOABLE_COMMIT_ORIGIN);
+        this._doc.commit();
+      } finally {
+        shipped = this._shipCapture;
+        this._shipCapture = null;
+      }
+      if (shipped.length === 0) continue;
+      const state = decodeInputsRoots(
+        this._doc.getMap(INPUTS_REFS_ROOT).toJSON(),
+        this._doc.getMap(INPUTS_READ_ROOT).toJSON(),
+      );
+      for (const key of keys) {
+        this._provisionalInputs.register(
+          key,
+          this._branchId,
+          state.get(key) ?? { refs: [], read: {} },
+          shipped,
+        );
+      }
+    }
   }
 
   /**
@@ -3086,17 +4738,19 @@ export class Document {
    */
   roots(): Record<string, RootKind> {
     this._assertNotClosed();
+    if (this._sealedRoots !== null) return this._sealedRoots.roots();
     const source =
       this._checkout !== null ? this._checkout.previewDoc : this._doc;
     const found: [string, RootKind][] = [];
     for (const [key, containerId] of Object.entries(source.getShallowValue())) {
       const kind = rootKindOf(containerId);
-      if (kind === null) continue;
+      if (kind === null || isReservedRootName(key)) continue;
       // Reading the container's own count, rather than its value, is what
       // keeps this off the projection: an empty collection is skipped without
       // anything being decoded.
       const container = source.getContainerById(containerId);
       if (container === undefined || rootIsEmpty(container)) continue;
+      if (holdsOnlyMarkers(key, container)) continue;
       found.push([key, kind]);
     }
     // Loro reports roots in registration order, which is an accident of who
@@ -3106,26 +4760,23 @@ export class Document {
     return Object.fromEntries(found);
   }
 
-  // Plain-JS projection of the current state.
+  // Plain-JS projection of the current state, leaving out a root that holds
+  // nothing. A CRDT cannot store an empty collection, and the root a Document
+  // registers on open is empty until written, so a projection that kept empty
+  // roots would change shape when the storage swaps in place under a reader.
+  // Every other root stays whatever its kind: the sealed-copy builder reads
+  // this projection to refuse a kind the frozen form cannot carry.
   toJSON(): Record<string, unknown> {
     this._assertNotClosed();
     // When in checkout, read from the preview LoroDoc so the app
     // renders the historical state. Returning to head clears
     // `_checkout` and reads go back to the live `_doc`.
-    const source =
-      this._checkout !== null ? this._checkout.previewDoc : this._doc;
-    const json = source.toJSON() as Record<string, unknown>;
-    // A paged root holds its records inside page entries beside the store's
-    // own edit bookkeeping, so flatten it to the same record lookup
-    // `doc.map(root).read()` hands back: a serializer and a whole-document
-    // renderer read this surface, and a store that crossed the paging
-    // threshold has to reach them as records. Every root is asked, because a
-    // root no handle was ever taken on is paged by the same rule as one that
-    // was; a root the marker does not name comes back as loro produced it.
-    for (const [rootKey, value] of Object.entries(json)) {
-      if (!isRootLookup(value)) continue;
-      if (!readRootPaged(source, rootKey)) continue;
-      json[rootKey] = flattenPagedLookup(value, true);
+    const json =
+      this._sealedRoots !== null
+        ? this._sealedRoots.toJSON()
+        : engineJSON(this._checkout !== null ? this._checkout.previewDoc : this._doc);
+    for (const [key, value] of Object.entries(json)) {
+      if (projectsEmpty(value)) delete json[key];
     }
     return json;
   }
@@ -3155,6 +4806,7 @@ export class Document {
   maybeResyncPush(
     persistedSnapshotVersionVector: Uint8Array,
     durableTailBlobs: Uint8Array[],
+    deliveringBlobs: readonly Uint8Array[] = [],
   ): ResyncPushOutcome {
     // `computeResyncPush` reads `this._doc.version()` / `export()`; refuse on a
     // closed (freed) doc so a late `doc_ops_dropped` / periodic-reverify
@@ -3168,6 +4820,7 @@ export class Document {
     const chunks = this.computeResyncPush(
       persistedSnapshotVersionVector,
       durableTailBlobs,
+      deliveringBlobs,
     );
     if (chunks === 'covered') return 'covered';
     if (chunks === 'undecodable') return 'undecodable';
@@ -3183,14 +4836,15 @@ export class Document {
   // this client holds CRDT knowledge the durable server state lacks,
   // and if so return the update blob that fills exactly those holes.
   //
-  // The durable frontier is the snapshot's version vector advanced by
-  // every tail op the server delivered (those ops are durable in the
-  // log even though no snapshot has absorbed them yet). Comparing the
-  // local doc against the SNAPSHOT vector alone would falsely flag the
-  // whole durable tail as missing and push it back on every join, which
-  // then grows the log and loops; folding the tail in is what keeps the
-  // handshake a no-op in the common "server already has everything"
-  // case. `decodeImportBlobMeta` reads each blob's end vector from its
+  // What the server holds is the snapshot (every author's ops from zero to
+  // its version vector) plus each tail op it served, range by range: a tail
+  // op is durable in the log even though no snapshot has absorbed it. Holding
+  // the tail as ranges rather than folding it into one counter per author is
+  // what sees a hole: a log that lost an author's op and stored that author's
+  // later ones can apply none of them, so the op that fills the hole is
+  // exactly what has to go back. Leaving the tail out altogether would flag
+  // the whole tail as missing and push it back on every join, which grows the
+  // log and loops. `decodeImportBlobMeta` reads each blob's range from its
   // header without a full import, so this stays cheap.
   //
   // Returns the chunks to resync-push, `'covered'` when the durable state
@@ -3201,10 +4855,11 @@ export class Document {
   // nothing about whether the doc has diverged, so a caller healing a known
   // divergence must keep asking.
   //
-  // The common case is one chunk: an `update` export from the durable
-  // frontier carries only the missing ops plus their dependencies, never
-  // the whole history, and a realistic gap is far under the per-frame
-  // cap. When the missing slice exceeds the cap (a BIM-sized edit set:
+  // The common case is one chunk: when each author is missing only its
+  // newest ops, an `update` export carries exactly those, and a realistic
+  // gap is far under the per-frame cap. A hole below ops the server holds
+  // ships as its own `updates-in-range` span, one range per author per blob,
+  // so a blob never re-sends what the server holds. When the missing slice exceeds the cap (a BIM-sized edit set:
   // a geometry import or bulk parametric change discarded then healed, or
   // a large offline divergence on reconnect), it is split into multiple
   // chunks via `updates-in-range` spans, each under the cap, so even a
@@ -3231,7 +4886,7 @@ export class Document {
    * @internal
    */
   _snapshotHasUnseenAuthor(persistedSnapshotVersionVector: Uint8Array): boolean {
-    if (this._closed) return false;
+    if (this._closed || this._sealedRoots !== null) return false;
     let durable: VersionVector;
     try {
       durable = VersionVector.decode(persistedSnapshotVersionVector);
@@ -3251,14 +4906,19 @@ export class Document {
   computeResyncPush(
     persistedSnapshotVersionVector: Uint8Array,
     durableTailBlobs: Uint8Array[],
+    deliveringBlobs: readonly Uint8Array[] = [],
   ): Uint8Array[] | 'covered' | 'undecodable' {
-    let durable: VersionVector;
+    // Frozen content holds no local ops, so the durable frontier covers it.
+    if (this._sealedRoots !== null) return 'covered';
+    let held: HeldRanges;
     try {
-      durable = VersionVector.decode(persistedSnapshotVersionVector);
-      for (const blob of durableTailBlobs) {
-        const meta = decodeImportBlobMeta(blob, false);
-        durable = mergeVersionVectors(durable, meta.partialEndVersionVector);
-      }
+      // An op the transport has only just sent is on its way rather than
+      // missing; counting it as held keeps the handshake from writing a
+      // second copy of it beside the transport's own send.
+      held = durableHoldings(persistedSnapshotVersionVector, [
+        ...durableTailBlobs,
+        ...deliveringBlobs,
+      ]);
     } catch (err) {
       console.warn(
         '[Brass] durability handshake skipped: could not decode the persisted version vector or a tail op blob',
@@ -3267,37 +4927,27 @@ export class Document {
       return 'undecodable';
     }
     const local = this._doc.version();
-    const cmp = local.compare(durable);
-    // `compare` returns -1/0 when local is at or behind the durable
-    // frontier (nothing to push), 1 when local is strictly ahead, and
-    // undefined when the two are concurrent (local holds ops the server
-    // lacks AND vice versa). Push in the ahead and concurrent cases; the
-    // export from `durable` carries only the local-only ops either way.
-    if (cmp !== undefined && cmp <= 0) return 'covered';
-    // Common case: the whole missing slice fits in one frame. Keep this
-    // path byte-identical to a plain `update` export so the no-chunking
-    // case is unchanged.
-    const full = this._doc.export({ mode: 'update', from: durable });
-    if (full.byteLength <= RESYNC_PUSH_MAX_BYTES) return [full];
-    // Large divergence: split the per-peer missing ranges into chunks.
-    return this.chunkMissingSlice(local, durable);
-  }
-
-  // The per-peer ranges local holds beyond `durable`, as half-open
-  // [from, to) counter ranges. `export({ mode: 'update', from })` covers
-  // exactly these ops; we re-express them as `updates-in-range` spans so
-  // they can be split.
-  private missingRanges(
-    local: VersionVector,
-    durable: VersionVector,
-  ): { peer: PeerID; from: number; to: number }[] {
-    const durableMap = durable.toJSON();
-    const ranges: { peer: PeerID; from: number; to: number }[] = [];
-    for (const [peer, to] of local.toJSON()) {
-      const from = durableMap.get(peer) ?? 0;
-      if (to > from) ranges.push({ peer, from, to });
+    const missing = rangesMissingFrom(local, held);
+    if (missing.length === 0) return 'covered';
+    // Common case: each author is missing only its newest ops, which is an
+    // `update` export from a version vector, and the slice fits in one frame.
+    const tails = new Map(missing.map((r) => [r.peer, r]));
+    const localMap = local.toJSON();
+    if (
+      tails.size === missing.length &&
+      missing.every((r) => r.to === localMap.get(r.peer))
+    ) {
+      const from = new Map(localMap);
+      for (const r of missing) from.set(r.peer, r.from);
+      const full = this._doc.export({
+        mode: 'update',
+        from: VersionVector.parseJSON(from),
+      });
+      if (full.byteLength <= RESYNC_PUSH_MAX_BYTES) return [full];
     }
-    return ranges;
+    return oneRangePerAuthor(missing).flatMap((group) =>
+      this.chunkRanges(group, true),
+    );
   }
 
   // Recursively export the given ranges as one `updates-in-range` blob,
@@ -3337,13 +4987,6 @@ export class Document {
       ...this.chunkRanges(first, dropOversizedSingle),
       ...this.chunkRanges(second, dropOversizedSingle),
     ];
-  }
-
-  private chunkMissingSlice(
-    local: VersionVector,
-    durable: VersionVector,
-  ): Uint8Array[] {
-    return this.chunkRanges(this.missingRanges(local, durable), true);
   }
 
   // A local commit re-exported as several op blobs, or null to ship it whole.
@@ -3424,17 +5067,19 @@ export class Document {
     if (this._closed || this._suspended) return;
     this._suspended = true;
     this._setStreamsSuspended(true);
-    // A pending auto-checkpoint would otherwise fire against a parked
-    // Document and silently no-op via the scheduler's guard.
-    // Cancelling here keeps the timer count clean across long-lived
-    // caches and avoids the no-op fetch flush.
-    this._checkpoints.cancelAuto();
+    // Calls still waiting for a marker get one now rather than after the
+    // spacing, and a pending auto-checkpoint is cancelled rather than left to
+    // fire against a parked Document.
+    this._checkpoints.detach();
     this._subs.clear();
     this._undoStateSubs.clear();
     this._gone.clearListeners();
     this._workStatus.clearListeners();
     this._driveStatus.clearListeners();
     this._drivePublishTarget.clearListeners();
+    this._inputFollowers.stopAll();
+    this._inputStatusHub?.dispose();
+    this._inputStatusHub = null;
     // Presence subscribes its OWN WS topic and keeps it alive across a park
     // (resume does not re-create the controller), so drop its app-side
     // change listeners here the same way as the sets above: a parked doc
@@ -3449,9 +5094,11 @@ export class Document {
     // so a subscription an app registered before `close()` would keep firing
     // the app's callback on a doc it has closed. Detaching first stops that;
     // fresh handles are minted on resume + next access.
-    for (const entry of this._rootHandles.values()) {
-      if (entry.kind === 'text') entry.handle._teardown();
-      else teardownRootHandle(entry.handle);
+    // The handles over the ones torn down go with them, so a resumed open is
+    // handed fresh handles like any other.
+    if (this._sealedRoots === null) {
+      this._teardownRootHandles();
+      this._handles.clear();
     }
     this._rootHandles.clear();
     // Drop the ordered-map cache too. Each wrapper holds the specific root
@@ -3494,8 +5141,26 @@ export class Document {
     return this._openEpoch;
   }
 
+  /** @internal Whether the latest join reported the document as its stored
+   *  file with no import run yet. Set by the open layer on every join, so an
+   *  importer can hold the document before its claim goes out. */
+  _awaitsImport = false;
+
+  /** @internal The status an importer holds the document under, or null. */
+  _importHold: DocumentWorkStatus | null = null;
+
+  /** @internal Why this client stopped waiting to import the document, or
+   *  null. */
+  _importAbandoned: string | null = null;
+
   close(): void {
     if (this._closed) return;
+    // Before anything is torn down: the final marker reads the seq and the
+    // unacked-op count this close is about to drop.
+    this._checkpoints.detach();
+    this._stopChangeNotice?.();
+    this._stopChangeNotice = null;
+    this._changedListeners.clear();
     this._closeStreams();
     this._closed = true;
     this._suspended = false;
@@ -3510,6 +5175,10 @@ export class Document {
     if (this._undo) {
       this._undo.free();
       this._undo = null;
+    }
+    if (!this._undoGroup.isOwner(this)) {
+      this._undoGroup.delete(this);
+      this._undoGroup.changed();
     }
     this._thumbnails.destroy();
     this._checkpoints.cancelAuto();
@@ -3528,13 +5197,13 @@ export class Document {
     this._workStatus.clearListeners();
     this._driveStatus.clearListeners();
     this._drivePublishTarget.clearListeners();
+    this._inputFollowers.stopAll();
+    this._inputStatusHub?.dispose();
+    this._inputStatusHub = null;
     // Detach handle subscriptions before freeing the doc (below): a handle's
     // per-container Loro subscription outlives the cache reference, and
     // `_doc.free()` must not run with subscriptions still attached.
-    for (const entry of this._rootHandles.values()) {
-      if (entry.kind === 'text') entry.handle._teardown();
-      else teardownRootHandle(entry.handle);
-    }
+    if (this._sealedRoots === null) this._teardownRootHandles();
     this._rootHandles.clear();
     this._orderedMapHandles.clear();
     // Free a live historical-checkout preview: it is a distinct LoroDoc
@@ -3543,7 +5212,7 @@ export class Document {
     // mirrors `_checkoutVersion` / `returnToHead`: the frozen cold-link case
     // has `previewDoc === _doc`, where `_doc.free()` below already covers it
     // and an unguarded free would double-free.
-    if (this._checkout && this._checkout.previewDoc !== this._doc) {
+    if (this._checkout && this._checkout.previewDoc !== this._engine) {
       try {
         this._checkout.previewDoc.free();
       } catch {
@@ -3554,6 +5223,6 @@ export class Document {
     // Loro's WASM has a `free()` to drop the heap-allocated doc state.
     // Calling it after `close()` invalidates the doc, which is what we
     // want; future mutate/subscribe calls throw above.
-    this._doc.free();
+    this._engine?.free();
   }
 }

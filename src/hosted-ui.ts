@@ -101,6 +101,98 @@ export interface SelectDocumentResult {
   branch_id?: string;
 }
 
+/** What an app passes to `Brass.chooseInputs`. */
+export interface ChooseInputsOptions {
+  /** The references this app already holds. The picker opens with them
+   *  ticked and resolves with the whole set, so replace what you kept with
+   *  the result rather than appending to it. */
+  selected?: readonly InputReference[];
+  /** Narrows the files of those families by name or extension. */
+  accept?: SelectionNarrowing;
+  /** One line naming what the app is asking for. */
+  prompt?: string;
+}
+
+/** What an app passes to `Brass.chooseInput`. */
+export interface ChooseInputOptions {
+  /** The reference this app already holds for this choice. The picker opens
+   *  with that file marked. */
+  selected?: InputReference | null;
+  /** Narrows the files of those families by name or extension. */
+  accept?: SelectionNarrowing;
+  /** One line naming what the app is asking for. */
+  prompt?: string;
+}
+
+/**
+ * One file, folder, project or organization a person chose for this app,
+ * which `doc.dependsOn` records as a reference. A place (`organization`,
+ * `project`, or a folder named by `doc_id`) keeps answering, so a document
+ * filed there later is included; a file is that one document.
+ */
+export interface InputReference {
+  organization_id: string;
+  /** `document` names a file or a folder by `doc_id`. */
+  extent: 'organization' | 'project' | 'document';
+  project_id?: string;
+  doc_id?: string;
+  /** The name the picker showed for this entry when the reader chose it. It
+   *  does not follow a later rename; choosing again returns the new name. */
+  label?: string;
+  /** What the picker a folder, project or organization was chosen in
+   *  offered. Listing the reference includes only the documents it admits, so
+   *  a place chosen in two pickers stays apart. Keep it with the reference. */
+  accept?: SelectionAccept;
+}
+
+/** The families a picker offers, as your manifest's `opens` and `inputs`
+ *  declare them. A family your manifest does not declare offers nothing. */
+export type DocumentFamilies = readonly string[];
+
+/** Narrows the files of the families a request offers. A file passes when
+ *  it matches a name or an extension given. */
+export interface SelectionNarrowing {
+  /** Names to match, case-insensitively, against a document's name and the
+   *  name of the file it was imported from. */
+  names?: readonly string[];
+  /** File extensions, with or without the leading dot. */
+  extensions?: readonly string[];
+}
+
+/** What a picker offered: the families it named, and any narrowing. */
+export interface SelectionAccept extends SelectionNarrowing {
+  /** Absent when the picker offered every family. */
+  families?: readonly string[];
+}
+
+// The `accept` a picker sends, from the families and narrowing an app passed.
+// Throws when the families are missing, since without them the picker would
+// offer everything the app can read, its own documents included.
+function pickerAccept(
+  method: string,
+  families: unknown,
+  narrowing: SelectionNarrowing | undefined,
+): SelectionAccept | undefined {
+  const named =
+    Array.isArray(families) &&
+    families.length > 0 &&
+    families.every((t) => typeof t === 'string' && t.trim() !== '');
+  if (families !== '*' && !named) {
+    throw new Error(
+      `${method}: pass the families to offer first, such as ['ifc']`,
+    );
+  }
+  if (narrowing !== undefined && ('families' in narrowing || 'types' in narrowing)) {
+    throw new Error(`${method}: name the families in the first argument rather than in accept`);
+  }
+  const accept: SelectionAccept = {
+    ...(named ? { families: [...(families as readonly string[])] } : {}),
+    ...(narrowing?.names?.length ? { names: [...narrowing.names] } : {}),
+    ...(narrowing?.extensions?.length ? { extensions: [...narrowing.extensions] } : {}),
+  };
+  return Object.keys(accept).length > 0 ? accept : undefined;
+}
+
 // Result of the hosted create-destination dialog: where a new document goes,
 // plus the chosen name. The dialog resolves a destination only; the SDK does
 // the create itself so the app's credential path stamps `creating_app_id` and
@@ -109,6 +201,7 @@ export interface SelectDocumentResult {
 export interface CreateDestinationResult {
   organization_id: string;
   project_id: string | null;
+  folder_id?: string | null;
   name: string;
 }
 
@@ -177,9 +270,9 @@ export interface ServiceCredentialResult {
 // how a `behind` / `diverged` drive-linked doc was resolved. `null` when
 // dismissed.
 export interface DriveResolveResult {
-  // The fresh mirror doc that took over the link (take-source / keep-both
-  // re-import the remote into a new doc); `null` when publish-over resolved
-  // in place.
+  // A document to switch onto, or `null` when the resolution kept this one:
+  // publish-over, take-source and keep-both all resolve in place, and an open
+  // copy moves onto the drive's version when it lands.
   newDocId: string | null;
 }
 
@@ -208,6 +301,23 @@ export interface HostedUiLauncher {
   // Iframe-only with a `BrassError` reject (a returned value can't survive a
   // redirect fallback).
   selectDocument(): Promise<SelectDocumentResult | null>;
+  // The same picker as a tree of tick boxes, asking which documents this
+  // app has rather than which one to open now. Ticking a folder includes
+  // what is filed there later; ticking a document is that document. What
+  // they choose is their own reach, so every later read is still clamped to
+  // what they can see. Resolves with everything currently chosen.
+  // Iframe-only, same rationale as `selectDocument`.
+  chooseInputs(
+    families: DocumentFamilies,
+    options?: ChooseInputsOptions,
+  ): Promise<InputReference[] | null>;
+  // The same picker as the ordinary Open list, where one press on a file
+  // chooses it. Resolves with that file's reference, or `null` when the
+  // reader closes it.
+  chooseInput(
+    families: DocumentFamilies,
+    options?: ChooseInputOptions,
+  ): Promise<InputReference | null>;
   // The document picker opened straight on its New panel to ask where a new
   // document goes. Used by `Brass.session.create()` when a cold create is
   // ambiguous across multiple orgs, so the user picks rather than the SDK
@@ -271,10 +381,9 @@ export interface HostedUiLauncher {
   // (default selection is the only org, or the first by membership time).
   installApp(organizationId?: string): Promise<InstallAppResult | null>;
   // Hosted drive-divergence resolution (from `Document.resolveDrive()`):
-  // publish over the source, take the source, or keep both. Take-source /
-  // keep-both mint a fresh mirror doc (its id rides the result for the app to
-  // switch onto); publish-over resolves in place (`newDocId: null`). Resolves
-  // with the outcome or `null`. Iframe-only with a `BrassError` reject.
+  // publish over the source, take the source, or keep both, each in place
+  // (`newDocId: null`). Resolves with the outcome or `null`. Iframe-only with
+  // a `BrassError` reject.
   driveResolve(docId: string): Promise<DriveResolveResult | null>;
   // Hosted surface for a service credential this app is waiting on. Whoever
   // can supply it connects the account and admits this app to it; anyone else
@@ -296,10 +405,10 @@ export interface HostedUiLauncherOptions {
   // list; absent leaves it on everything the caller can reach, which is what
   // an app that has not resolved one yet should show.
   actingOrganizationId?: () => string | null;
-  // Threaded into param payloads for surfaces that need it (`installApp`).
-  // Every Brass app shares one sign-in client, so the JWT can't
-  // disambiguate the asking app; the embed page reads `appId` off the bridge.
-  // Optional so non-install fixtures can omit it.
+  // Sent as `appId` in every surface's init. Every Brass app shares one
+  // sign-in client, so the JWT can't name the asking app; the embed page reads
+  // it off the bridge, and checks the framing page may host that app before it
+  // renders. Optional so fixtures can omit it.
   callingAppId?: string;
   // Pins the modal + embed page to a theme. Defaults to `'light'`; pass
   // `'auto'` to follow OS preference. Host apps that force a theme pass it so
@@ -941,16 +1050,16 @@ export function createHostedUiLauncher(
   // would put a dark embed inside a light host on a dark-OS user.
   const theme: HostedUiTheme = opts.theme ?? 'light';
 
-  // Name the user this app is acting as in every surface's bridge params.
-  // Read at open time, not launcher-construction time, since the app may
-  // authenticate after the launcher is built. Every embed surface checks the
-  // same way, so this is cross-cutting rather than per-surface like `appId`.
-  const withActingSub = (
-    params: Record<string, unknown>,
-  ): Record<string, unknown> => {
+  // Name the app and the user it acts as in every surface's bridge params.
+  // The app id is what the embed checks the framing page against, so a
+  // surface opened without it is one whose host goes unchecked. The acting sub
+  // is read at open time, not launcher-construction time, since the app may
+  // authenticate after the launcher is built.
+  const withCaller = (params: Record<string, unknown>): Record<string, unknown> => {
     const actingSub = opts.getActingSub?.();
     return {
       ...params,
+      ...(opts.callingAppId !== undefined ? { appId: opts.callingAppId } : {}),
       ...(actingSub ? { actingSub } : {}),
     };
   };
@@ -959,17 +1068,17 @@ export function createHostedUiLauncher(
   // dismissal, otherwise the payload. `exportDoc` threads the export
   // serializer for the document surfaces whose page offers a Download
   // action.
-  const launch = async <T>(
+  const openSurface = (
     surface: string,
     params: Record<string, unknown>,
     unavailable: UnavailableMode,
     exportDoc?: boolean,
-  ): Promise<T | null> => {
-    const outcome = await openEmbed(
+  ): Promise<EmbedOutcome | null> =>
+    openEmbed(
       baseUrl,
       dashboardOrigin,
       surface,
-      withActingSub(params),
+      withCaller(params),
       unavailable,
       theme,
       exportDoc ? opts.serializeForExport : undefined,
@@ -978,25 +1087,69 @@ export function createHostedUiLauncher(
       opts.onLocalDelete,
       opts.onSignInRequested,
     );
+
+  const launch = async <T>(
+    surface: string,
+    params: Record<string, unknown>,
+    unavailable: UnavailableMode,
+    exportDoc?: boolean,
+  ): Promise<T | null> => {
+    const outcome = await openSurface(surface, params, unavailable, exportDoc);
     if (!outcome) return null;
     return outcome.payload as T;
   };
 
-  // Every Brass app shares one sign-in client, so a request's JWT
-  // does not say which app made it. Surfaces that must name the caller
-  // (its scopes on the install screen, its documents in the picker, the app
-  // a share link should open in) read this off the bridge instead.
-  const callerAppParam = (): Record<string, string> =>
-    opts.callingAppId !== undefined ? { appId: opts.callingAppId } : {};
+  // One input picker at a time. A second call while one is open (a double
+  // press) shares it when it asks the same question, so the reader answers
+  // once and every caller hears that answer; a different question is
+  // refused rather than stacked behind the first. The slot clears on a
+  // reaction registered on the dialog's own promise, ahead of any caller's,
+  // so a call made as soon as the first settles opens a fresh picker.
+  let inputPicker: { key: string; promise: Promise<InputReference[] | null> } | null = null;
+  const pickInputs = (params: Record<string, unknown>): Promise<InputReference[] | null> => {
+    const key = JSON.stringify(params);
+    if (inputPicker) {
+      if (inputPicker.key === key) return inputPicker.promise;
+      return Promise.reject(new BrassError('A document picker is already open.'));
+    }
+    const opened = openSurface('select-document', params, 'reject');
+    const promise = opened.then((outcome) =>
+      outcome ? (outcome.payload as InputReference[]) : null,
+    );
+    const entry = { key, promise };
+    const clear = (): void => {
+      if (inputPicker === entry) inputPicker = null;
+    };
+    opened.then(clear, clear);
+    inputPicker = entry;
+    return promise;
+  };
+
+  // The params a choice opens the picker with. `choose` is what the picker
+  // reads to answer with references; everything else about the surface is
+  // the same, which is why this is one param rather than a second surface.
+  // A choice takes no redirect: the fallback carries its answer home in
+  // one-shot URL params built for an opened document, so a browser that
+  // cannot host the frame rejects instead of ejecting the reader.
+  const chooseParams = (
+    method: string,
+    families: DocumentFamilies,
+    options: { accept?: SelectionNarrowing; prompt?: string } | undefined,
+    selected: readonly InputReference[],
+  ): Record<string, unknown> => {
+    const accept = pickerAccept(method, families, options?.accept);
+    const params: Record<string, unknown> = { choose: true };
+    if (selected.length) params['selected'] = [...selected];
+    if (accept) params['accept'] = accept;
+    if (options?.prompt !== undefined) params['prompt'] = options.prompt;
+    const actingOrganizationId = opts.actingOrganizationId?.();
+    if (actingOrganizationId) params['organizationId'] = actingOrganizationId;
+    return params;
+  };
 
   return {
     async selectDocument(): Promise<SelectDocumentResult | null> {
-      // Thread the calling app id over the bridge (every Brass app shares one
-      // sign-in client, so the origin can't otherwise tell which
-      // app opened the picker). The embed page uses it for a "only documents
-      // this app can open" filter.
       const params: Record<string, unknown> = {};
-      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
       // Where the app is working, so the picker opens there rather than on
       // every document the person can reach. Without it the first list an app
       // shows spans organizations the app is not installed on, and picking
@@ -1027,6 +1180,26 @@ export function createHostedUiLauncher(
         pickReturn ? 'redirect-with-value' : 'reject',
       );
     },
+    async chooseInputs(
+      families: DocumentFamilies,
+      options?: ChooseInputsOptions,
+    ): Promise<InputReference[] | null> {
+      return pickInputs(
+        chooseParams('chooseInputs', families, options, options?.selected ?? []),
+      );
+    },
+    async chooseInput(
+      families: DocumentFamilies,
+      options?: ChooseInputOptions,
+    ): Promise<InputReference | null> {
+      const held = options?.selected ?? null;
+      const params = chooseParams('chooseInput', families, options, held ? [held] : []);
+      // `multiple: false` draws the browsing list rather than the tree, and
+      // the picker answers with an array of the one reference.
+      params['multiple'] = false;
+      const chosen = await pickInputs(params);
+      return chosen?.[0] ?? null;
+    },
     async selectCreateDestination(options?: {
       name?: string;
     }): Promise<CreateDestinationResult | null> {
@@ -1035,13 +1208,11 @@ export function createHostedUiLauncher(
       // it back instead of creating the doc, so the create stays on the SDK's
       // credential path. `name` pre-fills the dialog.
       const params: Record<string, unknown> = { intent: 'create' };
-      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
       if (options?.name !== undefined) params['name'] = options.name;
       return launch<CreateDestinationResult>('select-document', params, 'reject');
     },
     async acquireOrganization(): Promise<AcquireOrganizationResult | null> {
       const params: Record<string, unknown> = {};
-      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
       return launch<AcquireOrganizationResult>(
         'acquire-organization',
         params,
@@ -1055,7 +1226,7 @@ export function createHostedUiLauncher(
       // `newDocId` into `openSiblingDoc`, and this one cannot.
       await launch(
         'share-document',
-        { ...callerAppParam(), docId, focus: 'share' },
+        { docId, focus: 'share' },
         'redirect',
         true,
       );
@@ -1079,7 +1250,7 @@ export function createHostedUiLauncher(
         // `newDocId` into `openSiblingDoc`. The hosted page is served
         // fresh against pinned SDKs, so it offers the Open only to a host
         // that says it will honour it.
-        { ...callerAppParam(), docId, focus, canOpenCopy: true },
+        { docId, focus, canOpenCopy: true },
         'redirect',
         true,
       );
@@ -1104,23 +1275,17 @@ export function createHostedUiLauncher(
       currentOrganizationId?: string,
     ): Promise<SelectOrganizationResult | null> {
       // The list is read on the dashboard origin and never crosses the
-      // bridge; only the chosen organization comes back. `appId` rides it for
-      // the same reason the install dialog needs it: one sign-in client
-      // serves every app, so the JWT cannot say which app is asking.
+      // bridge; only the chosen organization comes back.
       const params: Record<string, unknown> = {};
-      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
       if (currentOrganizationId !== undefined) {
         params['organizationId'] = currentOrganizationId;
       }
       return launch<SelectOrganizationResult>('select-organization', params, 'reject');
     },
     async installApp(organizationId?: string): Promise<InstallAppResult | null> {
-      // Thread the caller's `appId` over the bridge so the embed page renders
-      // the right app's name + scopes (every Brass app shares one sign-in
-      // user-pool client, so the JWT can't disambiguate). On confirm the
-      // embed page POSTs the install server-side and forwards the response.
+      // The embed page renders the app the init names, with its scopes. On
+      // confirm it POSTs the install server-side and forwards the response.
       const params: Record<string, unknown> = {};
-      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
       if (organizationId !== undefined) params['organizationId'] = organizationId;
       return launch<InstallAppResult>('install-app', params, 'reject');
     },
@@ -1131,11 +1296,7 @@ export function createHostedUiLauncher(
       organizationId: string,
       host: string,
     ): Promise<ServiceCredentialResult | null> {
-      // `appId` rides the bridge for the same reason the install dialog needs
-      // it: one sign-in client serves every app, so the JWT cannot say which
-      // app is asking, and this screen grants that app in particular.
       const params: Record<string, unknown> = { organizationId, host };
-      if (opts.callingAppId !== undefined) params['appId'] = opts.callingAppId;
       return launch<ServiceCredentialResult>('service-credential', params, 'reject');
     },
   };

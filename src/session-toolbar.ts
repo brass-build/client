@@ -41,6 +41,8 @@ export interface DocumentTitleDeps {
   // Resolve the active doc's server-authored location label (rendered
   // verbatim by the chip; null when the doc is loose).
   getDocument: (docId: string) => Promise<{ location_label: string | null }>;
+  // Whether the page opened its document through a `?brass_link=` link.
+  onLink?: () => boolean;
 }
 
 export interface UndoRedoDeps {
@@ -49,6 +51,8 @@ export interface UndoRedoDeps {
 
 export interface PresenceRosterDeps {
   session: DocumentSession;
+  // The signed-in person, whose other tabs and devices are not collaborators.
+  getUser?: () => BrassUser | null;
 }
 
 export interface DriveSyncDeps {
@@ -58,21 +62,47 @@ export interface DriveSyncDeps {
 export interface VersionPreviewDeps {
   session: DocumentSession;
   // Resolved dashboard/embed origin (no trailing slash): the version bar
-  // iframe loads `${dashboardBaseUrl}/embed/version-bar`.
-  dashboardBaseUrl: string;
+  // iframe loads `${dashboardBaseUrl}/embed/version-bar`. Called at use
+  // rather than passed as a value, for the reason on `AccountMenuDeps`.
+  dashboardBaseUrl: () => string;
+  // The app the bar serves, named in the embed's init like every other hosted
+  // surface. Read at use for the same reason as `dashboardBaseUrl`.
+  appId?: () => string | undefined;
   // Pins the embed's light/dark theme (matches the other hosted surfaces).
-  hostedUiTheme?: 'light' | 'dark' | 'auto';
+  hostedUiTheme?: () => 'light' | 'dark' | 'auto';
+}
+
+// The strip under the bar on a document created without an account, which
+// says the work will be lost and offers the sign-in that keeps it.
+export interface NotSignedInDeps {
+  session: DocumentSession;
+  signIn: () => void;
+  // The signed-in person, when there is one. A person signed in on someone
+  // else's temporary work is told when it goes and offered nothing; in the
+  // browser that made it, `keep` claims it in place.
+  getUser?: () => BrassUser | null;
+  onUserChange?: (listener: (user: BrassUser | null) => void) => () => void;
+  canKeep?: () => boolean;
+  keep?: () => void;
 }
 
 export interface AccountMenuDeps {
   getUser: () => BrassUser | null;
+  // The guest's "Sign in" names what a sign-in does when the open document
+  // was created without an account (it keeps the document), so the menu
+  // reads the active document's expiry off the session when one is given.
+  session?: DocumentSession;
   onUserChange: (listener: (user: BrassUser | null) => void) => () => void;
   signIn: () => void;
   signOut: () => void;
   // Base URL of the Brass dashboard, for the account menu's "Open Brass
   // dashboard" link. The client's resolved dashboard origin (picks the
   // environment), with no trailing slash.
-  dashboardBaseUrl: string;
+  //
+  // Called at use rather than passed as a value: `Brass.init()` resolves the
+  // origin, and a bar may be mounted before it settles, so a value read at
+  // mount is the default rather than the one that call resolved.
+  dashboardBaseUrl: () => string;
   // The organization this app is currently acting in, or null while none has
   // been resolved or the one resolved has no name yet.
   getActingOrganization?: () => { id: string; name: string } | null;
@@ -91,6 +121,7 @@ export type SessionToolbarDeps = FileMenuDeps &
   UndoRedoDeps &
   PresenceRosterDeps &
   AccountMenuDeps &
+  NotSignedInDeps &
   VersionPreviewDeps;
 
 export interface SessionToolbarOptions {
@@ -144,12 +175,14 @@ const STYLE_ID = 'brass-toolbar-styles';
 const CSS = `
 .brass-ui { --brass-surface:#161b22; --brass-surface-2:#1f2730;
   --brass-fg:#e6edf3; --brass-fg-muted:#9da7b3; --brass-border:#2a313b;
-  --brass-accent:#3b82f6; --brass-accent-fg:#fff; --brass-danger:#e5534b;
+  --brass-accent:#3b82f6; --brass-accent-fg:#fff; --brass-accent-soft:#1c2b45;
+  --brass-danger:#e5534b;
   color:var(--brass-fg);
   font:14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif; box-sizing:border-box; }
 @media (prefers-color-scheme: light) { .brass-ui {
   --brass-surface:#fff; --brass-surface-2:#f1f3f5; --brass-fg:#1b1f24;
-  --brass-fg-muted:#5c636a; --brass-border:#d8dee4; --brass-danger:#cf222e; } }
+  --brass-fg-muted:#5c636a; --brass-border:#d8dee4; --brass-accent-soft:#e6effd;
+  --brass-danger:#cf222e; } }
 .brass-ui *, .brass-bar * { box-sizing:border-box; }
 /* Host apps commonly set a global button min-height for touch targets, which
    overrides the avatar's height regardless of specificity and stretches the
@@ -182,6 +215,7 @@ const CSS = `
   .brass-bar .b-tools { order:2; flex:1; flex-basis:auto;
   justify-content:center; } .brass-bar .b-right { order:3; margin-left:auto; } }
 .b-menu { display:inline-flex; }
+.b-menu[hidden] { display:none; }
 /* A bare hamburger glyph, no button chrome (background / border / radius), so it
    reads as an icon sitting beside the document title. The 36px box is only an
    invisible tap target; the glyph is sized up so it holds its weight next to the
@@ -209,6 +243,10 @@ const CSS = `
    declared here. */
 .b-pop .b-sep { height:0; border:none; border-top:1px solid var(--brass-border);
   margin:4px 2px; }
+/* A line of fact in a menu (when a document minted without an account
+   expires): the same inset as an entry, in the muted tone, and no hover. */
+.b-pop .b-note { padding:8px 10px; color:var(--brass-fg-muted); font-size:12px;
+  line-height:1.3; }
 /* [hidden] must beat the block rule above (the account menu swaps its body
    between signed-in actions and the guest's "Sign in"). */
 .b-pop button[hidden], .b-pop a[hidden], .b-pop .b-email[hidden],
@@ -234,7 +272,7 @@ const CSS = `
   border:1px solid var(--brass-accent); border-radius:6px; padding:0 6px;
   margin:0; cursor:pointer; font-family:inherit; overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; }
-.b-branch:hover { background:var(--brass-accent); color:var(--brass-accent-fg); }
+.b-branch:hover:not(:disabled) { background:var(--brass-accent); color:var(--brass-accent-fg); }
 .b-loc { font-size:11px; line-height:1.2; color:var(--brass-fg-muted);
   background:none; border:none; border-radius:0; padding:1px 3px; min-height:0; cursor:pointer; white-space:nowrap;
   font-family:inherit; }
@@ -242,7 +280,24 @@ const CSS = `
 .b-loc.filed::before { content:'📁 '; }
 .b-loc.loose { text-decoration:underline dashed; text-underline-offset:2px; }
 .b-loc.loose::before { content:'+ '; }
-.b-undo-redo { display:inline-flex; align-items:center; gap:6px; }
+.b-undo-redo { display:inline-flex; align-items:center; gap:2px; }
+.b-undo-compact { display:none; }
+.b-tool.b-tool-icon { padding:6px; display:inline-flex; align-items:center; justify-content:center;
+  background:none; border-color:transparent; }
+.b-tool.b-tool-icon:hover:not(:disabled) { background:var(--brass-surface-2); }
+/* An icon button's name on hover or keyboard focus. A top-layer popover, so
+   no ancestor's overflow clips it. */
+.b-tip { position:fixed; inset:auto; margin:0; padding:4px 8px; border:none;
+  border-radius:6px; background:var(--brass-fg); color:var(--brass-surface);
+  font-size:12px; line-height:1.3; white-space:nowrap; pointer-events:none;
+  display:none; z-index:2147483646; }
+.b-tip:popover-open, .b-tip.b-tip-open { display:block; }
+/* Narrow: the pair sits in the top row beside the avatar, so the tools row
+   holds only the app's items and collapses when it has none. */
+@media (max-width:759.98px) {
+  .brass-bar .b-undo-compact { display:inline-flex; }
+  .brass-bar .b-undo-full { display:none; }
+  .brass-bar:not(.b-app-tools) .b-tools { display:none !important; } }
 .b-tool { background:var(--brass-surface-2); color:var(--brass-fg);
   border:1px solid var(--brass-border); border-radius:8px; padding:8px 12px; cursor:pointer; font:inherit; }
 .b-tool:disabled { opacity:.5; cursor:default; }
@@ -264,6 +319,13 @@ const CSS = `
 /* The uploaded avatar image fills the circle; object-fit:cover keeps it
    undistorted. It sits over the monogram, which stays in the DOM as the
    fallback shown when no image is set or the image fails to load. */
+/* The accent-filled controls (this avatar, the guest strip's sign-in, the
+   branch chip) restate their fill and text colour on hover, at a
+   specificity above a host's own button:hover:not(:disabled) whatever order the
+   two stylesheets load in. A host hover rule otherwise repaints the fill with
+   its own (often near-white) background under this white text. */
+button.b-avatar:hover:not(:disabled) { background:var(--brass-accent);
+  color:var(--brass-accent-fg); }
 .b-avatar-img { width:100%; height:100%; object-fit:cover; display:block; }
 .b-avatar-img[hidden], .b-avatar-initial[hidden] { display:none; }
 /* The account menu opens on the identity it acts for: the avatar again at
@@ -331,6 +393,23 @@ const CSS = `
    reports a problem, so it carries the danger tone rather than the muted one
    every other line uses. */
 .b-drive-unreadable { margin:0; padding:0 10px 6px; font-size:12px; color:var(--brass-danger, #b3261e); }
+/* The strip under the bar while the open document is one the platform will
+   remove (created without an account): it says so and carries the sign-in
+   that keeps the work. Tinted with the accent so it reads as a notice about
+   the document rather than as more chrome; the text takes the slack and the
+   button holds the trailing edge until a narrow width wraps it under. */
+.b-guest { width:100%; display:none; flex-wrap:wrap; align-items:center;
+  justify-content:space-between; gap:6px 12px; padding:8px 14px; font-size:13px;
+  line-height:1.4; background:var(--brass-accent-soft); color:var(--brass-fg);
+  border-bottom:1px solid var(--brass-border); }
+.b-guest.b-guest-on { display:flex; }
+.b-guest-msg { flex:1 1 auto; min-width:0; }
+.b-guest button { flex:0 0 auto; background:var(--brass-accent);
+  color:var(--brass-accent-fg); border:none; border-radius:6px; cursor:pointer;
+  font:inherit; font-size:13px; font-weight:600; padding:6px 12px; }
+.b-guest button:hover:not(:disabled) { background:var(--brass-accent);
+  color:var(--brass-accent-fg); filter:brightness(1.1); }
+.b-guest button:focus-visible { outline:2px solid var(--brass-fg); outline-offset:2px; }
 /* Historical-version preview bar: a full-width strip the toolbar shows below
    the bar whenever the active doc is previewing an earlier version. The strip
    itself is the platform-served version-bar iframe (the SDK owns only this
@@ -403,6 +482,13 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
+// A failed publish shows the server's own sentence, which is what the route
+// answers a refusal with.
+function publishFailureText(err: unknown): string {
+  const message = err instanceof Error ? err.message.trim() : '';
+  return message === '' || message === 'Request failed' ? 'Publishing failed.' : message;
+}
+
 function initialOf(user: BrassUser): string {
   const label = user.display_name ?? user.email ?? user.sub;
   return label.trim().charAt(0).toUpperCase() || '?';
@@ -449,6 +535,28 @@ function renderCommandButton(cmd: Command, asTool: boolean): HTMLButtonElement {
   const b = el('button', asTool ? 'b-tool' : undefined);
   b.type = 'button';
   b.textContent = cmd.label;
+  b.disabled = !cmd.enabled || cmd.running;
+  return b;
+}
+
+const COMMAND_ICONS: Record<string, string> = {
+  undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
+  redo: '<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>',
+};
+
+// A toolbar command as an icon button, named by its label for assistive
+// technology and on hover. A command with no icon keeps its text.
+function commandGlyph(icon: string): string {
+  return `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icon}</svg>`;
+}
+
+function renderCommandIcon(cmd: Command): HTMLButtonElement {
+  const icon = COMMAND_ICONS[cmd.id];
+  if (icon === undefined) return renderCommandButton(cmd, true);
+  const b = el('button', 'b-tool b-tool-icon');
+  b.type = 'button';
+  b.setAttribute('aria-label', cmd.label);
+  b.innerHTML = commandGlyph(icon);
   b.disabled = !cmd.enabled || cmd.running;
   return b;
 }
@@ -630,9 +738,18 @@ function buildFileMenu(deps: FileMenuDeps): PieceInternal {
 
   const render = (): void => {
     const rows: HTMLElement[] = [];
+    const expiresAt = deps.session.document?.expiresAt ?? null;
+    if (expiresAt !== null) {
+      const note = el('div', 'b-note b-expiry');
+      note.textContent = expiresInLabel(expiresAt);
+      rows.push(note);
+    }
     let group: string | null = null;
     for (const c of deps.session.commands) {
       if (c.surface !== 'menu') continue;
+      // A session command that is not enabled is not offered, so it is left
+      // out rather than greyed.
+      if (c.group === 'session' && !c.enabled) continue;
       // A rule wherever the family changes: the entries that put a
       // different document on screen, then the ones about this document.
       if (group !== null && c.group !== group) {
@@ -649,6 +766,8 @@ function buildFileMenu(deps: FileMenuDeps): PieceInternal {
       rows.push(b);
     }
     menu.pop.replaceChildren(...rows);
+    if (rows.length === 0) menu.close();
+    menu.root.hidden = rows.length === 0;
   };
   render();
   const unsub = deps.session.subscribe(render);
@@ -726,11 +845,11 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
       if (record.location_label !== null) {
         loc.textContent = record.location_label;
         loc.className = 'b-loc filed';
-        loc.title = 'Move or rename this document';
+        loc.title = 'Move or rename';
       } else {
         loc.textContent = 'Add to project';
         loc.className = 'b-loc loose';
-        loc.title = 'File this document in a project';
+        loc.title = 'Add to a project';
       }
       loc.hidden = false;
     } catch {
@@ -753,15 +872,24 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
     // Three states, not two. A bound doc whose name has not resolved yet
     // (a fresh create the server just numbered, a create/open still settling)
     // and an open in flight (`status` 'loading', `document` still null) both
-    // leave the name UNKNOWN: render nothing rather than assert "No document",
+    // leave the name UNKNOWN: render nothing rather than assert "Nothing open",
     // the same way the session reports 'unknown' auth as a neutral state
     // instead of flashing 'signed-out'. Only the genuine empty state (no doc,
-    // not loading) reads "No document".
+    // not loading) reads "Nothing open".
+    // A link the app opens only for signed-in people names the refusal,
+    // since the account control beside it is where the visitor signs in.
+    const refusal =
+      !doc &&
+      session.status === 'error' &&
+      session.error?.code === 'sign_in_required' &&
+      deps.onLink?.() === true
+        ? session.error.message
+        : null;
     const name = doc
       ? doc.name
       : session.status === 'loading'
         ? null
-        : 'No document';
+        : (refusal ?? 'Nothing open');
     if (name === null) {
       title.hidden = true;
     } else {
@@ -800,15 +928,96 @@ function buildDocumentTitle(deps: DocumentTitleDeps): PieceInternal {
   };
 }
 
-function buildUndoRedo(deps: UndoRedoDeps): PieceInternal {
+// Shows the aria-label of the icon button under the pointer or keyboard
+// focus inside `root`, below the button and clamped to the viewport.
+// One tip per document, outside every piece, so a piece's own children stay
+// what it renders.
+let sharedTip: HTMLElement | null = null;
+function iconTip(): HTMLElement {
+  if (sharedTip?.isConnected) return sharedTip;
+  sharedTip = el('div', 'brass-ui b-tip');
+  sharedTip.setAttribute('aria-hidden', 'true');
+  sharedTip.setAttribute('popover', 'manual');
+  document.body.append(sharedTip);
+  return sharedTip;
+}
+
+function attachIconTooltips(root: HTMLElement): { hide(): void } {
+  const tip = iconTip();
+  const api = tip as HTMLElement & { showPopover?: () => void; hidePopover?: () => void };
+  let shownFor: HTMLElement | null = null;
+  const show = (btn: HTMLElement): void => {
+    const label = btn.getAttribute('aria-label');
+    if (!label) return;
+    shownFor = btn;
+    tip.textContent = label;
+    if (typeof api.showPopover === 'function') {
+      try {
+        if (!tip.matches(':popover-open')) api.showPopover();
+      } catch {
+        tip.classList.add('b-tip-open');
+      }
+    } else tip.classList.add('b-tip-open');
+    const r = btn.getBoundingClientRect();
+    const w = tip.offsetWidth;
+    const left = Math.max(4, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - 4));
+    tip.style.left = `${left}px`;
+    tip.style.top = `${r.bottom + 6}px`;
+  };
+  const hide = (): void => {
+    shownFor = null;
+    tip.classList.remove('b-tip-open');
+    try {
+      if (tip.matches(':popover-open')) api.hidePopover?.();
+    } catch {
+      // Not showing.
+    }
+  };
+  const iconOf = (t: EventTarget | null): HTMLElement | null =>
+    t instanceof Element ? t.closest<HTMLElement>('.b-tool-icon') : null;
+  root.addEventListener('pointerover', (e) => {
+    const btn = iconOf(e.target);
+    if (btn && e.pointerType === 'mouse') show(btn);
+  });
+  root.addEventListener('pointerout', (e) => {
+    if (iconOf(e.target) === shownFor && iconOf(e.relatedTarget) !== shownFor) hide();
+  });
+  root.addEventListener('pointerdown', hide);
+  root.addEventListener('focusin', (e) => {
+    const btn = iconOf(e.target);
+    if (btn && btn.matches(':focus-visible')) show(btn);
+  });
+  root.addEventListener('focusout', hide);
+  return { hide };
+}
+
+// `full` and `compact` are the toolbar's two copies, which the narrow-width
+// rules swap. `standalone` is the one an app mounts itself: no copy stands in
+// for it at a narrow width, so those rules must not hide it.
+function buildUndoRedo(
+  deps: UndoRedoDeps,
+  variant: 'full' | 'compact' | 'standalone' = 'full',
+): PieceInternal {
   injectStyles(document);
-  const root = el('div', 'brass-ui b-undo-redo');
+  const root = el(
+    'div',
+    variant === 'standalone' ? 'brass-ui b-undo-redo' : `brass-ui b-undo-redo b-undo-${variant}`,
+  );
+  const tips = attachIconTooltips(root);
   const render = (): void => {
+    // The pair shows only while one of them can act: before the first edit, on
+    // a read-only document, and with nothing open they would only ever show
+    // disabled, and rendering none lets the bar give their row back.
+    const commands = deps.session.commands.filter((c) => c.surface === 'toolbar');
+    tips.hide();
+    if (!commands.some((c) => c.enabled)) {
+      root.replaceChildren();
+      return;
+    }
     root.replaceChildren(
-      ...deps.session.commands
-        .filter((c) => c.surface === 'toolbar')
+      ...commands
         .map((c) => {
-          const b = renderCommandButton(c, true);
+          const b = renderCommandIcon(c);
           b.onclick = () => void c.run();
           return b;
         }),
@@ -820,6 +1029,7 @@ function buildUndoRedo(deps: UndoRedoDeps): PieceInternal {
     root,
     destroy(): void {
       unsub();
+      tips.hide();
     },
   };
 }
@@ -836,9 +1046,28 @@ function buildPresenceRoster(deps: PresenceRosterDeps): PieceInternal {
   let boundDoc: DocumentSession['document'] = null;
   let presenceOff: (() => void) | null = null;
 
+  // The roster lists every other connection, so the reader's own other tabs,
+  // and a page they navigated away from until its socket closes, are in it.
+  // A pip stands for a person: one per sub, and never the reader. A visitor
+  // on a shared link has an empty sub, so each such connection is its own
+  // pip.
+  const collaborators = (
+    participants: readonly PresenceParticipant[],
+  ): PresenceParticipant[] => {
+    const own = deps.getUser?.()?.sub;
+    const seen = new Set<string>();
+    return participants.filter((p) => {
+      if (own !== undefined && p.sub === own) return false;
+      const person = p.sub !== '' ? p.sub : `connection:${p.connectionId}`;
+      if (seen.has(person)) return false;
+      seen.add(person);
+      return true;
+    });
+  };
+
   const renderRoster = (participants: readonly PresenceParticipant[]): void => {
     root.replaceChildren(
-      ...participants.map((p) => {
+      ...collaborators(participants).map((p) => {
         const pip = el('span', 'b-pip');
         pip.style.background = p.color;
         const label = p.displayName ?? p.sub ?? '?';
@@ -893,6 +1122,33 @@ function buildPresenceRoster(deps: PresenceRosterDeps): PieceInternal {
       presenceOff?.();
     },
   };
+}
+
+// The guest's account-menu entry, and its wording on a document created
+// without an account, where signing in is what keeps it.
+const SIGN_IN_LABEL = 'Sign in';
+const SIGN_IN_TO_KEEP_LABEL = 'Sign in to keep your work';
+const KEEP_LABEL = 'Keep';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// The file menu's line for a document the platform will remove: whole days
+// until then, rounded up, so the last day still reads as one.
+export function expiresInLabel(expiresAt: Date, now: number = Date.now()): string {
+  const days = Math.max(1, Math.ceil((expiresAt.getTime() - now) / DAY_MS));
+  return `Your work will be lost in ${days} ${days === 1 ? 'day' : 'days'}`;
+}
+
+// Someone else's temporary work, to a signed-in reader who cannot keep it.
+export function removedInLabel(expiresAt: Date, now: number = Date.now()): string {
+  const days = Math.max(1, Math.ceil((expiresAt.getTime() - now) / DAY_MS));
+  return `This work will be removed in ${days} ${days === 1 ? 'day' : 'days'}`;
+}
+
+// The strip's sentence: the same count as the file menu's line, led by the
+// state that explains it.
+export function notSignedInLabel(expiresAt: Date, now: number = Date.now()): string {
+  return `You are not signed in. ${expiresInLabel(expiresAt, now)}.`;
 }
 
 // A monochrome 16px stroke glyph (inherits `color` via `currentColor`). Built
@@ -992,13 +1248,23 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
   // covering the gap between a click here and the first `publishing` frame
   // arriving; the two combine as `isPublishing` in `render`.
   let publishing = false;
-  let publishError = false;
+  // The server's refusal of the last publish from this panel, shown where
+  // the resting sentence sits until the next attempt.
+  let publishError: string | null = null;
   let publishTimer: ReturnType<typeof setTimeout> | null = null;
   // Set on a click, cleared by the next publish-state frame. Between the two,
   // the held state describes the PREVIOUS attempt, and rendering it would
   // report the last failure over the publish just started.
   let publishStateStale = false;
   let currentStatus: DocumentDriveStatus | null = null;
+  // The panel is asking whether to publish over the drive's newer version.
+  let confirmingOverwrite = false;
+  pop.addEventListener('toggle', (event) => {
+    if ((event as ToggleEvent).newState === 'closed' && confirmingOverwrite) {
+      confirmingOverwrite = false;
+      render(currentStatus);
+    }
+  });
   const clearPublishing = (): void => {
     publishing = false;
     // The stale mark is cleared with the hold it belongs to. It is otherwise
@@ -1019,6 +1285,16 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
   // one.
   const renderPublishOffer = (target: DrivePublishTarget): void => {
     root.hidden = false;
+    if (target.unpublishable) {
+      // Nothing to publish, so the icon asks for no attention; the panel
+      // names the drive and says why the file cannot go to it.
+      root.classList.remove('has-changes', 'is-broken');
+      button.title = `Cannot publish to ${target.driveName}`;
+      const p = el('p', 'b-drive-unreadable');
+      p.textContent = target.detail;
+      pop.replaceChildren(p);
+      return;
+    }
     // A document the drive has never received is as far out of sync as one
     // whose edits have not been published, so the icon carries the same
     // attention an `ahead` document's does. What separates them is what the
@@ -1035,7 +1311,8 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
         : `Publish to ${target.driveName}`;
 
     const failed =
-      !inFlight && (state?.failed === true || target.publishFailed === true);
+      !inFlight &&
+      (publishError !== null || state?.failed === true || target.publishFailed === true);
 
     const rows: HTMLElement[] = [];
     // One line, server-authored either way: the worker's phase copy while it
@@ -1046,7 +1323,7 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
     const p = el('p', failed ? 'b-drive-unreadable' : 'b-drive-detail');
     p.textContent = inFlight
       ? (state?.publishing === true ? (state.detail ?? 'Publishing...') : 'Publishing...')
-      : (state?.detail ?? target.detail);
+      : (publishError ?? state?.detail ?? target.detail);
     rows.push(p);
 
     const pub = el('button');
@@ -1054,13 +1331,13 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
     pub.disabled = inFlight;
     pub.textContent = inFlight
       ? 'Publishing...'
-      : publishError || failed
+      : failed
         ? `Publish to ${target.driveName}, retry`
         : `Publish to ${target.driveName}`;
     pub.onclick = () => {
       const doc = deps.session.document;
       if (!doc) return;
-      publishError = false;
+      publishError = null;
       publishing = true;
       publishStateStale = true;
       // The same safety net the mirror panel keeps: a publish that neither
@@ -1071,9 +1348,9 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
         render(currentStatus);
       }, PUBLISH_HOLD_MS);
       render(currentStatus);
-      void doc.pushToDrive().catch(() => {
+      void doc.pushToDrive().catch((err: unknown) => {
         clearPublishing();
-        publishError = true;
+        publishError = publishFailureText(err);
         render(currentStatus);
       });
     };
@@ -1083,6 +1360,7 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
 
   const render = (status: DocumentDriveStatus | null): void => {
     currentStatus = status;
+    if (status?.state !== 'diverged' || !status.canPush) confirmingOverwrite = false;
     // A document that mirrors nothing can still have somewhere to go: its
     // project may be linked to a drive that takes it as a new file, which is
     // what an upload into a linked project sits waiting for. Offer that
@@ -1105,7 +1383,7 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
     // local hold (the server frame already has `publishing: false`).
     if (status.state === 'synced') {
       clearPublishing();
-      publishError = false;
+      publishError = null;
     }
     root.hidden = false;
     // Either a local click hold or the server's own `publishing` flag means a
@@ -1172,6 +1450,11 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
       warn.textContent = status.sourceUnreadable;
       rows.push(warn);
     }
+    if (publishError !== null && !isPublishing) {
+      const warn = el('p', 'b-drive-unreadable');
+      warn.textContent = publishError;
+      rows.push(warn);
+    }
 
     if (isPublishing) {
       // Held while the publish is in flight (a local click hold, or the doc's
@@ -1182,16 +1465,13 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
       pub.disabled = true;
       rows.push(pub);
     } else if (status.canPush) {
-      // `canPush` already encodes two-way + not broken + local edits + a
-      // server-writable format, so this never offers a publish the server
-      // would refuse.
-      const pub = el('button');
-      pub.type = 'button';
-      pub.textContent = publishError ? 'Publish failed, retry' : 'Publish changes';
-      pub.onclick = () => {
+      // `canPush` is the server's publish decision, so this never offers a
+      // publish the server would refuse.
+      const startPublish = (): void => {
         const doc = deps.session.document;
         if (!doc) return;
-        publishError = false;
+        confirmingOverwrite = false;
+        publishError = null;
         publishing = true;
         // Safety net: if the publish neither errors nor reaches synced (the
         // webhook never confirms), release the held state so the popover
@@ -1201,12 +1481,45 @@ function buildDriveSync(deps: DriveSyncDeps): PieceInternal {
           render(currentStatus);
         }, PUBLISH_HOLD_MS);
         render(currentStatus);
-        void doc.pushToDrive().catch(() => {
+        void doc.pushToDrive().catch((err: unknown) => {
           clearPublishing();
-          publishError = true;
+          publishError = publishFailureText(err);
           render(currentStatus);
         });
       };
+      // A diverged document publishes over a drive version it never took, so
+      // the panel asks first, in place.
+      const overwrites = status.state === 'diverged';
+      if (overwrites && confirmingOverwrite) {
+        const ask = el('p', 'b-drive-unreadable');
+        ask.textContent = status.keepsPriorVersions
+          ? `Publishing makes this doc the latest version in ${driveName}. ${driveName} keeps the newer version in its history.`
+          : `Publishing replaces the newer version in ${driveName} with this doc.`;
+        const confirm = el('button');
+        confirm.type = 'button';
+        confirm.textContent = `Publish over ${driveName}`;
+        confirm.onclick = startPublish;
+        const cancel = el('button');
+        cancel.type = 'button';
+        cancel.textContent = 'Cancel';
+        cancel.onclick = () => {
+          confirmingOverwrite = false;
+          render(currentStatus);
+        };
+        rows.push(ask, confirm, cancel);
+        pop.replaceChildren(...rows);
+        return;
+      }
+      const pub = el('button');
+      pub.type = 'button';
+      const verb = publishError !== null ? 'Publish failed, retry' : 'Publish changes';
+      pub.textContent = overwrites ? `${verb}...` : verb;
+      pub.onclick = overwrites
+        ? () => {
+            confirmingOverwrite = true;
+            render(currentStatus);
+          }
+        : startPublish;
       rows.push(pub);
     }
     // Resolve a divergence via the hosted take-source / keep-both surface. Not
@@ -1315,7 +1628,6 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     ),
     'Open Brass dashboard',
   );
-  dashboardLink.href = `${deps.dashboardBaseUrl}/home`;
   dashboardLink.target = '_blank';
   dashboardLink.rel = 'noopener noreferrer';
   dashboardLink.onclick = () => menu.close();
@@ -1350,9 +1662,10 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
   // meaningless, so the menu offers a single "Sign in" that takes the top
   // window through the app's normal sign-in and returns to this URL.
   const signInBtn = el('button');
+  const signInLabel = document.createTextNode(SIGN_IN_LABEL);
   signInBtn.append(
     strokeIcon('M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4', 'm10 17 5-5-5-5', 'M15 12H3'),
-    'Sign in',
+    signInLabel,
   );
   signInBtn.onclick = () => {
     menu.close();
@@ -1387,6 +1700,11 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     dashboardLink.hidden = !signedIn;
     signOutBtn.hidden = !signedIn;
     signInBtn.hidden = signedIn;
+    // On a document that expires, signing in is what keeps it.
+    signInLabel.data =
+      deps.session?.document?.expiresAt != null
+        ? SIGN_IN_TO_KEEP_LABEL
+        : SIGN_IN_LABEL;
     // The organization line names what the app is acting in, so it is drawn
     // only when there is something to name: an app that has not needed an
     // organization yet has not resolved one, and resolving one to fill this
@@ -1395,10 +1713,11 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     orgEl.textContent = organizationName;
     orgEl.title = organizationName;
     orgEl.hidden = organizationName === '';
+    const dashboardBaseUrl = deps.dashboardBaseUrl();
     dashboardLink.href =
       signedIn && organization
-        ? `${deps.dashboardBaseUrl}/organizations/${encodeURIComponent(organization.id)}`
-        : `${deps.dashboardBaseUrl}/home`;
+        ? `${dashboardBaseUrl}/organizations/${encodeURIComponent(organization.id)}`
+        : `${dashboardBaseUrl}/home`;
     // Offered to every signed-in reader, including one the line has nothing
     // to name and one who belongs to a single organization. The surface
     // behind it both moves the app and creates an organization, so gating it
@@ -1416,19 +1735,71 @@ function buildAccountMenu(deps: AccountMenuDeps): PieceInternal {
     organization = next;
     render();
   });
+  const unsubSession = deps.session?.subscribe(render);
   return {
     root: menu.root,
     destroy(): void {
       unsub();
       unsubOrganization?.();
+      unsubSession?.();
       menu.destroy();
+    },
+  };
+}
+
+// The strip under the bar on a document created without an account. It is
+// drawn whenever the active doc carries `expiresAt`, re-read on every session
+// notification: a sign-in claims the document and clears the expiry, and the
+// active document can change under the chrome. Empty otherwise, so the row
+// costs no height on an ordinary document.
+function buildNotSignedIn(deps: NotSignedInDeps): PieceInternal {
+  injectStyles(document);
+  const root = el('div', 'brass-ui b-guest');
+  root.setAttribute('role', 'status');
+  const message = el('span', 'b-guest-msg');
+  const signInBtn = el('button');
+  signInBtn.type = 'button';
+  signInBtn.textContent = SIGN_IN_LABEL;
+  signInBtn.onclick = () => deps.signIn();
+  const keepBtn = el('button');
+  keepBtn.type = 'button';
+  keepBtn.textContent = KEEP_LABEL;
+  keepBtn.onclick = () => deps.keep?.();
+
+  const render = (): void => {
+    const expiresAt = deps.session.document?.expiresAt ?? null;
+    if (expiresAt === null) {
+      root.classList.remove('b-guest-on');
+      root.replaceChildren();
+      return;
+    }
+    if ((deps.getUser?.() ?? null) === null) {
+      message.textContent = notSignedInLabel(expiresAt);
+      root.replaceChildren(message, signInBtn);
+    } else if (deps.canKeep?.() === true && deps.keep !== undefined) {
+      message.textContent = `${expiresInLabel(expiresAt)}.`;
+      root.replaceChildren(message, keepBtn);
+    } else {
+      message.textContent = `${removedInLabel(expiresAt)}.`;
+      root.replaceChildren(message);
+    }
+    root.classList.add('b-guest-on');
+  };
+  render();
+  const unsub = deps.session.subscribe(render);
+  const unsubUser = deps.onUserChange?.(() => render());
+  return {
+    root,
+    destroy(): void {
+      unsub();
+      unsubUser?.();
     },
   };
 }
 
 // The historical-version preview bar. When the active doc is previewing an
 // earlier version (a hosted `history`-initiated checkout: `doc.readOnly` is
-// true and `doc.version` is set), the SDK mounts the platform-served
+// true and `doc.previewVersion` is set), the SDK mounts the platform-served
 // `/embed/version-bar` inline as a strip and routes its intents (Prev / Next
 // checkout, return-to-latest, browse, branch-from) to the doc's internal
 // methods. Delivered as a server embed so the platform owns and grows the
@@ -1439,7 +1810,7 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
   injectStyles(document);
   const root = el('div', 'brass-ui b-version');
   root.setAttribute('role', 'group');
-  root.setAttribute('aria-label', 'Document version');
+  root.setAttribute('aria-label', 'Version');
 
   let frame: VersionBarFrame | null = null;
   // Once a preview starts (a checkout), the bar owns a browsing session that
@@ -1452,7 +1823,7 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
   // The version the reader dismissed the bar at, when the document was left
   // holding one. A document that cannot return to its head (one pinned to a
   // version) stays on it, so without this the next render reads a non-null
-  // `doc.version` and latches the bar the reader just dismissed straight back
+  // `doc.previewVersion` and latches the bar the reader just dismissed straight back
   // on. A dismissal at the live head records nothing: there is no version
   // left to latch on, and the head is where the next browse-in-the-app
   // request arrives, so a record there would swallow it.
@@ -1481,12 +1852,15 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       throw err;
     }
   };
-  const frameDeps: VersionBarDeps = {
-    dashboardBaseUrl: deps.dashboardBaseUrl,
-    ...(deps.hostedUiTheme ? { theme: deps.hostedUiTheme } : {}),
+  // Assembled when the bar opens rather than at mount, so the frame's origin
+  // and theme are the ones `Brass.init()` settled (see `AccountMenuDeps`).
+  const frameDeps = (): VersionBarDeps => ({
+    dashboardBaseUrl: deps.dashboardBaseUrl(),
+    appId: deps.appId?.(),
+    ...(deps.hostedUiTheme ? { theme: deps.hostedUiTheme() } : {}),
     // Read the live active document at call time: a bridge intent lands
     // async, so it must not close over a doc that may have been superseded.
-    currentVersion: () => session.document?.version ?? null,
+    currentVersion: () => session.document?.previewVersion ?? null,
     checkoutVersion: async (version) => {
       const doc = session.document;
       if (!doc) return;
@@ -1514,7 +1888,7 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       // flag is cleared too, or the next render would latch the bar back on.
       const doc = session.document;
       browsing = false;
-      dismissedAt = doc?.version ?? undefined;
+      dismissedAt = doc?.previewVersion ?? undefined;
       doc?._setVersionBrowsing(false);
       // Leaving the bar means leaving the preview: the bar is the only
       // surface that returns a document to its head, so a dismissal that
@@ -1527,7 +1901,7 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       // pick sets only `version`, so a stale `dismissedAt` equal to it would
       // otherwise leave the reader checked out, read-only, with no bar and
       // no exit).
-      if (doc && doc.version !== null) {
+      if (doc && doc.previewVersion !== null) {
         void attempt(doc, () => doc.returnToHead())
           .then(() => {
             if (session.document === doc) dismissedAt = undefined;
@@ -1536,7 +1910,7 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       }
       hideBar();
     },
-  };
+  });
 
   const render = (): void => {
     const doc = session.document;
@@ -1550,7 +1924,7 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       browsing = false;
       dismissedAt = undefined;
     }
-    // A live checkout (`doc.version !== null`) starts / keeps the browsing
+    // A live checkout (`doc.previewVersion !== null`) starts / keeps the browsing
     // session. Other read-only states (a view-only share link, a still-loading
     // doc) are not this bar's concern, and `doc.id` is null only on the offline
     // / test path the embed can't serve.
@@ -1560,8 +1934,8 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
     if (
       doc != null &&
       docId !== null &&
-      (doc.version !== null || doc.versionBrowsing) &&
-      (doc.versionBrowsing || doc.version !== dismissedAt)
+      (doc.previewVersion !== null || doc.versionBrowsing) &&
+      (doc.versionBrowsing || doc.previewVersion !== dismissedAt)
     ) {
       browsing = true;
       dismissedAt = undefined;
@@ -1573,14 +1947,14 @@ function buildVersionPreview(deps: VersionPreviewDeps): PieceInternal {
       doc._setVersionBrowsing(true);
     }
     // The bar stays open for the whole session, including at the live head
-    // (`doc.version === null`, browsing still true), until `close`.
+    // (`doc.previewVersion === null`, browsing still true), until `close`.
     if (doc != null && docId !== null && browsing) {
       root.classList.add('b-version-on');
-      if (!frame) frame = createVersionBarFrame(root, frameDeps);
+      if (!frame) frame = createVersionBarFrame(root, frameDeps());
       frame.update({
         docId,
         branch: doc.branchId ?? undefined,
-        version: doc.version,
+        version: doc.previewVersion,
         branchName: doc._currentBranchName() ?? undefined,
         pinned: doc._isVersionPinned,
       });
@@ -1638,7 +2012,7 @@ export function createUndoRedo(
   container: HTMLElement,
   deps: UndoRedoDeps,
 ): MountedPiece {
-  return mountPiece(container, buildUndoRedo(deps));
+  return mountPiece(container, buildUndoRedo(deps, 'standalone'));
 }
 
 // The presence roster (coloured initials of who's on the active doc).
@@ -1708,11 +2082,17 @@ function buildBarShell(): BarShell {
   // row-gap, leaving asymmetric padding. "Empty" = every child is blank (no
   // text, no element children), so an empty save-indicator span or a
   // command-less undo/redo piece both count.
+  // `b-app-tools` marks a strip holding something of the app's beside
+  // undo / redo, which the narrow bar shows on a row of its own.
   function updateToolsVisibility(): void {
-    const allBlank = Array.from(tools.children).every(
-      (c) => (c.textContent ?? '').trim() === '' && c.childElementCount === 0,
+    const blank = (c: Element): boolean =>
+      (c.textContent ?? '').trim() === '' && c.childElementCount === 0;
+    const children = Array.from(tools.children);
+    tools.style.display = children.every(blank) ? 'none' : '';
+    bar.classList.toggle(
+      'b-app-tools',
+      children.some((c) => !c.classList.contains('b-undo-full') && !blank(c)),
     );
-    tools.style.display = allBlank ? 'none' : '';
   }
   // The app (and the undo/redo subscription) mutates `tools` after mount, so
   // re-evaluate visibility on any change.
@@ -1759,10 +2139,15 @@ export function createSessionToolbar(
     pieces.push(drivePiece);
   }
 
-  // Middle: SDK toolbar-surface commands (undo/redo) + the app's slot.
+  // Middle: SDK toolbar-surface commands (undo/redo) + the app's slot. On a
+  // narrow screen the middle wraps to a row of its own, so Undo and Redo show
+  // there instead as icons in the right cluster (CSS swaps the two), and the
+  // middle row only appears for the app's own tools.
   const undoRedo = buildUndoRedo(deps);
   shell.tools.append(undoRedo.root);
-  pieces.push(undoRedo);
+  const compactUndo = buildUndoRedo(deps, 'compact');
+  shell.end.append(compactUndo.root);
+  pieces.push(undoRedo, compactUndo);
 
   // Right cluster: presence roster + account menu.
   if (showPresence) {
@@ -1776,12 +2161,14 @@ export function createSessionToolbar(
     pieces.push(accountPiece);
   }
 
-  // The historical-version preview bar sits below the bar as a full-width
-  // strip: mounting the toolbar is all an app does to get correct version-
-  // preview UX, so it never hand-rolls one.
+  // Two full-width strips sit below the bar: the not-signed-in notice on a
+  // document created without an account, and the historical-version preview
+  // bar. Mounting the toolbar is all an app does to get both, so it never
+  // hand-rolls either.
+  const guestPiece = buildNotSignedIn(deps);
   const versionPiece = buildVersionPreview(deps);
-  pieces.push(versionPiece);
-  container.replaceChildren(shell.bar, versionPiece.root);
+  pieces.push(guestPiece, versionPiece);
+  container.replaceChildren(shell.bar, guestPiece.root, versionPiece.root);
 
   return {
     tools: shell.tools,
@@ -1799,15 +2186,18 @@ export function createSessionToolbar(
 // never wraps when `tools` does.
 export function createSessionHeader(
   container: HTMLElement,
-  deps?: VersionPreviewDeps,
+  deps?: VersionPreviewDeps & NotSignedInDeps,
 ): SessionHeaderHandle {
   const shell = buildBarShell();
-  // A header shell built with session access includes the historical-version
-  // preview bar below the bar, so a composable-chrome app gets the same
-  // correct preview UX the full toolbar does without a separate mount.
+  // A header shell built with session access includes the two strips below
+  // the bar (the not-signed-in notice and the historical-version preview
+  // bar), so a composable-chrome app gets what the full toolbar renders
+  // there without a separate mount.
+  const guestPiece = deps ? buildNotSignedIn(deps) : null;
   const versionPiece = deps ? buildVersionPreview(deps) : null;
   container.replaceChildren(
     shell.bar,
+    ...(guestPiece ? [guestPiece.root] : []),
     ...(versionPiece ? [versionPiece.root] : []),
   );
   return {
@@ -1815,6 +2205,7 @@ export function createSessionHeader(
     tools: shell.tools,
     end: shell.end,
     destroy(): void {
+      guestPiece?.destroy();
       versionPiece?.destroy();
       shell.destroy();
       container.replaceChildren();

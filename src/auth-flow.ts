@@ -40,7 +40,7 @@ interface RefreshResponse {
 }
 
 // The credential the SDK presents to POST /refresh.
-//   - `cookie`: the default; the browser attaches the `brass_auth` cookie
+//   - `cookie`: the default; the browser attaches the `__Host-brass_auth` cookie
 //      and nothing is sent in the body. Works wherever the third-party
 //      cookie is allowed.
 //   - `code`: a one-time `brass_code` from the sign-in redirect, exchanged

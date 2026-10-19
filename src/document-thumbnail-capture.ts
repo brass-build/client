@@ -16,11 +16,22 @@ export type CanvasSource =
   | HTMLCanvasElement
   | (() => HTMLCanvasElement | null);
 
+// `version` names the document version the image depicts; omitted, the
+// uploader reads the document's current version.
 export type ThumbnailUploader = (
   image: Blob,
   width: number,
   height: number,
+  version?: number,
 ) => Promise<void>;
+
+// A frame taken from the registered canvas, held until the version it depicts
+// is known.
+export interface CapturedFrame {
+  image: Blob;
+  width: number;
+  height: number;
+}
 
 // Debounce window: a screenshot is taken this long after the last local edit,
 // so a continuous drag uploads once when it settles, not once per frame.
@@ -52,6 +63,23 @@ const FINGERPRINT_EDGE = 64;
 // per-surface derivative is a server-side concern.
 const MAX_THUMBNAIL_CAPTURE_EDGE = 512;
 
+// Resolve after the browser paints the next frame. A hidden tab paints none,
+// so a short timeout stands in for it there; outside a browser it resolves at
+// once.
+function nextFrame(): Promise<void> {
+  if (typeof requestAnimationFrame !== 'function') return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    requestAnimationFrame(() => finish());
+    setTimeout(finish, 100);
+  });
+}
+
 // Cap the longest edge to `maxEdge`, preserving aspect ratio, never upscaling:
 // a canvas within the cap is uploaded at native size (`scaled: false`), so the
 // common small-canvas case skips the offscreen redraw. The returned dimensions
@@ -81,9 +109,12 @@ export interface ThumbnailCaptureHost {
   // True when the doc is still attached, re-checked after the async toBlob +
   // upload boundary so a capture in flight when the doc closes does not upload.
   isAttached(): boolean;
+  // The version the document shows now: what a frame taken now depicts.
+  currentVersion(): number | null;
   // Called once an upload lands, so the host can record which version of the
-  // document now has a picture.
-  onCaptured?(): void;
+  // document now has a picture: `version` when the upload named one, else the
+  // document's current version.
+  onCaptured?(version?: number): void;
 }
 
 export class ThumbnailCapture {
@@ -345,43 +376,98 @@ export class ThumbnailCapture {
     return typeof this._canvas === 'function' ? this._canvas() : this._canvas;
   }
 
+  // Take a frame for a checkpoint: on the next animation frame, so the redraw
+  // the app makes for the action it just finished is in the picture. The
+  // frame supersedes a pending debounced capture, since it depicts the same
+  // edits; an edit after it schedules a new one. Null when there is no canvas
+  // or nothing may be captured.
+  async captureFrame(): Promise<CapturedFrame | null> {
+    if (this._canvas === null || this._uploader === null) return null;
+    if (!this.host.isCaptureAllowed()) return null;
+    if (this._timer !== null) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+    // Once the document has a picture, a checkpoint's frame supersedes a seed
+    // watch the way an edit does (see `schedule`).
+    if (this._uploaded) {
+      this._stopSeed();
+      this._seedOwed = false;
+    }
+    await nextFrame();
+    try {
+      return await this._render();
+    } catch (err) {
+      this._warnFailure(err);
+      return null;
+    }
+  }
+
+  // Upload a frame taken by `captureFrame` as the picture of `version`.
+  async uploadFrame(frame: CapturedFrame, version: number): Promise<void> {
+    if (this._uploader === null || !this.host.isAttached()) return;
+    try {
+      await this._uploader(frame.image, frame.width, frame.height, version);
+      this._uploaded = true;
+      this.host.onCaptured?.(version);
+    } catch (err) {
+      this._warnFailure(err);
+    }
+  }
+
+  private async _render(): Promise<CapturedFrame | null> {
+    const el = this._resolveCanvas();
+    if (!el) return null;
+    this._warnIfWebglContextWillProduceBlankCapture(el);
+    const target = fitWithinMaxEdge(
+      el.width,
+      el.height,
+      MAX_THUMBNAIL_CAPTURE_EDGE,
+    );
+    const source = target.scaled ? this._downscale(el, target) : el;
+    const image = await new Promise<Blob>((resolve, reject) => {
+      source.toBlob((blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error('thumbnail capture: canvas produced no image'));
+      }, 'image/png');
+    });
+    return { image, width: target.width, height: target.height };
+  }
+
   private async _capture(): Promise<void> {
     if (!this.host.isCaptureAllowed()) return;
     if (this._uploader === null) return;
-    const el = this._resolveCanvas();
-    if (!el) return;
-    this._warnIfWebglContextWillProduceBlankCapture(el);
+    // Read before the frame is taken, so the upload names the version the
+    // frame depicts rather than whatever the document reached while the
+    // image encoded.
+    const version = this.host.currentVersion();
     try {
-      const target = fitWithinMaxEdge(
-        el.width,
-        el.height,
-        MAX_THUMBNAIL_CAPTURE_EDGE,
-      );
-      const source = target.scaled ? this._downscale(el, target) : el;
-      const image = await new Promise<Blob>((resolve, reject) => {
-        source.toBlob((blob) => {
-          if (blob) resolve(blob);
-          else reject(new Error('thumbnail capture: canvas produced no image'));
-        }, 'image/png');
-      });
-      if (!this.host.isAttached()) return;
-      await this._uploader(image, target.width, target.height);
-      this._uploaded = true;
-      this.host.onCaptured?.();
-    } catch (err) {
-      // Best-effort: a rate-limit rejection, a lack of write access, or a
-      // transient failure leaves the document on its last picture, and the
-      // next edit or arrival reschedules. Reported once, because the refusals
-      // that persist (no write access, an oversized image) are otherwise
-      // indistinguishable from a capture that never ran.
-      if (!this._warnedCaptureFailure) {
-        this._warnedCaptureFailure = true;
-        console.warn(
-          '@brass-build/client: uploading the document thumbnail failed: ' +
-            (err instanceof Error ? err.message : String(err)),
-        );
+      const frame = await this._render();
+      if (frame === null || !this.host.isAttached()) return;
+      if (version === null) {
+        await this._uploader(frame.image, frame.width, frame.height);
+      } else {
+        await this._uploader(frame.image, frame.width, frame.height, version);
       }
+      this._uploaded = true;
+      this.host.onCaptured?.(version ?? undefined);
+    } catch (err) {
+      this._warnFailure(err);
     }
+  }
+
+  // Best-effort: a rate-limit rejection, a lack of write access, or a
+  // transient failure leaves the document on its last picture, and the next
+  // edit or arrival reschedules. Reported once, because the refusals that
+  // persist (no write access, an oversized image) are otherwise
+  // indistinguishable from a capture that never ran.
+  private _warnFailure(err: unknown): void {
+    if (this._warnedCaptureFailure) return;
+    this._warnedCaptureFailure = true;
+    console.warn(
+      '@brass-build/client: uploading the document thumbnail failed: ' +
+        (err instanceof Error ? err.message : String(err)),
+    );
   }
 
   // Redraw an oversized canvas into an offscreen 2D canvas at the capped

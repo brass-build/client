@@ -9,7 +9,7 @@ what a keystroke costs, and where a text container belongs in a document.
 ## Paint a peer's edit without losing the caret
 
 Assigning `field.value` moves the caret to the end, so an editor that
-assigns unconditionally throws away the reader's place on every peer
+assigns unconditionally throws away the user's place on every peer
 keystroke, and one that skips a focused field never shows a peer's typing
 to anyone who is typing themselves. Find the span the incoming value
 replaced, and move the caret across it:
@@ -29,10 +29,12 @@ report.subscribe((value, origin) => {
   const max = Math.min(painted.length, value.length);
   let start = 0;
   while (start < max && painted.charCodeAt(start) === value.charCodeAt(start)) start += 1;
+  if (start > 0 && isHighHalf(value.charCodeAt(start - 1))) start -= 1;
   let tail = 0;
   while (tail < max - start
          && painted.charCodeAt(painted.length - 1 - tail)
             === value.charCodeAt(value.length - 1 - tail)) tail += 1;
+  if (tail > 0 && isLowHalf(value.charCodeAt(value.length - tail))) tail -= 1;
   const removed = painted.length - tail - start;
   const inserted = value.length - tail - start;
 
@@ -45,13 +47,13 @@ report.subscribe((value, origin) => {
     : caret >= start + removed ? caret + inserted - removed
     : start + Math.min(caret - start, inserted);
 
-  // A reader with text selected has two offsets, and `selectionDirection`
+  // A user with text selected has two offsets, and `selectionDirection`
   // says which of them their next keystroke extends from.
   const focused = document.activeElement === field;
   const anchor = carry(field.selectionStart ?? 0);
   const head = carry(field.selectionEnd ?? field.selectionStart ?? 0);
   const direction = field.selectionDirection;
-  // Assigning `value` resets the scroll, which throws a reader who is
+  // Assigning `value` resets the scroll, which throws a user who is
   // partway down a long field back to the top on every peer keystroke.
   const scroll = field.scrollTop;
 
@@ -65,19 +67,24 @@ report.subscribe((value, origin) => {
 ```
 
 Offsets count UTF-16 code units, which is what a text field's
-`selectionStart` reports, so the two agree with no conversion. The same
-units are why an offset needs one more check before it is used: a character
+`selectionStart` reports, so the two agree with no conversion. A character
 outside the Basic Multilingual Plane, an emoji above all, is two code units,
-and the `charCodeAt` walk above stops between them whenever the edit sits
-next to one. `nudgeOffPair` moves such an offset off the seam:
+and two emoji can share their first unit (😀 and 🙂 both start with
+`0xd83d`), so the `charCodeAt` walks can stop between the halves of a
+character. Keep the two checks after the walks: they move each end of the
+span back onto a whole character, so a caret where a peer types an emoji
+ends up after it, since the caret binds to the text on its right. A carried
+offset can still land inside a character the peer inserted, and
+`nudgeOffPair` moves it back to that character's start:
 
 ```ts
+const isHighHalf = (unit: number) => unit >= 0xd800 && unit <= 0xdbff;
+const isLowHalf = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff;
+
 function nudgeOffPair(text: string, at: number): number {
   const bounded = Math.max(0, Math.min(at, text.length));
   if (bounded <= 0 || bounded >= text.length) return bounded;
-  const before = text.charCodeAt(bounded - 1);
-  const after = text.charCodeAt(bounded);
-  const splits = before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+  const splits = isHighHalf(text.charCodeAt(bounded - 1)) && isLowHalf(text.charCodeAt(bounded));
   return splits ? bounded - 1 : bounded;
 }
 ```
@@ -94,8 +101,8 @@ path, where it would otherwise run on every keystroke.
 
 ## Defer the paint, not the write, while an IME is open
 
-Assigning to the field while an IME is open discards what it is holding,
-which costs a reader typing Japanese, Chinese, or Korean the word they were
+Assigning to the field while an IME is open discards its unfinished input,
+which costs a user typing Japanese, Chinese, or Korean the word they were
 in the middle of. So track `compositionstart` / `compositionend` and skip
 the paint in between.
 
@@ -113,7 +120,7 @@ field.addEventListener('compositionend', () => {
   painted = field.value;
   report.update(painted);
   // What arrived while the composition was open is older than what the
-  // reader just committed, so paint the container's own value, which
+  // user just committed, so paint the container's own value, which
   // carries both.
   if (missed) {
     missed = false;
@@ -123,9 +130,9 @@ field.addEventListener('compositionend', () => {
 });
 ```
 
-Holding the incoming value and applying it at `compositionend` is the
+Keeping the incoming value aside and applying it at `compositionend` is the
 version that looks right and loses data: that value predates the
-composition, so painting it discards the word the reader just committed.
+composition, so painting it discards the word the user just committed.
 Deferring the write instead has the same shape of bug one layer down, since
 the field's value then has no record of the peer's edit and `update` diffs
 it back out.
@@ -152,7 +159,7 @@ revision pattern:
 | 300 KB | 4.09 |
 
 One paragraph, one description, or one report is far inside a frame at
-typing speed. A field holding a book is not, and an app whose document
+typing speed. A field containing a book is not, and an app whose document
 grows that large wants its prose split across containers, one per section,
 so an edit compares against a section rather than the book.
 
@@ -167,9 +174,9 @@ per-session, since a snapshot carries the history.
 
 A text container is a top-level root, and no nested-text surface exists, so
 per-element prose that merges costs one root per element. Loro prices a
-container against how many the document holds, so that does not stay flat
-the way the record store does, where paging holds container count down past
-`UNPAGED_MAX_RECORDS`. Creating one text root per element against the same
+container against how many the document contains, so that does not stay flat
+the way the record store does, where paging keeps container count down once
+a map contains many records. Creating one text root per element against the same
 elements written as records:
 
 | elements | a root each | as records | roots heap | records heap |

@@ -72,6 +72,10 @@ export interface RetryOptions {
   // Invoked before each replay with the 1-based attempt that just failed and
   // the response (absent on a network throw). For diagnostics only.
   onRetry?: (attempt: number, response: Response | undefined) => void;
+  // A response in the replay set that this answers true for is returned
+  // rather than replayed: a refusal that names its own wait, which the caller
+  // paces instead of this backoff.
+  isFinal?: (response: Response) => Promise<boolean>;
   // Injected for tests; defaults to the real timer.
   sleep?: (ms: number) => Promise<void>;
 }
@@ -112,6 +116,7 @@ export async function fetchWithRetry(
     if (response && !policy.replayStatuses.has(response.status)) {
       return response;
     }
+    if (response && options.isFinal && (await options.isFinal(response))) return response;
     if (attempt === maxAttempts) {
       if (response) return response;
       throw lastError;

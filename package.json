@@ -1,6 +1,6 @@
 {
   "name": "@brass-build/client",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Client SDK for Brass",
   "type": "module",
   "main": "./dist/index.js",
@@ -39,8 +39,11 @@
     "prepublishOnly": "tsc -b --force"
   },
   "dependencies": {
+    "apache-arrow": "^21.2.0",
     "fflate": "^0.8.3",
-    "loro-crdt": "^1.13.0"
+    "flatbuffers": "^25.1.24",
+    "fzstd": "^0.1.1",
+    "loro-crdt": "1.13.9"
   },
   "devDependencies": {
     "typescript": "~6.0.0"

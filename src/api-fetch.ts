@@ -13,6 +13,12 @@ export interface ApiRequest {
   path: string;
   // JSON-encoded when present; sets `content-type: application/json`.
   body?: unknown;
+  // Attempts a GET gets when it is refused as throttled or fails in the
+  // network, including the first. Defaults to `fetchWithRetry`'s.
+  maxAttempts?: number;
+  // A POST that changes nothing (a read whose ids travel in the body), so it
+  // is retried as a GET is.
+  idempotent?: boolean;
 }
 
 interface ApiFetchOptions {
@@ -47,8 +53,11 @@ export function createApiFetch(opts: ApiFetchOptions): ApiFetch {
     // rather than surfacing it as a hard failure; a write is never
     // replayed here.
     const response =
-      method === 'GET'
-        ? await fetchWithRetry(() => fetch(url, init))
+      method === 'GET' || req.idempotent === true
+        ? await fetchWithRetry(
+            () => fetch(url, init),
+            req.maxAttempts !== undefined ? { maxAttempts: req.maxAttempts } : {},
+          )
         : await fetch(url, init);
     if (response.status === 204) return undefined as T;
 
@@ -82,7 +91,38 @@ function isErrorBody(body: unknown): body is { error: string } {
 // through here so the server's machine-readable denials, in particular
 // `code: "app_not_installed"`, survive into the error the caller (and
 // the SDK's own install-consent offer) can branch on.
+// What a 409 to an import claim says about the client holding it: how long
+// ago it last claimed or refreshed, and whether its output is being sealed.
+export interface ClaimHolder {
+  refreshedMsAgo: number;
+  expiresInMs: number;
+  sealing: boolean;
+}
+
+const claimHolders = new WeakMap<BrassError, ClaimHolder>();
+
+export function claimHolderOf(err: unknown): ClaimHolder | null {
+  return err instanceof BrassError ? (claimHolders.get(err) ?? null) : null;
+}
+
+function readClaimHolder(body: unknown): ClaimHolder | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const b = body as Record<string, unknown>;
+  const ago = b['refreshed_ms_ago'];
+  const lapses = b['expires_in_ms'];
+  if (b['pending'] !== true || typeof ago !== 'number' || !Number.isFinite(ago)) return null;
+  if (typeof lapses !== 'number' || !Number.isFinite(lapses)) return null;
+  return { refreshedMsAgo: ago, expiresInMs: lapses, sealing: b['sealing'] === true };
+}
+
 export function brassErrorFromBody(status: number, parsed: unknown): BrassError {
+  const err = brassErrorOf(status, parsed);
+  const holder = status === 409 ? readClaimHolder(parsed) : null;
+  if (holder !== null) claimHolders.set(err, holder);
+  return err;
+}
+
+function brassErrorOf(status: number, parsed: unknown): BrassError {
   const message = isErrorBody(parsed) ? parsed.error : 'Request failed';
   if (isNotInstalledBody(parsed)) {
     return new BrassError(message, {
@@ -99,7 +139,17 @@ export function brassErrorFromBody(status: number, parsed: unknown): BrassError 
       ...(typeof title === 'string' ? { title } : {}),
     });
   }
-  return new BrassError(message, { status });
+  const code = serverCode(parsed);
+  return new BrassError(message, { status, ...(code !== null ? { code } : {}) });
+}
+
+// The code a refusal body carries, when it is one: a short snake_case token.
+const SERVER_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+
+function serverCode(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const code = (value as { code?: unknown }).code;
+  return typeof code === 'string' && SERVER_CODE.test(code) ? code : null;
 }
 
 // The platform refuses to join a document this app's declared schema cannot

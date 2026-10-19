@@ -4,6 +4,7 @@
 // raw Loro import at 50k entities, so the materialisation path adds no
 // full-snapshot logging or deep cloning of decoded bytes.
 
+import { awaitSeal, type SealStatus } from './staged-seal.js';
 import {
   DEFAULT_STREAM_NAME,
   Document,
@@ -15,15 +16,24 @@ import {
   type DocumentDriveTrackingState,
   type DriveMirrorDirection,
   type HostedUiProvider,
-  type ReadOnlyReason,
+  type ForcedReadOnlyReason,
   type ResyncPushOutcome,
+  type CheckoutFetcher,
 } from './documents.js';
 import { ensureWasmReady } from './wasm-runtime.js';
 import { createPresenceController } from './presence.js';
 import type { WsTopicCallback } from './ws-client.js';
 import { applyAppAssertionHeader, applyClientVersionHeader } from './api-headers.js';
 import { brassErrorFromBody } from './api-fetch.js';
-import { fetchWithRetry, RETRY_IDEMPOTENT_WRITE } from './fetch-retry.js';
+import type { SelectDocumentResult } from './hosted-ui.js';
+import type { ImportReport } from './import-report.js';
+import type { ImportClaimResponse, ImportFailedResponse } from './importer.js';
+import { randomToken, type DocumentSourceBlob } from './documents-namespace.js';
+import {
+  fetchWithRetry,
+  RETRY_IDEMPOTENT_WRITE,
+  RETRY_WRITE_503,
+} from './fetch-retry.js';
 import {
   deadlineForUpload,
   fetchWithDeadline,
@@ -41,8 +51,21 @@ type ClientReportReason =
   | 'divergence_healed';
 import { BrassError } from './errors.js';
 import { perfStart } from './perf.js';
+import { SealedContent } from './sealed-store.js';
 import { joinCoverageFloor, snapshotSeqOf } from './join-coverage.js';
+import { parseInputStatusNudge } from './inputs.js';
+import { TEMPORARY_INPUTS_RUNTIME, type InputsStatusRuntime } from './inputs-status.js';
+import { setJoinStamp } from './join-stamp.js';
+import { storeClaimSecret } from './guest-link.js';
+import {
+  base64ToBytes,
+  decodeJoinContent,
+  joinEncoding,
+  type ContentFetch,
+  type JoinContent,
+} from './join-content.js';
 import { declaredTailBytes, resolveTailOps, type WireTailOp } from './tail-ops.js';
+import { SEALED_ACCEPT } from './sealed-store.js';
 import {
   opBlobExceedsDurableLimit,
   opBlobNeedsStaging,
@@ -66,8 +89,7 @@ export interface OpenDocumentByIdOptions {
    * join a document this app's declared schema cannot read, so that a
    * bookmark or a reload does not silently open one; this says the refusal
    * has already been answered. Set by the client after a person answers its
-   * dialog, or for every open when the app passes
-   * `openIncompatibleDocuments` at init.
+   * dialog.
    * @internal
    */
   acceptSchemaConflict?: boolean;
@@ -94,6 +116,19 @@ export interface OpenDocumentByIdOptions {
    */
   version?: number;
   /**
+   * Open a live copy with nothing on it that writes: it follows other
+   * people's edits, and `mutate` throws. `false` opens to write whatever
+   * `documentOptions.readOnly` says. Unset, `documentOptions.readOnly`
+   * decides.
+   */
+  readOnly?: boolean;
+  /**
+   * Open a read-only copy that changes only when the app asks: it reports
+   * that the document moved (`onChanged`) and holds what it loaded
+   * until `reload()`. Implies `readOnly`.
+   */
+  frozen?: boolean;
+  /**
    * SDK-internal load-progress sink. The session threads it through to
    * surface a progress state before the Document exists; apps read that via
    * `Brass.session`, never this.
@@ -103,7 +138,12 @@ export interface OpenDocumentByIdOptions {
    * the wire, because the two are paced by different things and a document
    * can spend the whole of the first in what looks like silence: `tail` is
    * the spilled ops the join fetches, `snapshot` the snapshot itself, and
-   * absent means `snapshot`.
+   * absent means `snapshot`. `preparing` reports no bytes: the platform is
+   * making the document editable, and the open is waiting for it. `importing`
+   * reports no bytes either: a reader's open is waiting for work that replaces
+   * the content (a new version of the file being read), and `message` is the
+   * platform's own words for it. Answering `false` to either says nobody wants
+   * this open any more, and the open rejects rather than going on waiting.
    *
    * `total` is the whole download in both phases. The tail declares it from
    * each spilled op's own size plus the snapshot still to come, so the
@@ -122,8 +162,9 @@ export interface OpenDocumentByIdOptions {
 export type LoadProgress = (
   loaded: number,
   total: number | null,
-  phase?: 'snapshot' | 'tail',
-) => void;
+  phase?: 'snapshot' | 'tail' | 'preparing' | 'importing',
+  message?: string,
+) => void | boolean;
 
 // `Brass.createDocument(options?)` creates a new document and returns it
 // fully editable. `name` defaults to "Untitled". Placement is resolved from
@@ -166,6 +207,136 @@ export type CreateDocumentResult =
   | { kind: 'needs-destination' }
   | { kind: 'needs-organization' };
 
+// What `POST /anonymous-documents` minted: the document, the editor link
+// token that is its only credential, when the platform removes it, and the
+// secret that claims it on a sign-in in this browser.
+export interface MintedAnonymousDocument {
+  docId: string;
+  linkToken: string;
+  expiresAt: Date;
+  claimSecret?: string;
+}
+
+// The file types a visitor can start a document from, as an `<input
+// accept>` value (`''` when there are none), and the largest file taken.
+export interface AnonymousUploadAccept {
+  accept: string;
+  maxBytes: number;
+}
+
+// The app's upload-types read: whether the app starts new documents at all,
+// and either the file types a visitor can start one from or the app's
+// refusal of signed-out use.
+export type AnonymousUploadTypes =
+  | { offersNew: boolean; accept: AnonymousUploadAccept }
+  | { offersNew: boolean; refusal: BrassError };
+
+export function acceptFromUploadTypes(body: unknown): AnonymousUploadAccept {
+  const wire = body as
+    | {
+        import_types?: { extensions?: unknown; content_types?: unknown }[];
+        max_bytes?: unknown;
+      }
+    | undefined;
+  const tokens = new Set<string>();
+  for (const type of Array.isArray(wire?.import_types) ? wire.import_types : []) {
+    for (const list of [type.extensions, type.content_types]) {
+      if (!Array.isArray(list)) continue;
+      for (const token of list) if (typeof token === 'string' && token !== '') tokens.add(token);
+    }
+  }
+  return {
+    accept: [...tokens].join(','),
+    maxBytes: typeof wire?.max_bytes === 'number' ? wire.max_bytes : Number.POSITIVE_INFINITY,
+  };
+}
+
+function parseMintedAnonymousDocument(parsed: unknown): MintedAnonymousDocument {
+  const minted = parsed as {
+    doc_id?: unknown;
+    link_token?: unknown;
+    claim_secret?: unknown;
+    expires_at?: unknown;
+  } | undefined;
+  const expiresAt =
+    typeof minted?.expires_at === 'string' ? new Date(minted.expires_at) : null;
+  if (
+    typeof minted?.doc_id !== 'string' ||
+    typeof minted.link_token !== 'string' ||
+    expiresAt === null ||
+    Number.isNaN(expiresAt.getTime())
+  ) {
+    throw new BrassError('Malformed anonymous document response', { status: 500 });
+  }
+  return {
+    docId: minted.doc_id,
+    linkToken: minted.link_token,
+    expiresAt,
+    ...(typeof minted.claim_secret === 'string' ? { claimSecret: minted.claim_secret } : {}),
+  };
+}
+
+async function readJsonBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  try {
+    return text ? JSON.parse(text) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// PUT a file to a presigned URL. Through XHR where there is one, which is
+// the browser API that reports upload progress.
+function putFile(
+  url: string,
+  file: File,
+  onProgress?: (loaded: number, total: number) => void,
+): Promise<void> {
+  const failed = (status: number) =>
+    new BrassError('The file could not be uploaded.', { status: status || 503 });
+  if (typeof XMLHttpRequest === 'undefined') {
+    return fetch(url, { method: 'PUT', body: file }).then((r) => {
+      if (!r.ok) throw failed(r.status);
+    });
+  }
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded, e.total);
+    };
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(failed(xhr.status)));
+    xhr.onerror = () => reject(failed(0));
+    xhr.send(file);
+  });
+}
+
+export interface GuestImportCalls {
+  claimImport(): Promise<ImportClaimResponse>;
+  stageImport(bundle: Uint8Array): Promise<string>;
+  completeImport(report: ImportReport | undefined, uploadKey: string): Promise<unknown>;
+  failImport(message: string): Promise<ImportFailedResponse>;
+  sourceBlob(): Promise<DocumentSourceBlob>;
+}
+
+export interface ClaimAnonymousDocumentArgs {
+  linkToken: string;
+  claimSecret: string;
+  // The hosted picker's opaque destination, relayed verbatim like a create's.
+  destination?: unknown;
+  // The name the person settled on in the destination dialog.
+  name?: string;
+}
+
+// The claim's outcome, classified the way a create's is so the same
+// placement loop runs over it. `record` is the claimed document as the
+// server answered it, in the picker's shape, so the claim can be stashed as
+// a selection; null when the answer did not carry the fields.
+export type ClaimDocumentResult =
+  | { kind: 'claimed'; record: SelectDocumentResult | null }
+  | { kind: 'needs-destination' }
+  | { kind: 'needs-organization' };
+
 // Wire-protocol-pinned response shape from
 // `GET /documents/{docId}?include=snapshot`.
 export interface DocumentSnapshotResponse {
@@ -180,9 +351,13 @@ export interface DocumentSnapshotResponse {
   stream_branch_id?: string;
   // `inline` carries base64 bytes; `presigned` is a signed URL the
   // client GETs directly; `null` means no snapshot yet (empty new doc).
+  // `sealed` is SEALED CONTENT rather than a snapshot: the document's
+  // records as they were produced, which this reader decodes with no CRDT
+  // engine. Always a URL, never inline.
   snapshot:
     | { kind: 'inline'; data_b64: string }
     | { kind: 'presigned'; url: string }
+    | { kind: 'sealed'; url: string }
     | null;
   // Tail ops since the last snapshot, seq ascending, each a base64 Loro op
   // blob. Applied in order; `applyRemoteOp` is idempotent.
@@ -202,6 +377,14 @@ export interface DocumentSnapshotResponse {
   // ground truth). The handshake runs off the `doc_init` frame's copy; this
   // is carried for wire parallelism. Absent until the branch is compacted.
   snapshot_version_vector?: string;
+  // The seq the line's current import was sealed at (`importSeqMoved`).
+  import_seq?: number;
+  // True while the document is its stored file and no import has run on it:
+  // an importer claiming it will replace this (empty) content, so a client
+  // with one holds the document before the claim answers.
+  awaits_import?: boolean;
+  // Why `can_edit` is false when the grant itself would allow writing.
+  read_only_reason?: string;
   // Whether the caller may write to this document, as the server's own
   // write gate answers it. `false` opens the Document read-only, so
   // `doc.readOnly` covers a view-only grant at bind time rather than
@@ -243,6 +426,7 @@ export interface DrivePublishTargetWire {
   source_unreadable?: unknown;
   publishing?: unknown;
   publish_failed?: unknown;
+  unpublishable?: unknown;
 }
 
 // Wire shape of the `drive` block carried on the join response and the
@@ -266,6 +450,9 @@ export interface DocumentDriveSummaryWire {
   // Optional: a frame from an older server omits it, treated as not
   // publishing (the `canPush` affordance then behaves as before).
   publishing?: boolean;
+  // The server's publish decision: something a publish would change now.
+  publishable?: boolean;
+  keeps_prior_versions?: boolean;
   source_unreadable?: string;
 }
 
@@ -277,9 +464,12 @@ export interface DocumentAtVersionResponse {
   effective_version: number;
   requested_version: number;
   branch_id: string;
+  // `sealed` when the version is the head of a document still stored as a
+  // record set (see `DocumentSnapshotResponse`).
   snapshot:
     | { kind: 'inline'; data_b64: string }
     | { kind: 'presigned'; url: string }
+    | { kind: 'sealed'; url: string }
     | null;
   tail_ops: Array<{ seq: number; op_blob_b64: string }>;
   current_seq: number;
@@ -294,6 +484,8 @@ export interface OpenDocumentWsClient {
     options?: {
       ownsFrameRetry?: boolean;
       onEnded?: (info: { reason: string }) => void;
+      onSubscribed?: (info: { resubscribed: boolean; currentSeq?: number }) => void;
+      notice?: boolean;
     },
   ): () => void;
   send(frame: unknown): void;
@@ -306,6 +498,14 @@ export interface OpenDocumentWsClient {
   // Whether a socket is open right now. Absent reads as connected, which is
   // what a transport-only test stub is.
   readonly connected?: boolean;
+  // Whether any socket has opened in this page load. Absent reads as opened,
+  // for the same reason.
+  readonly everOpened?: boolean;
+}
+
+export interface LinkCredential {
+  accessToken: string;
+  appAssertion: string;
 }
 
 export interface OpenDocumentFactoryOptions {
@@ -315,11 +515,24 @@ export interface OpenDocumentFactoryOptions {
   // Forwarded as `X-Brass-App-Assertion` on the Brass-API fetches only; the
   // presigned snapshot downloads carry no Brass headers.
   getAppAssertion?: () => Promise<string | null>;
+  // The person's own credential for a link open, held when they signed in on
+  // a link page. An app that opens public links only for people signed in
+  // to it refuses the open without one.
+  getLinkCredential?: () => LinkCredential | null | Promise<LinkCredential | null>;
+  // How a link open proceeds when the server answers that the signed-in
+  // person opens the document as themselves. Defaults to this factory's own
+  // `open`.
+  openAsMember?: (docId: string, options?: OpenDocumentByIdOptions) => Promise<OpenedDocument>;
   // The shared WS client. When provided (production), the factory wires a
   // doc-topic subscription + local-op send hook so the Document is editable.
   // When absent (tests / snapshot reads), the local-op hook is inert: state
   // still mutates locally but nothing leaves the process.
   wsClient?: OpenDocumentWsClient;
+  // The socket a document opened through `token` uses. A link admits a socket
+  // to its one document only, so a link's socket carries nothing else and the
+  // page's own socket keeps the signed-in person's credential. Falls back to
+  // `wsClient`.
+  linkWsClient?: (token: string) => OpenDocumentWsClient | undefined;
   // ID minter, exposed for deterministic test clientOpIds. Defaults to
   // `crypto.randomUUID()`, falling back to a 32-hex Math.random() string.
   // Correlation is SDK-side only (the server never reads the value), so
@@ -337,10 +550,12 @@ export interface OpenDocumentFactoryOptions {
     image: Blob,
     width: number,
     height: number,
+    version?: number,
   ) => Promise<unknown>;
   // Routes `doc.createCheckpoint(...)`. When absent (tests), it throws.
   checkpointCreator?: (
     doc: Document,
+    anchor: import('./document-checkpoints.js').CheckpointAnchor,
   ) => Promise<import('./documents-namespace.js').DocumentCheckpoint>;
   // Routes `doc.pushToDrive(...)`. When absent (tests / offline), it throws.
   drivePusher?: (
@@ -352,6 +567,18 @@ export interface OpenDocumentFactoryOptions {
   sourceBlobFetcher?: (
     doc: Document,
   ) => Promise<import('./documents-namespace.js').DocumentSourceBlob>;
+  // Routes `subscribeInputStatus` / `inputStatus` for a document or one of
+  // its stream lines. When absent (tests / offline), those methods throw.
+  inputsRuntime?: (docId: string) => import('./inputs-status.js').InputsStatusRuntime;
+  // Posts a key's provisional entry once the op carrying a `dependsOn` /
+  // `markRead` change is acknowledged. When absent, nothing is posted and the
+  // platform reads the key from the document when it compacts.
+  /** @internal */
+  provisionalInputsPoster?: (
+    docId: string,
+    post: import('./inputs.js').ProvisionalInputsPost,
+    opts?: { superseded?: () => boolean },
+  ) => Promise<import('./inputs.js').ProvisionalInputsAnswer | null>;
   // Streams manifest plumbing (`GET` / `POST /documents/{docId}/streams`).
   // When supplied, every returned Document exposes `doc.stream(name)` /
   // `doc.stream(name)` / `doc.listStreams()`; the factory owns the
@@ -408,6 +635,16 @@ const WORK_READY_STATUS: DocumentWorkStatus = {
   pending: false,
   blocking: false,
 };
+
+// How long an edit waits on a client that has never opened a socket before
+// the document tells the reader it is not saved. Timed from the first waiting
+// edit rather than counted in failed handshakes, because a network that
+// swallows the upgrade can hold one attempt open with no failure to count.
+// The socket starts connecting when the document opens, so by the time this
+// expires it has had at least this long, which is several times a slow
+// mobile handshake, and a network that refuses upgrades outright has failed
+// four or five of them under the reconnect backoff (1s, 2s, 4s).
+export const NEVER_OPENED_NOTICE_MS = 10_000;
 
 const CONTENT_PULL_ATTEMPTS = 5;
 const CONTENT_PULL_BACKOFF_MS = 1000;
@@ -499,6 +736,35 @@ export interface DocumentFactory {
   createDocumentId: (args: CreateDocumentArgs) => Promise<CreateDocumentResult>;
   // Read-only guest open from a public-link token (no auth, no live sub).
   openByLink: OpenDocumentByLinkFn;
+  // Mint a document with no account: `POST /anonymous-documents`, no
+  // Authorization header. The returned link token opens it through
+  // `openByLink` read-write until it expires.
+  mintAnonymousDocument: (args: {
+    name?: string;
+  }) => Promise<MintedAnonymousDocument>;
+  // Whether this app starts new documents, and the file types a visitor
+  // without an account can start one from:
+  // `GET /anonymous-documents/upload-types`.
+  anonymousUploadTypes: () => Promise<AnonymousUploadTypes>;
+  // Mint a document with no account from a file: stage it through a
+  // presigned PUT, then `POST /anonymous-documents/from-upload`. The file's
+  // import runs after this resolves, and the open reports it as pending.
+  // The app-run import calls for a document a visitor started from a file,
+  // through the member import routes with its edit link as the credential.
+  guestImports: (token: string, docId: string) => GuestImportCalls;
+  mintAnonymousDocumentFromFile: (args: {
+    file: File;
+    name?: string;
+    onUploadProgress?: (loaded: number, total: number) => void;
+  }) => Promise<MintedAnonymousDocument>;
+  // Move a document minted without an account into the caller's
+  // organization: `POST /documents/{docId}/claim`. Classified like
+  // `createDocumentId` so the caller can place it through the same hosted
+  // surfaces.
+  claimAnonymousDocument: (
+    docId: string,
+    args: ClaimAnonymousDocumentArgs,
+  ) => Promise<ClaimDocumentResult>;
 }
 
 // Wire shapes on the `doc:` topic. Frame names match the server's exactly, so
@@ -592,6 +858,7 @@ interface DocInitFrame {
   // frontier and resync-push anything local holds beyond it. Absent on
   // never-compacted docs; the handshake is skipped (nothing to verify).
   snapshot_version_vector?: string;
+  import_seq?: number;
 }
 
 // Server-pushed "the document moved past you" prompt, naming the seq to
@@ -678,8 +945,7 @@ interface DocOpsDroppedFrame {
 }
 
 // Map the snake_case wire `drive` block to the public camelCase
-// `DocumentDriveStatus`. `canPush` is derived once here (unbroken, two-way,
-// and ahead/diverged) so apps don't re-derive it.
+// `DocumentDriveStatus`. `canPush` is the server's `publishable`.
 function toDriveStatus(wire: DocumentDriveSummaryWire): DocumentDriveStatus {
   const state = wire.tracking_state;
   // Only an explicit `import_only` restricts publishing; a frame omitting the
@@ -691,22 +957,14 @@ function toDriveStatus(wire: DocumentDriveSummaryWire): DocumentDriveStatus {
     driveType: wire.drive_type,
     driveName: wire.drive_name,
     state,
-    // `broken` gates the Publish affordance, so read it explicitly rather
-    // than by truthiness: a frame that OMITS it (a future partial drive
-    // update) must not be treated as unbroken and offered a push the server
-    // would reject. Require an explicit `false` to enable, and an explicit
-    // `true` to flag broken. Behaviour is unchanged for today's frames, which
-    // always carry the boolean. Whether the file is written server-side or
-    // from the app's own serializer is a REQUEST SHAPE the push path resolves
-    // for itself, so it says nothing about whether this document can publish.
-    canPush:
-      wire.broken === false &&
-      mirrorDirection === 'two_way' &&
-      (state === 'ahead' || state === 'diverged'),
+    // Only an explicit `true` offers a publish, so a frame that omits the
+    // field never offers one the server would refuse.
+    canPush: wire.publishable === true,
     label: wire.tracking_label,
     detail: wire.tracking_detail,
     broken: wire.broken === true,
     pushReplacesRemote: wire.push_replaces_remote,
+    keepsPriorVersions: wire.keeps_prior_versions === true,
     mirrorDirection,
     ref: wire.tracking_ref,
     refUpdatedAt: wire.tracking_ref_updated_at,
@@ -738,6 +996,7 @@ function toPublishTarget(
     detail: typeof wire.detail === 'string' ? wire.detail : '',
     publishing: wire.publishing === true,
     publishFailed: wire.publish_failed === true,
+    unpublishable: wire.unpublishable === true,
   };
 }
 
@@ -797,6 +1056,7 @@ function parseDocInitFrame(frame: unknown): DocInitFrame | null {
     ...(typeof f.snapshot_version_vector === 'string'
       ? { snapshot_version_vector: f.snapshot_version_vector }
       : {}),
+    ...(typeof f.import_seq === 'number' ? { import_seq: f.import_seq } : {}),
   };
 }
 
@@ -861,7 +1121,15 @@ type OversizedOpResult =
       // Set when the refusal was about the writer rather than the op, which
       // is the same distinction the socket's `op_rejected` reasons draw:
       // every later op meets it too, so the Document turns read-only.
-      readOnly?: ReadOnlyReason;
+      readOnly?: ForcedReadOnlyReason;
+      // A new version's import replaced the line this op was built on: the
+      // copy reopens rather than failing the op (`OP_REJECTED_MOVED`).
+      moved?: boolean;
+      // The document still holds only its uploaded file, and it takes no
+      // edits until that file is imported (`OP_REJECTED_NOT_IMPORTED`).
+      notImported?: boolean;
+      // No transport this writer has can carry the op (a 413).
+      tooLarge?: boolean;
     };
 
 // Whether re-sending the same op is the right move. Two statuses refuse to
@@ -884,6 +1152,25 @@ function opWriteIsRetryable(status: number): boolean {
 function isCapacityRefusal(status: number, parsed: unknown): boolean {
   if (status === 507) return true;
   return (parsed as { code?: unknown } | undefined | null)?.code === 'at_capacity';
+}
+
+// The refusal of an op built on a version of the line that a new version's
+// import has since replaced. It is about the copy rather than the op: no
+// resend or heal can place an op naming the replaced version's containers, so
+// the copy reopens, as it does on `doc_gone` `moved`.
+const OP_REJECTED_MOVED = 'moved';
+
+// The document still holds only its uploaded file. Every op meets the same
+// refusal until the import lands, so a smaller or later push cannot place
+// the refused work and the heal is not armed: the copy locks and reloads.
+const OP_REJECTED_NOT_IMPORTED = 'not_imported';
+
+function isNotImportedRefusal(parsed: unknown): boolean {
+  return (parsed as { code?: unknown } | undefined | null)?.code === OP_REJECTED_NOT_IMPORTED;
+}
+
+function isMovedRefusal(parsed: unknown): boolean {
+  return (parsed as { code?: unknown } | undefined | null)?.code === OP_REJECTED_MOVED;
 }
 
 // A failure uploading an oversized op's blob to storage. It carries its own
@@ -931,7 +1218,7 @@ function opRejectedMessage(frame: OpRejectedFrame): string {
   if (typeof frame.message === 'string' && frame.message !== '') {
     return frame.message;
   }
-  return 'A change could not be saved and will not be retried. Reload the document to continue.';
+  return 'A change could not be saved and will not be retried. Reload to continue.';
 }
 
 // The one rejection reason that describes the DOCUMENT rather than the op:
@@ -961,14 +1248,14 @@ function isCapacityRejection(frame: OpRejectedFrame): boolean {
 // object answers for the names it inherits, so a reason reading `constructor`
 // or `toString` would resolve a function and lock the document, which is the
 // opposite of what an unclassified refusal means.
-const READ_ONLY_REJECTION_REASONS = new Map<string, ReadOnlyReason>([
+const READ_ONLY_REJECTION_REASONS = new Map<string, ForcedReadOnlyReason>([
   ['role_denied', 'grant'],
   ['scope_denied', 'app'],
 ]);
 
 function readOnlyReasonForRejection(
   frame: OpRejectedFrame,
-): ReadOnlyReason | null {
+): ForcedReadOnlyReason | null {
   if (typeof frame.reason !== 'string') return null;
   return READ_ONLY_REJECTION_REASONS.get(frame.reason) ?? null;
 }
@@ -1098,16 +1385,6 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
-// Uses `atob` (present in modern browsers, Node 20+, and jsdom) rather than
-// Node-only `Buffer`, which would force a browser-bundle polyfill.
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) {
-    bytes[i] = bin.charCodeAt(i);
-  }
-  return bytes;
-}
 
 function isSnapshotResponse(body: unknown): body is DocumentSnapshotResponse {
   if (typeof body !== 'object' || body === null) return false;
@@ -1124,16 +1401,171 @@ function isSnapshotResponse(body: unknown): body is DocumentSnapshotResponse {
   return true;
 }
 
+/**
+ * The body a join answered with, or the error it is.
+ *
+ * Every open starts here: check the status, then check the shape. Both
+ * failures are open-time and neither is recoverable by the caller, so they
+ * throw rather than returning, and the shape check is what stops a response
+ * the server changed out from under a pinned SDK being read as an empty
+ * document. `describe` names the response in the message, since a reader
+ * debugging one wants to know which route answered.
+ */
+function unwrapJoinResponse<T>(
+  result: { status: number; parsed: unknown; parseFailed: boolean },
+  isShape: (body: unknown) => body is T,
+  describe: string,
+): T {
+  const { status, parsed, parseFailed } = result;
+  if (status < 200 || status >= 300) {
+    throw brassErrorFromBody(status, parseFailed ? undefined : parsed);
+  }
+  if (!isShape(parsed)) {
+    throw new BrassError(`Malformed document ${describe} response`, {
+      status: 500,
+    });
+  }
+  return parsed;
+}
+
 // Fold the join's write verdict into the Document options, so a reader the
 // server will not accept writes from opens read-only instead of learning it
 // from the first refused op. Only ever ADDS the restriction: a caller that
 // asked for a read-only Document keeps it whatever the grant says.
+/** The longest one pause between joins of a converting document. The wait
+ *  itself has no bound, because a slow conversion is still a healthy one:
+ *  each join is answered with what is left of it, and a conversion that
+ *  cannot finish ends as `at_capacity`, which stops the wait. */
+const CONVERSION_MAX_DELAY_MS = 60_000;
+/** The shortest pause, so a server answering without holding the join is not
+ *  asked again in a tight loop. */
+const CONVERSION_MIN_DELAY_MS = 250;
+const CONVERSION_POLL_MIN_MS = 1_000;
+const CONVERSION_POLL_MAX_MS = 5_000;
+/** Joins in a row that may fail outright while a conversion is awaited. */
+const CONVERSION_JOIN_FAILURES = 5;
+// How often a reader's open waiting on an import reads the work status, as
+// the backstop for a terminal frame it did not hear.
+const IMPORT_WAIT_POLL_MIN_MS = 2_000;
+const IMPORT_WAIT_POLL_MAX_MS = 15_000;
+const OPEN_SUPERSEDED_MESSAGE = 'This open was replaced by another';
+// How long an open waits on the platform's work (a conversion, an import)
+// before it rejects. Above the longest the platform itself takes to end that
+// work either way: an import is two runs of the hydration worker (one retry)
+// before the platform marks it failed, about 32 minutes, and a conversion is
+// three compaction runs before it is marked full, about 18. A wait past this
+// is work the platform has stopped reporting on.
+// Exported for the fake-timer tests.
+export const OPEN_WAIT_CEILING_MS = 40 * 60 * 1000;
+const OPEN_WAIT_EXPIRED_MESSAGE = 'This is taking too long to open. Reload to try again.';
+const IMPORT_FAILED_MESSAGE = 'This file could not be imported';
+/** How long the server holds a writable join for a conversion, less a margin,
+ *  so a join sent this long before the conversion is expected is held until
+ *  it lands. */
+const CONVERSION_HOLD_MS = 10_000;
+
+/** When to send the next held join, given how long the conversion is
+ *  expected to take from now. */
+function heldJoinDelay(retryAfterMs: number): number {
+  return Math.min(
+    Math.max(CONVERSION_MIN_DELAY_MS, retryAfterMs - CONVERSION_HOLD_MS),
+    CONVERSION_MAX_DELAY_MS,
+  );
+}
+
+/** Whether a response is the join's retryable refusal for a conversion,
+ *  which names its own wait, so the caller paces it rather than a backoff. */
+async function namesConversionWait(response: Response): Promise<boolean> {
+  if (response.status !== 503) return false;
+  try {
+    const body = (await response.clone().json()) as { retry_after_ms?: unknown };
+    return typeof body.retry_after_ms === 'number';
+  } catch {
+    return false;
+  }
+}
+
+type JoinAnswer = { status: number; parsed: unknown; parseFailed: boolean };
+
+/**
+ * Work a join reports that the open waits out before it resolves: pending work
+ * that locks readers, such as the platform importing the file or a new
+ * version of it.
+ */
+function pendingImportWork(
+  join: JoinAnswer,
+): { status: DocumentWorkStatus; topic: string } | null {
+  if (join.status !== 200 || join.parseFailed) return null;
+  const parsed = join.parsed as {
+    doc_id?: unknown;
+    branch_id?: unknown;
+    status?: unknown;
+  } | null;
+  if (parsed === null || typeof parsed !== 'object') return null;
+  if (typeof parsed.doc_id !== 'string' || typeof parsed.branch_id !== 'string') return null;
+  const status = parseWorkStatus(parsed.status);
+  if (status === null || !status.pending || status.blocking === false) return null;
+  return { status, topic: `doc:${parsed.doc_id}:${parsed.branch_id}` };
+}
+
+/**
+ * The error an open rejects with when the file's import failed and the
+ * document holds nothing from it, or `null`.
+ */
+function failedImportOf(join: JoinAnswer): BrassError | null {
+  if (join.status !== 200 || join.parseFailed) return null;
+  const parsed = join.parsed as {
+    current_seq?: unknown;
+    awaits_import?: unknown;
+    status?: unknown;
+  } | null;
+  if (parsed === null || typeof parsed !== 'object') return null;
+  const status = parseWorkStatus(parsed.status);
+  if (status === null || status.pending || status.blocking !== true) return null;
+  // An import lands at seq 1 or later, so seq 0 is a document no import has
+  // filled.
+  const empty =
+    parsed.awaits_import === true ||
+    typeof parsed.current_seq !== 'number' ||
+    parsed.current_seq <= 0;
+  if (!empty) return null;
+  return new BrassError(status.message !== '' ? status.message : IMPORT_FAILED_MESSAGE, {
+    status: 0,
+  });
+}
+
+/** Why a writable join refused, or `null` for one that served or failed some
+ *  other way. */
+function joinRefusalOf(join: {
+  status: number;
+  parsed: unknown;
+}):
+  | { kind: 'converting'; retryAfterMs?: number }
+  | { kind: 'at_capacity'; error?: string }
+  | null {
+  const body =
+    typeof join.parsed === 'object' && join.parsed !== null
+      ? (join.parsed as { retry_after_ms?: unknown; code?: unknown; error?: unknown })
+      : {};
+  if (join.status === 503 && typeof body.retry_after_ms === 'number' && body.retry_after_ms >= 0) {
+    return { kind: 'converting', retryAfterMs: body.retry_after_ms };
+  }
+  if (join.status === 507 && body.code === 'at_capacity') {
+    return typeof body.error === 'string' ? { kind: 'at_capacity', error: body.error } : { kind: 'at_capacity' };
+  }
+  return null;
+}
+
 function readOnlyForGrant(
   body: DocumentSnapshotResponse,
   options: DocumentOptions | undefined,
 ): DocumentOptions | undefined {
   if (body.can_edit !== false) return options;
-  return { ...options, readOnly: true, readOnlyReason: 'grant' };
+  return {
+    ...options,
+    readOnly: true,
+    readOnlyReason: body.read_only_reason === 'not_imported' ? 'not_imported' : 'grant',
+  };
 }
 
 function isAtVersionResponse(
@@ -1166,11 +1598,156 @@ export function createOpenDocument(
   // fourth one from silently dropping it.
   const consented = new Set<string>();
 
+  // What a document is opened with: the signed-in session, a share link, or
+  // the edit link of a document started without an account. Every document
+  // this factory returns is built by `materialiseAs`, which wires what the
+  // credential reaches, so an open path cannot leave a capability out.
+  type OpenCredential =
+    | { kind: 'session' }
+    | { kind: 'link'; token: string }
+    | { kind: 'temporary'; token: string };
+  const SESSION: OpenCredential = { kind: 'session' };
+
+  function inputsRuntimeFor(credential: OpenCredential, docId: string): InputsStatusRuntime | null {
+    switch (credential.kind) {
+      case 'session':
+        return opts.inputsRuntime ? opts.inputsRuntime(docId) : null;
+      case 'link':
+        return {
+          readKey: (key, query) =>
+            getWithLink(
+              credential.token,
+              `/documents/${encodeURIComponent(docId)}/inputs/${encodeURIComponent(key)}`,
+              query,
+            ),
+        };
+      case 'temporary':
+        return TEMPORARY_INPUTS_RUNTIME;
+    }
+  }
+
+  // The join, the op write and the work-status read, through whichever
+  // credential the document was opened with.
+  // `rejoin` marks a read for a document this page already has open, which a
+  // link meters apart from opens.
+  async function joinAs(
+    credential: OpenCredential,
+    docId: string,
+    options: OpenDocumentByIdOptions | undefined,
+    { rejoin = true }: { rejoin?: boolean } = {},
+  ): Promise<JoinAnswer> {
+    return credential.kind === 'session'
+      ? fetchSnapshot(docId, options, await requireToken())
+      : fetchLinkView(credential.token, options ?? {}, undefined, { rejoin });
+  }
+
+  async function postOpAs(
+    credential: OpenCredential,
+    docId: string,
+    lineId: string,
+    opBlobB64: string,
+    clientOpId: string,
+    base: { base_import_seq?: number },
+  ): Promise<{ status: number; parsed: unknown }> {
+    if (credential.kind === 'session') {
+      return postDocumentOp(docId, lineId, opBlobB64, clientOpId, await requireToken(), base);
+    }
+    return postLinkOp(credential.token, docId, lineId, opBlobB64, clientOpId, base);
+  }
+
+  async function readStatusAs(credential: OpenCredential, docId: string): Promise<unknown> {
+    const headers: Record<string, string> = {};
+    let url: string;
+    if (credential.kind === 'session') {
+      headers['authorization'] = `Bearer ${await requireToken()}`;
+      applyClientVersionHeader(headers);
+      await applyAppAssertionHeader(headers, opts.getAppAssertion);
+      url = `${baseUrl}/documents/${encodeURIComponent(docId)}`;
+    } else {
+      Object.assign(headers, await linkViewHeaders());
+      url = `${baseUrl}/links/${encodeURIComponent(credential.token)}/view?app_id=${encodeURIComponent(opts.appId)}&rejoin=1`;
+    }
+    const response = await fetch(url, { method: 'GET', headers });
+    if (!response.ok) {
+      throw new BrassError(`document read returned ${response.status}`, { status: response.status });
+    }
+    return response.json();
+  }
+
+  function wsClientFor(credential: OpenCredential): OpenDocumentWsClient | undefined {
+    return credential.kind === 'session' ? opts.wsClient : (opts.linkWsClient?.(credential.token) ?? opts.wsClient);
+  }
+
+  async function materialiseAs(
+    credential: OpenCredential,
+    ...args: Parameters<typeof materialise>
+  ): Promise<OpenedDocument> {
+    const doc = await materialise(...args);
+    doc._setInputsRuntime(inputsRuntimeFor(credential, args[0].doc_id));
+    return doc;
+  }
+
+  // A join. One that will write and takes nothing else waits while the
+  // platform converts the document: the join is refused with how long is
+  // left, and asked again then, for as long as that takes. The open's
+  // progress sink hears `preparing` on each wait, and its `false` ends the
+  // wait with a rejection.
   async function fetchSnapshot(
     docId: string,
     options: OpenDocumentByIdOptions | undefined,
     token: string,
-  ): Promise<{ status: number; parsed: unknown; parseFailed: boolean }> {
+  ): Promise<JoinAnswer> {
+    if (opensReadOnly(options)) {
+      return joinOnce(docId, options, token);
+    }
+    // The first join spends the token the caller holds; a re-join after a
+    // long wait asks for a current one.
+    let held: string | null = token;
+    return waitWhileConverting(async () => {
+      const t = held ?? (await requireToken());
+      held = null;
+      return joinOnce(docId, options, t);
+    }, options?.onSnapshotProgress);
+  }
+
+  async function waitWhileConverting(
+    join: () => Promise<JoinAnswer>,
+    progress: LoadProgress | undefined,
+  ): Promise<JoinAnswer> {
+    const deadline = Date.now() + OPEN_WAIT_CEILING_MS;
+    let answer = await join();
+    let failures = 0;
+    for (;;) {
+      const refused = joinRefusalOf(answer);
+      if (refused?.kind !== 'converting') return answer;
+      if (progress?.(0, null, 'preparing') === false) {
+        throw new BrassError(OPEN_SUPERSEDED_MESSAGE, { status: 0 });
+      }
+      if (Date.now() >= deadline) throw new BrassError(OPEN_WAIT_EXPIRED_MESSAGE, { status: 0 });
+      let delay =
+        refused.retryAfterMs === undefined ? CONVERSION_POLL_MIN_MS : heldJoinDelay(refused.retryAfterMs);
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        try {
+          answer = await join();
+          failures = 0;
+          break;
+        } catch (err) {
+          // The document is known to exist and to be converting, so a join
+          // that fails outright is the connection rather than the answer.
+          failures += 1;
+          if (failures >= CONVERSION_JOIN_FAILURES) throw err;
+          delay = Math.min(CONVERSION_POLL_MIN_MS * 2 ** (failures - 1), CONVERSION_POLL_MAX_MS);
+        }
+      }
+    }
+  }
+
+  async function joinOnce(
+    docId: string,
+    options: OpenDocumentByIdOptions | undefined,
+    token: string,
+  ): Promise<JoinAnswer> {
     const search = new URLSearchParams();
     search.set('include', 'snapshot');
     if (options?.filter !== undefined) {
@@ -1184,16 +1761,46 @@ export function createOpenDocument(
     }
     if (options?.acceptSchemaConflict === true) consented.add(docId);
     if (consented.has(docId)) search.set('accept_schema_conflict', '1');
-    const url = `${baseUrl}/documents/${encodeURIComponent(docId)}?${search.toString()}`;
-    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
-    applyClientVersionHeader(headers);
-    await applyAppAssertionHeader(headers, opts.getAppAssertion);
-    const endFetch = perfStart('open: GET /documents (http + read body)');
+    // A caller that will not write asks for the document as it is stored. It
+    // matters on a document the platform holds as a record set: serving one
+    // to a reader is the point of storing one, and serving it to a writer
+    // means converting it to a CRDT first, which the server does and this
+    // reader has no reason to wait for.
+    if (opensReadOnly(options)) search.set('intent', 'read');
+    return sendJoin(`/documents/${encodeURIComponent(docId)}`, search, {
+      headers: await memberHeaders(token),
+      perf: 'open: GET /documents (http + read body)',
+      ...(options?.onSnapshotProgress !== undefined ? { progress: options.onSnapshotProgress } : {}),
+    });
+  }
+
+  // Every join's request: the stored frames this build decodes (a client that
+  // does not name them is served the CRDT), the answer parsed, and its
+  // spilled tail ops resolved. A reader holding a CRDT names the frames too:
+  // the line as stored is the cheapest answer to serve it, and `applyJoin`
+  // takes either form in place.
+  async function sendJoin(
+    path: string,
+    search: URLSearchParams,
+    {
+      headers,
+      perf,
+      progress,
+    }: {
+      headers?: Record<string, string>;
+      perf?: string;
+      progress?: LoadProgress;
+    },
+  ): Promise<JoinAnswer> {
+    search.set('accept', SEALED_ACCEPT);
+    const qs = search.toString();
+    const url = `${baseUrl}${path}${qs ? `?${qs}` : ''}`;
+    const endFetch = perf !== undefined ? perfStart(perf) : null;
     // Idempotent read: ride out a transient 5xx / 429 instead of failing the
     // open on something that clears on its own.
     //
     // Longer than the default handful of attempts because of what a 503 means
-    // on this route: the document is intact and its storage is busy. A
+    // on a join: the document is intact and its storage is busy. A
     // document's own writes contend with each other, so the one most likely
     // to answer 503 is one that was just written hard, which is exactly the
     // moment a person reloads to see their work. That pressure clears over
@@ -1207,15 +1814,18 @@ export function createOpenDocument(
     // answered the first, with the reader watching a loading surface
     // throughout.
     const response = await fetchWithRetry(
-      () =>
-        fetch(url, {
-          method: 'GET',
-          headers,
-        }),
-      { maxAttempts: 7, baseDelayMs: 700, maxNetworkAttempts: 3 },
+      () => fetch(url, { method: 'GET', ...(headers !== undefined ? { headers } : {}) }),
+      {
+        maxAttempts: 7,
+        baseDelayMs: 700,
+        maxNetworkAttempts: 3,
+        // A conversion's refusal says how long to wait, and the caller waits
+        // that long rather than this backoff's second or two.
+        isFinal: namesConversionWait,
+      },
     );
     const text = await response.text();
-    endFetch({ status: response.status, responseChars: text.length });
+    endFetch?.({ status: response.status, responseChars: text.length });
     let parsed: unknown = undefined;
     let parseFailed = false;
     if (text) {
@@ -1225,44 +1835,34 @@ export function createOpenDocument(
         parseFailed = true;
       }
     }
-    await resolveParsedTailOps(parsed, options?.onSnapshotProgress);
+    // A tail op whose bytes spilled to storage arrives as a signed URL, which
+    // carries its own signature, so a guest resolves it as a member does.
+    await resolveParsedTailOps(parsed, progress);
     return { status: response.status, parsed, parseFailed };
   }
 
+  async function memberHeaders(token: string): Promise<Record<string, string>> {
+    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+    applyClientVersionHeader(headers);
+    await applyAppAssertionHeader(headers, opts.getAppAssertion);
+    return headers;
+  }
+
   // `GET /documents/{docId}/at/{version}`: read-only materialization at a
-  // historical version. Same auth + parse shape as `fetchSnapshot`.
+  // historical version.
   async function fetchAtVersion(
     docId: string,
     version: number,
     branch: string | undefined,
     token: string,
-  ): Promise<{ status: number; parsed: unknown; parseFailed: boolean }> {
+  ): Promise<JoinAnswer> {
     const search = new URLSearchParams();
     if (branch !== undefined) search.set('branch', branch);
-    const qs = search.toString();
-    const url =
-      `${baseUrl}/documents/${encodeURIComponent(docId)}` +
-      `/at/${encodeURIComponent(String(version))}` +
-      (qs ? `?${qs}` : '');
-    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
-    applyClientVersionHeader(headers);
-    await applyAppAssertionHeader(headers, opts.getAppAssertion);
-    const response = await fetch(url, {
-      method: 'GET',
-      headers,
-    });
-    const text = await response.text();
-    let parsed: unknown = undefined;
-    let parseFailed = false;
-    if (text) {
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parseFailed = true;
-      }
-    }
-    await resolveParsedTailOps(parsed);
-    return { status: response.status, parsed, parseFailed };
+    return sendJoin(
+      `/documents/${encodeURIComponent(docId)}/at/${encodeURIComponent(String(version))}`,
+      search,
+      { headers: await memberHeaders(token) },
+    );
   }
 
   // The historical-materialise fetcher `doc._checkoutVersion(v)` calls back
@@ -1271,16 +1871,7 @@ export function createOpenDocument(
   // `stream_seqs` in the response (present only on a default/branch preview
   // that resolved a checkpoint, absent on a line's own preview) rides
   // through so the parent can preview every opened stream at the same point.
-  function makeCheckoutFetcher(): (
-    id: string,
-    version: number,
-    branchId: string,
-  ) => Promise<{
-    snapshotBytes: Uint8Array | null;
-    tailOpBlobs: Uint8Array[];
-    effectiveVersion: number;
-    streamSeqs?: Record<string, number>;
-  }> {
+  function makeCheckoutFetcher(): CheckoutFetcher {
     return async (id, version, branchId) => {
       const t = await requireToken();
       const result = await fetchAtVersion(id, version, branchId, t);
@@ -1295,26 +1886,9 @@ export function createOpenDocument(
           status: 500,
         });
       }
-      let snapshotBytes: Uint8Array | null = null;
-      const snap = result.parsed.snapshot;
-      if (snap !== null) {
-        if (snap.kind === 'inline') {
-          snapshotBytes = base64ToBytes(snap.data_b64);
-        } else if (snap.kind === 'presigned') {
-          const snapResponse = await fetch(snap.url, { method: 'GET' });
-          if (!snapResponse.ok) {
-            throw new BrassError('Presigned snapshot fetch failed', {
-              status: snapResponse.status,
-            });
-          }
-          const buf = await snapResponse.arrayBuffer();
-          snapshotBytes = new Uint8Array(buf);
-        } else {
-          // A delivery kind this build does not implement; refuse rather than
-          // preview an empty version (same rationale as `materialise`).
-          throw snapshotKindTooNewError();
-        }
-      }
+      const content = await decodeJoinContent(result.parsed.snapshot, (url) =>
+        fetchPresignedSnapshot(url),
+      );
       const tailOpBlobs = result.parsed.tail_ops.map((entry) =>
         base64ToBytes(entry.op_blob_b64),
       );
@@ -1328,7 +1902,7 @@ export function createOpenDocument(
         if (Object.keys(parsed).length > 0) streamSeqs = parsed;
       }
       return {
-        snapshotBytes,
+        content,
         tailOpBlobs,
         effectiveVersion: result.parsed.effective_version,
         ...(streamSeqs ? { streamSeqs } : {}),
@@ -1352,8 +1926,8 @@ export function createOpenDocument(
     if (typeof serverMessage === 'string' && serverMessage.length > 0) {
       return serverMessage;
     }
-    if (status === 403) return 'You do not have permission to edit this document.';
-    if (status === 404) return 'This document is no longer available.';
+    if (status === 403) return 'You do not have permission to make changes here.';
+    if (status === 404) return 'This is no longer available.';
     return `This change could not be saved (${status}).`;
   }
 
@@ -1364,27 +1938,30 @@ export function createOpenDocument(
   // outstanding tracker and re-asserts it, and a blind replay would write a
   // second stored copy of the same edit.
   // Mint a presigned PUT and upload the blob to it, returning the staging
-  // key the op write names. The PUT carries no Brass headers: the URL is
+  // key the op write names. A share link mints on the same route with the
+  // link as the credential. The PUT carries no Brass headers: the URL is
   // signed, and an extra header falls outside that signature.
   async function stageOpBlob(
     docId: string,
     opBlobB64: string,
-    token: string,
+    credential: { bearer: string } | { link: string },
   ): Promise<string> {
     // Everything in here happens before the op write, so every failure it
     // can take is tagged as one: what the tag buys the writer is the right
     // to send the op again, which a failure of the write itself does not
     // carry.
     try {
-      const headers: Record<string, string> = {
-        authorization: `Bearer ${token}`,
-        'content-type': 'application/json',
-      };
-      applyClientVersionHeader(headers);
-      await applyAppAssertionHeader(headers, opts.getAppAssertion);
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if ('link' in credential) {
+        headers['authorization'] = `Link ${credential.link}`;
+      } else {
+        headers['authorization'] = `Bearer ${credential.bearer}`;
+        applyClientVersionHeader(headers);
+        await applyAppAssertionHeader(headers, opts.getAppAssertion);
+      }
       const mint = await fetchWithDeadline(
         `${baseUrl}/documents/${encodeURIComponent(docId)}/ops/upload`,
-        { method: 'POST', headers, body: '{}' },
+        { method: 'POST', headers, body: JSON.stringify({ byte_size: opBlobB64.length }) },
         OP_WRITE_TIMEOUT_MS,
       );
       let minted: unknown = undefined;
@@ -1427,6 +2004,7 @@ export function createOpenDocument(
     opBlobB64: string,
     clientOpId: string,
     token: string,
+    base: { base_import_seq?: number } = {},
   ): Promise<{ status: number; parsed: unknown }> {
     const headers: Record<string, string> = {
       authorization: `Bearer ${token}`,
@@ -1439,7 +2017,7 @@ export function createOpenDocument(
     // through a request body.
     let stagedKey: string | undefined;
     if (opBlobNeedsStaging(opBlobB64)) {
-      stagedKey = await stageOpBlob(docId, opBlobB64, token);
+      stagedKey = await stageOpBlob(docId, opBlobB64, { bearer: token });
     }
     const endFetch = perfStart('op: POST /documents/{id}/ops');
     const response = await fetchWithDeadline(
@@ -1453,6 +2031,7 @@ export function createOpenDocument(
             : { upload_key: stagedKey }),
           branch_id: branchId,
           client_op_id: clientOpId,
+          ...base,
         }),
       },
       // An op under the staging threshold travels inline, so this request
@@ -1617,24 +2196,27 @@ export function createOpenDocument(
   async function openStreamLine(
     docId: string,
     lineId: string,
+    // The parent document's open, whose read intent every line of it shares.
+    parentOptions: OpenDocumentByIdOptions | undefined,
+    credential: OpenCredential = SESSION,
   ): Promise<Document> {
-    const token = await requireToken();
-    const { status, parsed, parseFailed } = await fetchSnapshot(
-      docId,
-      { branch: lineId },
-      token,
-    );
-    if (status < 200 || status >= 300) {
-      throw brassErrorFromBody(status, parseFailed ? undefined : parsed);
-    }
-    if (!isSnapshotResponse(parsed)) {
-      throw new BrassError('Malformed document snapshot response', {
-        status: 500,
-      });
-    }
+    const lineOptions = rejoinOptions(lineId, parentOptions);
+    const result = await joinAs(credential, docId, lineOptions, { rejoin: false });
+    const parsed = unwrapJoinResponse(result, isSnapshotResponse, 'snapshot');
     // A stream's write authority is the document's, so the line opens
-    // read-only for the same reader the document opens read-only for.
-    const doc = await materialise(parsed, readOnlyForGrant(parsed, undefined));
+    // read-only for the same reader the document opens read-only for, and for
+    // a caller who asked for a read-only document.
+    const asked = parentOptions?.documentOptions;
+    const doc = await materialiseAs(
+      credential,
+      parsed,
+      readOnlyForGrant(
+        parsed,
+        asked?.readOnly === true
+          ? { readOnly: true, readOnlyReason: asked.readOnlyReason ?? 'snapshot' }
+          : undefined,
+      ),
+    );
     // A stream line materializes at a historical seq the same way the
     // default line does, so the parent's version preview can bring this
     // stream to a point in time (`doc.stream(name)._previewAt(seq)`). The
@@ -1697,24 +2279,15 @@ export function createOpenDocument(
         do {
           lineResyncAgain = false;
           try {
-            const t = await requireToken();
-            const res = await fetchSnapshot(docId, { branch: lineId }, t);
+            const res = await joinAs(credential, docId, lineOptions);
             if (res.status < 200 || res.status >= 300) continue;
             if (!isSnapshotResponse(res.parsed)) continue;
-            const snap = res.parsed.snapshot;
-            if (snap !== null) {
-              const bytes =
-                snap.kind === 'inline'
-                  ? base64ToBytes(snap.data_b64)
-                  : await fetchPresignedSnapshot(snap.url);
-              doc._applySnapshot(bytes);
-            }
-            const seqs: number[] = [];
-            for (const entry of res.parsed.tail_ops) {
-              doc.applyRemoteOp(base64ToBytes(entry.op_blob_b64));
-              if (entry.seq > currentSeq) currentSeq = entry.seq;
-              seqs.push(entry.seq);
-            }
+            const applied = await applyJoin(doc, res.parsed, (url) =>
+              fetchPresignedSnapshot(url),
+            );
+            if (applied.kind !== 'applied') return;
+            const seqs = applied.tailSeqs;
+            for (const seq of seqs) if (seq > currentSeq) currentSeq = seq;
             const joined = res.parsed.current_seq;
             if (typeof joined === 'number' && joined > currentSeq) {
               currentSeq = joined;
@@ -1750,13 +2323,13 @@ export function createOpenDocument(
       opBlobB64: string,
       clientOpId: string,
     ): Promise<OversizedOpResult> => {
-      const token = await requireToken();
-      const { status, parsed: opResult } = await postDocumentOp(
+      const { status, parsed: opResult } = await postOpAs(
+        credential,
         docId,
         lineId,
         opBlobB64,
         clientOpId,
-        token,
+        baseImportSeqField(doc),
       );
       if (status < 200 || status >= 300) {
         return {
@@ -1764,6 +2337,9 @@ export function createOpenDocument(
           message: opWriteFailureMessage(status, opResult),
           retryable: opWriteIsRetryable(status),
           atCapacity: isCapacityRefusal(status, opResult),
+          ...(isMovedRefusal(opResult) ? { moved: true } : {}),
+          ...(isNotImportedRefusal(opResult) ? { notImported: true } : {}),
+          ...(status === 413 ? { tooLarge: true } : {}),
           // The route answers 403 when the caller's grant carries no write
           // access, which is the HTTP face of the socket's `role_denied`.
           ...(status === 403 ? { readOnly: 'grant' as const } : {}),
@@ -1780,13 +2356,33 @@ export function createOpenDocument(
       return { ok: true, seq };
     };
 
-    if (opts.wsClient) {
+    // The durability handshake's ground truth for this line, read from the
+    // line's own join so the diff is against this stream's frontier.
+    const refetchDurableFrontier = async (): Promise<{
+      snapshotVersionVector?: string;
+      tailBlobs: Uint8Array[];
+    } | null> => {
+      const res = await joinAs(credential, docId, lineOptions);
+      if (res.status < 200 || res.status >= 300) return null;
+      if (!isSnapshotResponse(res.parsed)) return null;
+      const out: { snapshotVersionVector?: string; tailBlobs: Uint8Array[] } = {
+        tailBlobs: res.parsed.tail_ops.map((entry) => base64ToBytes(entry.op_blob_b64)),
+      };
+      if (typeof res.parsed.snapshot_version_vector === 'string') {
+        out.snapshotVersionVector = res.parsed.snapshot_version_vector;
+      }
+      return out;
+    };
+
+    const lineWsClient = wsClientFor(credential);
+    if (lineWsClient) {
       wireDocTransport({
         doc,
         docId,
         branchId: lineId,
-        wsClient: opts.wsClient,
+        wsClient: lineWsClient,
         postOversizedOp,
+        refetchDurableFrontier,
         newClientOpId: opts.newClientOpId ?? defaultClientOpIdMinter,
         getCurrentSeq: () => currentSeq,
         setCurrentSeq: (next) => {
@@ -1803,27 +2399,450 @@ export function createOpenDocument(
     return doc;
   }
 
+  /**
+   * A snapshot-only open: the ordinary join, materialised read-only, with no
+   * transport wired.
+   *
+   * It reads the JOIN rather than the at-version route even though the two
+   * envelopes match, because the join is what serves a record set as itself.
+   * The at-version route materialises a LoroDoc to replay a tail onto, so it
+   * converts a record set before answering; a reader asking for the document
+   * as it stands has no tail to replay and would pay that conversion for
+   * nothing.
+   *
+   * `readOnly` is what the caller asked for rather than a fact about their
+   * grant, which is why it carries its own reason: an app that disables its
+   * editor on `doc.readOnly` is right to, and the message a refused `mutate`
+   * throws should say the caller opened a snapshot rather than blame a
+   * permission they may well hold.
+   */
+  async function openSnapshotOnly(
+    snapshot: { status: number; parsed: unknown; parseFailed: boolean },
+    options: OpenDocumentByIdOptions,
+  ): Promise<OpenedDocument> {
+    const parsed = unwrapJoinResponse(snapshot, isSnapshotResponse, 'snapshot');
+    return openParsedSnapshot(parsed, options);
+  }
+
+  async function openParsedSnapshot(
+    parsed: DocumentSnapshotResponse,
+    options: OpenDocumentByIdOptions,
+  ): Promise<OpenedDocument> {
+    // The grant's own reason wins where there is one. A viewer who asks for a
+    // snapshot cannot edit either way, and telling them to reopen without
+    // asking for one would be advice that does not work: the refusal has to
+    // name the limit they actually have.
+    const byGrant = readOnlyForGrant(parsed, options.documentOptions);
+    const doc = await materialiseAs(
+      SESSION,
+      parsed,
+      {
+        ...byGrant,
+        readOnly: true,
+        readOnlyReason: byGrant?.readOnlyReason ?? 'snapshot',
+      },
+      options.onSnapshotProgress,
+      { emptyAsFrozen: true },
+    );
+    // What one load brought: the point it was taken at, fixed until the next
+    // load. A live open's provider is the transport's cursor and a
+    // version-pinned one answers from its checkout, so this is what makes
+    // `doc.currentSeq` mean the same thing on all three: the version the
+    // reader is looking at. The change notice compares the document's head
+    // against it.
+    const takeLoad = (load: DocumentSnapshotResponse): void => {
+      const takenAt = load.current_seq;
+      if (typeof takenAt === 'number') doc.setCurrentSeqProvider(() => takenAt);
+      // Work the join reported over the content it served: work that does not
+      // lock readers (a push), or a new version's import that failed and left
+      // the content in place. A join carries a status only while work is in
+      // flight, so one with none after a pending load is the work having ended.
+      if (load.status !== undefined) doc._emitStatus(load.status);
+      else if (doc._workStatusNow?.pending === true) doc._emitStatus(WORK_READY_STATUS, { contentLoaded: true });
+      doc._setImportReport(importReportOf(load));
+      setJoinStamp(doc, (load as { updated_at?: unknown }).updated_at);
+      setJoinedName(doc, load);
+      watchFrom(load);
+    };
+    // An import is stored frozen, so a frozen open of a file nobody has
+    // imported yet runs the app's importer the way an editable open does.
+    doc._awaitsImport = parsed.awaits_import === true;
+    if (opts.sourceBlobFetcher) {
+      const fetcher = opts.sourceBlobFetcher;
+      doc.setSourceBlobFetcher(() => fetcher(doc));
+    }
+    // A document's other streams open as frozen copies of their own lines,
+    // read the same way and watched on their own topics.
+    doc.setOpenedStreamName(options.stream ?? DEFAULT_STREAM_NAME);
+    if (opts.streamProvider) {
+      const provider = opts.streamProvider;
+      const docId = parsed.doc_id;
+      const openedBranchId = parsed.stream_branch_id ?? parsed.branch_id;
+      doc.setStreamRuntime({
+        list: async () => (await provider.list(docId, openedBranchId)).streams,
+        create: () => Promise.reject(new Error('A read-only copy cannot create a stream.')),
+        openLine: (lineId) => openFrozen(docId, frozenLineOptions(lineId)),
+      });
+    }
+    const ws = opts.wsClient;
+    const watchFrom = (load: DocumentSnapshotResponse): void => {
+      if (!ws) return;
+      const topic = `doc:${load.doc_id}:${load.branch_id}`;
+      const at = typeof load.current_seq === 'number' ? load.current_seq : 0;
+      // The copy reports the work that was in flight when it loaded, through to
+      // its outcome, and nothing that starts afterwards: later work describes a
+      // version of the document this copy does not hold.
+      let following = load.status?.pending === true;
+      doc._setChangeNotice((fire) =>
+        ws.subscribe(
+          topic,
+          (frame) => {
+            if (following && isDocStatusFrame(frame)) {
+              const status = normalizeWorkStatus(frame.status);
+              if (!status.pending) following = false;
+              doc._emitStatus(status);
+              doc._settleChangeNotice();
+            }
+            if (frameMovesDocument(frame, at)) fire();
+          },
+          {
+            notice: true,
+            onSubscribed: ({ currentSeq }) => {
+              if (currentSeq !== undefined && currentSeq > at) fire();
+              // Work that ends between the join and this subscribe sent its
+              // frame to nobody, and may or may not have moved the seq, so a
+              // copy taken mid-work asks the row whether it is still running.
+              if (load.status?.pending !== true) return;
+              void readFrozenWorkStatus(load.doc_id).then((now) => {
+                if (now === 'unread' || now?.pending === true) return;
+                doc._emitStatus(now ?? { pending: false, message: '' });
+                fire();
+              });
+            },
+          },
+        ),
+      );
+    };
+    takeLoad(parsed);
+    // A frozen copy loads again only when the app asks. The join keeps the
+    // open's read intent and names the stored frames whatever the copy holds
+    // now, and the result applies in place (`applyJoin`) under the same
+    // handles, switching between frozen content and a CRDT when the line has.
+    const openedId = parsed.doc_id;
+    //
+    // A reload follows the open's rule: it waits out an import in flight and
+    // loads what the import landed, and rejects (keeping what the copy holds)
+    // when the import failed with nothing landed or the file is one only
+    // another app imports. The open's progress sink belongs to the open, so
+    // the reload's wait reports to none.
+    const { onSnapshotProgress: _openProgress, ...reloadOptions } = options;
+    doc._setFrozenReloader(async () => {
+      const join = (): Promise<JoinAnswer> =>
+        paceFrozen(async () => fetchSnapshot(openedId, reloadOptions, await requireToken()));
+      const snapshot = await joinPastWork(openedId, reloadOptions, await join(), join);
+      const load = unwrapJoinResponse(snapshot, isSnapshotResponse, 'snapshot');
+      const applied = await applyJoin(doc, load, (url) => fetchPresignedSnapshot(url));
+      if (applied.kind !== 'reloaded') takeLoad(load);
+    });
+    return doc;
+  }
+
+  // The row's work status as it is now, without a snapshot, or 'unread' when
+  // the read fails.
+  async function readFrozenWorkStatus(docId: string): Promise<DocumentWorkStatus | null | 'unread'> {
+    const now = await readWorkStatus(docId);
+    return now === 'gone' ? 'unread' : now;
+  }
+
+  // As `readFrozenWorkStatus`, with 'gone' for a document the caller can no
+  // longer read (403 / 404).
+  async function readWorkStatus(docId: string): Promise<DocumentWorkStatus | null | 'unread' | 'gone'> {
+    try {
+      const token = await requireToken();
+      const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+      applyClientVersionHeader(headers);
+      await applyAppAssertionHeader(headers, opts.getAppAssertion);
+      const response = await fetch(`${baseUrl}/documents/${encodeURIComponent(docId)}`, {
+        method: 'GET',
+        headers,
+      });
+      if (response.status === 403 || response.status === 404) return 'gone';
+      if (!response.ok) return 'unread';
+      const body = (await response.json()) as { status?: unknown };
+      return parseWorkStatus(body.status);
+    } catch {
+      return 'unread';
+    }
+  }
+
+  // An open joins past an import the join reports (`pendingImportWork`): it
+  // waits for the import to end and joins again, so it resolves with what the
+  // import landed, and rejects when the import failed with nothing landed.
+  async function joinPastWork(
+    docId: string,
+    options: OpenDocumentByIdOptions | undefined,
+    first: JoinAnswer,
+    join: () => Promise<JoinAnswer>,
+  ): Promise<JoinAnswer> {
+    const deadline = Date.now() + OPEN_WAIT_CEILING_MS;
+    let answer = first;
+    for (;;) {
+      const work = pendingImportWork(answer);
+      if (work === null) {
+        const failed = failedImportOf(answer);
+        if (failed !== null) throw failed;
+        return answer;
+      }
+      await waitForWorkToEnd(docId, work.topic, work.status, deadline, options?.onSnapshotProgress);
+      answer = await join();
+    }
+  }
+
+  // Resolves once the work ends: a terminal `doc_status` frame on the
+  // document's topic, or a status read that finds it ended (on subscribe, and
+  // on a backing-off poll for a frame that never arrives). Rejects when the
+  // progress sink says a newer open superseded this one, and at `deadline`.
+  async function waitForWorkToEnd(
+    docId: string,
+    topic: string,
+    status: DocumentWorkStatus,
+    deadline: number,
+    progress: LoadProgress | undefined,
+  ): Promise<void> {
+    const superseded = (): boolean => progress?.(0, null, 'importing', status.message) === false;
+    if (superseded()) throw new BrassError(OPEN_SUPERSEDED_MESSAGE, { status: 0 });
+    const ended = (now: DocumentWorkStatus): boolean => !now.pending || now.blocking === false;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let unsubscribe: (() => void) | null = null;
+      const expiry = setTimeout(
+        () => end(new BrassError(OPEN_WAIT_EXPIRED_MESSAGE, { status: 0 })),
+        Math.max(0, deadline - Date.now()),
+      );
+      const end = (err?: Error): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        clearTimeout(expiry);
+        unsubscribe?.();
+        if (err) reject(err);
+        else resolve();
+      };
+      const check = async (): Promise<void> => {
+        const now = await readWorkStatus(docId);
+        if (now === 'unread') return;
+        // A document the caller lost is left to the next join to report.
+        if (now === 'gone' || now === null || ended(now)) end();
+      };
+      let delay = IMPORT_WAIT_POLL_MIN_MS;
+      const poll = (): void => {
+        timer = setTimeout(() => {
+          timer = null;
+          if (settled) return;
+          if (superseded()) {
+            end(new BrassError(OPEN_SUPERSEDED_MESSAGE, { status: 0 }));
+            return;
+          }
+          void check().finally(() => {
+            if (settled) return;
+            delay = Math.min(delay * 2, IMPORT_WAIT_POLL_MAX_MS);
+            poll();
+          });
+        }, delay);
+      };
+      if (opts.wsClient) {
+        unsubscribe = opts.wsClient.subscribe(
+          topic,
+          (frame) => {
+            if (isDocStatusFrame(frame) && ended(normalizeWorkStatus(frame.status))) end();
+          },
+          { notice: true, onSubscribed: () => void check() },
+        );
+      }
+      poll();
+    });
+  }
+
+  // A frozen open: a snapshot that watches for the document moving once a
+  // listener asks it to. A set is opened as a loop over its ids, so joins
+  // are paced here, which is what keeps such a loop fast without letting it
+  // flood the api. The pace covers the join alone: the content download
+  // goes to storage rather than the api, and holding a lane through it
+  // leaves the next join waiting on bytes the api is not serving.
+  async function openFrozen(docId: string, options: OpenDocumentByIdOptions): Promise<OpenedDocument> {
+    const join = (): Promise<JoinAnswer> =>
+      paceFrozen(async () => fetchSnapshot(docId, options, await requireToken()));
+    // The wait sits outside the pace, which covers a join and not the time
+    // between two of them.
+    const snapshot = await joinPastWork(docId, options, await join(), join);
+    return openSnapshotOnly(snapshot, options);
+  }
+  const paceFrozen = createPacer(FROZEN_OPEN_LANES);
+
+  // What a signed-in open reaches beyond the transport.
+  function wireSessionCapabilities(
+    doc: OpenedDocument,
+    docId: string,
+    parsed: DocumentSnapshotResponse,
+    options: OpenDocumentByIdOptions | undefined,
+  ): void {
+      // `doc._checkoutVersion(v)` calls back here to materialise historical
+      // state, leaving the live subscription untouched.
+      doc.setCheckoutFetcher(makeCheckoutFetcher());
+      // Wire the branch provider + populate the initial list, so the
+      // toolbar's branch chip can name the branch on the next subscribe
+      // tick. Branch management is hosted; this list feeds the SDK's own
+      // chrome, not an app method.
+      if (opts.branchProvider) {
+        doc.setBranchProvider(opts.branchProvider);
+        void doc._refreshBranches().catch(() => {
+          // Best-effort: a failure leaves the chip unnamed until a hosted
+          // branch action refreshes the list.
+        });
+      }
+      // `doc.useCanvas(canvas)` captures + uploads after each local commit; the
+      // doc handles debounce + readOnly gating internally.
+      if (opts.thumbnailUploader) {
+        const uploader = opts.thumbnailUploader;
+        doc.setThumbnailUploader(async (image, width, height, version) => {
+          await uploader(doc, image, width, height, version);
+        });
+      }
+      doc._setThumbnailVersion(parsed.thumbnail?.version ?? null);
+      if (opts.checkpointCreator) {
+        const creator = opts.checkpointCreator;
+        doc.setCheckpointCreator((anchor) => creator(doc, anchor));
+      }
+      if (opts.drivePusher) {
+        const pusher = opts.drivePusher;
+        doc.setDrivePusher((input) => pusher(doc, input));
+      }
+      // `doc.resolveDrive()` opens the hosted resolution surface and, when it
+      // names a document to switch onto, re-opens onto it via the same
+      // `openSiblingDoc` path the `history` fork uses.
+      const hostedForResolve = opts.hostedUiProvider;
+      const resolveSurface = hostedForResolve?.driveResolve;
+      if (hostedForResolve && resolveSurface) {
+        doc.setDriveResolver(async () => {
+          const docId = doc.id;
+          if (docId === null) return null;
+          const result = await resolveSurface(docId);
+          if (result?.newDocId && hostedForResolve.openSiblingDoc) {
+            await hostedForResolve.openSiblingDoc(result.newDocId, {});
+          }
+          return result;
+        });
+      }
+      if (opts.sourceBlobFetcher) {
+        const fetcher = opts.sourceBlobFetcher;
+        doc.setSourceBlobFetcher(() => fetcher(doc));
+      }
+      setJoinStamp(doc, (parsed as { updated_at?: unknown }).updated_at);
+      setJoinedName(doc, parsed);
+      const poster = opts.provisionalInputsPoster;
+      if (poster) doc._setProvisionalInputsPoster((post, o) => poster(docId, post, o));
+      doc.setOpenedStreamName(options?.stream ?? DEFAULT_STREAM_NAME);
+      // Streams: manifest list/create over HTTP plus the per-line open
+      // (join + WS subscribe). Bound to the BRANCH this Document opened on,
+      // which is not the line it materialized when the open named a stream: a
+      // manifest belongs to a branch and a line owns none, so binding to the
+      // line would leave `doc.stream(name)` resolving against nothing.
+      if (opts.streamProvider) {
+        const provider = opts.streamProvider;
+        const openedBranchId = parsed.stream_branch_id ?? parsed.branch_id;
+        doc.setStreamRuntime({
+          list: async () =>
+            (await provider.list(docId, openedBranchId)).streams,
+          create: (name) => provider.create(docId, openedBranchId, name),
+          openLine: (lineId) => openStreamLine(docId, lineId, options),
+        });
+      }
+      // Hosted-UI provider backing the doc's built-in `history` / `details` /
+      // `share` / `delete` commands.
+      if (opts.hostedUiProvider) {
+        doc.setHostedUiProvider(opts.hostedUiProvider);
+        const refreshName = opts.hostedUiProvider.refreshName;
+        if (refreshName && docId) {
+          void refreshName(docId).then((name) => {
+            if (name !== null) doc._setName(name);
+          });
+        }
+      }
+  }
+
+  // What a share link's open reaches beyond the transport: the routes that
+  // take the link as the credential, and the link's own stream manifest.
+  function wireLinkCapabilities(
+    doc: OpenedDocument,
+    docId: string,
+    parsed: DocumentSnapshotResponse,
+    credential: Exclude<OpenCredential, { kind: 'session' }>,
+    options: OpenDocumentByIdOptions | undefined,
+    writes: boolean,
+  ): void {
+    const { token } = credential;
+    setJoinStamp(doc, (parsed as { updated_at?: unknown }).updated_at);
+    setJoinedName(doc, parsed);
+    doc.setOpenedStreamName(options?.stream ?? DEFAULT_STREAM_NAME);
+    if (writes) {
+      doc.setCheckpointCreator(async (anchor) => {
+        const version = anchor?.version ?? doc.currentSeq;
+        if (version === null) {
+          throw new BrassError('createCheckpoint: the document has no resolved version yet', { status: 400 });
+        }
+        const res = await postWithLink<{
+          checkpoint: import('./documents-namespace.js').DocumentCheckpoint;
+        }>(token, `/documents/${encodeURIComponent(docId)}/checkpoints`, {
+          version,
+          ...(doc.branchId !== null ? { branch_id: doc.branchId } : {}),
+        });
+        return res.checkpoint;
+      });
+    }
+    doc.setStreamRuntime({
+      list: () => fetchLinkStreamManifest(token),
+      openLine: (lineId) => openStreamLine(docId, lineId, options, credential),
+      create: async (name) => {
+        if (!writes) {
+          throw new BrassError('A shared-link guest cannot create streams.', { status: 403 });
+        }
+        const info = await postWithLink<{ name: string; format: string; line_id: string }>(
+          token,
+          `/documents/${encodeURIComponent(docId)}/streams`,
+          { name, branch_id: parsed.branch_id },
+        );
+        return { name: info.name, format: info.format, line_id: info.line_id, created_at: '', created_by: '' };
+      },
+    });
+  }
+
   async function finalise(
     docId: string,
     snapshot: { status: number; parsed: unknown; parseFailed: boolean },
     options: OpenDocumentByIdOptions | undefined,
+    credential: OpenCredential = SESSION,
   ): Promise<OpenedDocument> {
-    const { status, parsed, parseFailed } = snapshot;
-    if (status < 200 || status >= 300) {
-      throw brassErrorFromBody(status, parseFailed ? undefined : parsed);
-    }
-    if (!isSnapshotResponse(parsed)) {
-      throw new BrassError('Malformed document snapshot response', { status: 500 });
-    }
-    const doc = await materialise(
+    const parsed = unwrapJoinResponse(snapshot, isSnapshotResponse, 'snapshot');
+    // A caller who asked for a read-only document is told so in the words for
+    // that, not a share link's.
+    const asked = options?.documentOptions;
+    const doc = await materialiseAs(
+      credential,
       parsed,
-      readOnlyForGrant(parsed, options?.documentOptions),
+      readOnlyForGrant(
+        parsed,
+        asked?.readOnly === true && asked.readOnlyReason === undefined
+          ? { ...asked, readOnlyReason: 'snapshot' }
+          : asked,
+      ),
       options?.onSnapshotProgress,
     );
-    // Populate `doc.status` from the join before the first `doc_status` frame
-    // (a stub opened mid-hydration returns `snapshot: null` + a `pending`
-    // status).
+    // Populate `doc.status` from the join before the first `doc_status` frame.
     if (parsed.status !== undefined) doc._emitStatus(parsed.status);
+    doc._setImportReport(importReportOf(parsed));
+    setJoinStamp(doc, (parsed as { updated_at?: unknown }).updated_at);
+    doc._awaitsImport = parsed.awaits_import === true;
     // Whether this app is the one to serialize the document, which is what
     // decides whether a push carries bytes. Answered by the server for the
     // caller's own app and only on the join, since the fanout frame is one
@@ -1909,12 +2928,13 @@ export function createOpenDocument(
       | { ok: false; reason: string }
     > => {
       const endPerf = perfStart('doc: content reload (fetch + import)');
-      const token = await requireToken();
       // Refetch the branch this doc was opened on, not the default. `parsed`
       // is the opened-branch join, so its `branch_id` is authoritative;
       // dropping it would import the default branch's snapshot + tail into a
       // doc open on another branch and silently merge the wrong CRDT state.
-      const result = await fetchSnapshot(docId, { branch: parsed.branch_id }, token);
+      // The open's read intent too: a reader who opened a record set as one
+      // re-joins as one, rather than as a writer whose join converts it.
+      const result = await joinAs(credential, docId, rejoinOptions(parsed.branch_id, options));
       if (result.status < 200 || result.status >= 300) {
         endPerf({ ok: false, joinStatus: result.status });
         return { ok: false, reason: `join fetch returned ${result.status}` };
@@ -1923,40 +2943,35 @@ export function createOpenDocument(
         endPerf({ ok: false, joinStatus: result.status });
         return { ok: false, reason: 'malformed join response' };
       }
-      const snap = result.parsed.snapshot;
-      let snapshotBytes: Uint8Array | null = null;
-      if (snap !== null && snap.kind === 'inline') {
-        snapshotBytes = base64ToBytes(snap.data_b64);
-      } else if (snap !== null && snap.kind === 'presigned') {
+      doc._awaitsImport = result.parsed.awaits_import === true;
+      let applied: JoinApplied;
+      try {
         // Stream through the same progress sink the initial open uses, so the
         // session surfaces "Downloading... NN%" instead of sitting on the
         // last server phase.
-        try {
-          snapshotBytes = await fetchPresignedSnapshot(
-            snap.url,
-            options?.onSnapshotProgress,
-          );
-        } catch (err) {
-          const status = err instanceof BrassError ? err.status ?? 0 : 0;
-          endPerf({ ok: false, snapshotStatus: status });
-          return {
-            ok: false,
-            reason:
-              status > 0
-                ? `presigned snapshot fetch returned ${status}`
-                : `presigned snapshot fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
+        applied = await applyJoin(doc, result.parsed, (url) =>
+          fetchPresignedSnapshot(url, options?.onSnapshotProgress),
+        );
+      } catch (err) {
+        const status = err instanceof BrassError ? err.status ?? 0 : 0;
+        endPerf({ ok: false, snapshotStatus: status });
+        return {
+          ok: false,
+          reason:
+            status > 0
+              ? `snapshot read returned ${status}`
+              : `snapshot read failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
       }
-      if (snapshotBytes) doc._applySnapshot(snapshotBytes);
-      const sortedTail = [...result.parsed.tail_ops].sort(
-        (a, b) => a.seq - b.seq,
-      );
+      if (applied.kind !== 'applied') {
+        endPerf({ ok: true, joinStatus: result.status, reloaded: applied.kind === 'reloaded' });
+        return { ok: true, status: result.parsed.status };
+      }
+      const tailSeqs = applied.tailSeqs;
       let maxTailSeq = 0;
-      for (const entry of sortedTail) {
-        doc.applyRemoteOp(base64ToBytes(entry.op_blob_b64));
-        if (entry.seq > currentSeq) currentSeq = entry.seq;
-        if (entry.seq > maxTailSeq) maxTailSeq = entry.seq;
+      for (const seq of tailSeqs) {
+        if (seq > currentSeq) currentSeq = seq;
+        if (seq > maxTailSeq) maxTailSeq = seq;
       }
       const fetchedSeq =
         typeof result.parsed.current_seq === 'number'
@@ -1977,23 +2992,17 @@ export function createOpenDocument(
       // under it. That resolves at the next compaction, which folds the tail
       // past the hole and raises `snapshot_seq` over it; until then the gap
       // pull's own budget is what stops the reader asking forever.
-      const tailSeqs = sortedTail.map((entry) => entry.seq);
-      // A snapshot only counts as a floor once its bytes are in: a shape this
-      // pin does not decode leaves `snapshot_seq` describing content the doc
-      // never received, and the tail alone is then what it holds.
-      if (snapshotBytes !== null || result.parsed.snapshot === null) {
-        raiseCoverage(
-          joinCoverageFloor(
-            snapshotSeqOf(result.parsed.snapshot_seq, tailSeqs, fetchedSeq),
-            tailSeqs,
-          ),
-        );
-      }
+      raiseCoverage(
+        joinCoverageFloor(
+          snapshotSeqOf(result.parsed.snapshot_seq, tailSeqs, fetchedSeq),
+          tailSeqs,
+        ),
+      );
       for (const seq of tailSeqs) advanceCoverage(seq);
       endPerf({
         ok: true,
-        snapshotBytes: snapshotBytes?.byteLength ?? 0,
-        tailOps: sortedTail.length,
+        snapshotBytes: applied.content.kind === 'crdt' ? applied.content.bytes.byteLength : 0,
+        tailOps: tailSeqs.length,
       });
       return { ok: true, status: result.parsed.status };
     };
@@ -2007,10 +3016,9 @@ export function createOpenDocument(
       snapshotVersionVector?: string;
       tailBlobs: Uint8Array[];
     } | null> => {
-      const token = await requireToken();
       // Same-branch as `refetchAndImport`: the durability handshake must diff
       // against the opened branch's frontier, not the default branch's.
-      const result = await fetchSnapshot(docId, { branch: parsed.branch_id }, token);
+      const result = await joinAs(credential, docId, rejoinOptions(parsed.branch_id, options));
       if (result.status < 200 || result.status >= 300) return null;
       if (!isSnapshotResponse(result.parsed)) return null;
       const tailBlobs = result.parsed.tail_ops.map((entry) =>
@@ -2113,6 +3121,47 @@ export function createOpenDocument(
       })();
     };
 
+    // The row's work status as it is now, read without a snapshot, for a
+    // frame whose claim about the row needs checking.
+    const readWorkStatus = async (): Promise<DocumentWorkStatus | null> => {
+      const body = (await readStatusAs(credential, docId)) as { status?: unknown };
+      return parseWorkStatus(body.status);
+    };
+
+    // A `pending` frame that would take a settled document back to loading is
+    // checked against the row before it locks anything. A frame is the
+    // stream's view of the row at the time of that write, delivered after the
+    // stream's own lag, while the reconcile above reads the row directly: a
+    // client that reconciles between a hydration's last phase write and the
+    // stream delivering it has already imported the content when that
+    // phase's frame arrives, and applying it locks a document whose work is
+    // done. An importer that ran off the reconcile's own ready status then
+    // writes into that lock and is refused. Progress inside a run the
+    // document already shows as pending applies without a read; only the
+    // regression from settled to pending pays one, and that one read answers
+    // for every frame that arrives while it is out. A read that fails applies
+    // the frame, since locking is the side that loses nothing.
+    let pendingVerifyInFlight = false;
+    const verifyPendingStatus = (status: DocumentWorkStatus): void => {
+      if (pendingVerifyInFlight) return;
+      pendingVerifyInFlight = true;
+      void (async () => {
+        let current: DocumentWorkStatus | null | 'unread' = 'unread';
+        try {
+          current = await readWorkStatus();
+        } catch {
+          // Unread: the frame stands.
+        } finally {
+          pendingVerifyInFlight = false;
+        }
+        if (current === 'unread') {
+          doc._emitStatus(status);
+        } else if (current !== null && current.pending) {
+          doc._emitStatus(current);
+        }
+      })();
+    };
+
     // Evidence the document moved on the server after a give-up: one more
     // pull, which on success imports the content and releases the lock the
     // failed terminal status left in place.
@@ -2122,15 +3171,15 @@ export function createOpenDocument(
       reloadAfterHydration(WORK_READY_STATUS);
     };
 
-    // Reconcile a pending open once the live subscription exists. The
-    // terminal `doc_status` frame is best-effort: if hydration finishes
-    // before this client's subscription record exists, the fan-out finds no subscriber
-    // and drops the frame, stranding the app on the pending overlay. `doc_init`
-    // is posted only after the subscription record is written, so one re-fetch here
-    // closes the gap for a completion that landed before the row existed.
-    // Only a pending open pays the extra fetch.
+    // Reconcile pending work once the live subscription exists (a resubscribe
+    // while work runs). The terminal `doc_status` frame is best-effort: if the
+    // work finishes while this client has no subscription record, the fan-out
+    // finds no subscriber and drops the frame, stranding the app on the pending
+    // overlay. `doc_init` is posted only after the subscription record is
+    // written, so one re-fetch here closes the gap. Only a pending document
+    // pays the extra fetch.
     const reconcileStatusOnInit = (): void => {
-      const current = doc.status;
+      const current = doc._workStatusNow;
       if (!current || !current.pending) return;
       if (reconcileInFlight || reloadInFlight) return;
       reconcileInFlight = true;
@@ -2171,13 +3220,13 @@ export function createOpenDocument(
       opBlobB64: string,
       clientOpId: string,
     ): Promise<OversizedOpResult> => {
-      const token = await requireToken();
-      const { status, parsed: opResult } = await postDocumentOp(
+      const { status, parsed: opResult } = await postOpAs(
+        credential,
         docId,
         parsed.branch_id,
         opBlobB64,
         clientOpId,
-        token,
+        baseImportSeqField(doc),
       );
       if (status < 200 || status >= 300) {
         return {
@@ -2185,6 +3234,9 @@ export function createOpenDocument(
           message: opWriteFailureMessage(status, opResult),
           retryable: opWriteIsRetryable(status),
           atCapacity: isCapacityRefusal(status, opResult),
+          ...(isMovedRefusal(opResult) ? { moved: true } : {}),
+          ...(isNotImportedRefusal(opResult) ? { notImported: true } : {}),
+          ...(status === 413 ? { tooLarge: true } : {}),
           // The route answers 403 when the caller's grant carries no write
           // access, which is the HTTP face of the socket's `role_denied`.
           ...(status === 403 ? { readOnly: 'grant' as const } : {}),
@@ -2201,7 +3253,8 @@ export function createOpenDocument(
       return { ok: true, seq };
     };
 
-    if (opts.wsClient) {
+    const docWsClient = wsClientFor(credential);
+    if (docWsClient) {
       wireDocTransport({
         doc,
         docId,
@@ -2218,7 +3271,10 @@ export function createOpenDocument(
           ? { documentOptions: options.documentOptions }
           : {}),
         ...(opts.identity !== undefined ? { identity: opts.identity } : {}),
-        wsClient: opts.wsClient,
+        // A link's open is parked under nobody, and a frozen copy hears
+        // whole-document notices rather than joining the room.
+        ...(credential.kind === 'session' ? {} : { parkable: false, skipPresence: options?.frozen === true }),
+        wsClient: docWsClient,
         postOversizedOp,
         newClientOpId: opts.newClientOpId ?? defaultClientOpIdMinter,
         getCurrentSeq: () => currentSeq,
@@ -2231,87 +3287,12 @@ export function createOpenDocument(
         refetchDurableFrontier,
         reloadAfterHydration,
         reconcileStatusOnInit,
+        verifyPendingStatus,
         onDocumentMoved: retryContentPull,
       });
     }
-    // `doc._checkoutVersion(v)` calls back here to materialise historical
-    // state, leaving the live subscription untouched.
-    doc.setCheckoutFetcher(makeCheckoutFetcher());
-    // Wire the branch provider + populate the initial list, so the
-    // toolbar's branch chip can name the branch on the next subscribe
-    // tick. Branch management is hosted; this list feeds the SDK's own
-    // chrome, not an app method.
-    if (opts.branchProvider) {
-      doc.setBranchProvider(opts.branchProvider);
-      void doc._refreshBranches().catch(() => {
-        // Best-effort: a failure leaves the chip unnamed until a hosted
-        // branch action refreshes the list.
-      });
-    }
-    // `doc.useCanvas(canvas)` captures + uploads after each local commit; the
-    // doc handles debounce + readOnly gating internally.
-    if (opts.thumbnailUploader) {
-      const uploader = opts.thumbnailUploader;
-      doc.setThumbnailUploader(async (image, width, height) => {
-        await uploader(doc, image, width, height);
-      });
-    }
-    doc._setThumbnailVersion(parsed.thumbnail?.version ?? null);
-    if (opts.checkpointCreator) {
-      const creator = opts.checkpointCreator;
-      doc.setCheckpointCreator(() => creator(doc));
-    }
-    if (opts.drivePusher) {
-      const pusher = opts.drivePusher;
-      doc.setDrivePusher((input) => pusher(doc, input));
-    }
-    // `doc.resolveDrive()` opens the hosted resolution surface and, when it
-    // mints a new mirror doc (take-source / keep-both), re-opens onto it via
-    // the same `openSiblingDoc` path the `history` fork uses.
-    const hostedForResolve = opts.hostedUiProvider;
-    const resolveSurface = hostedForResolve?.driveResolve;
-    if (hostedForResolve && resolveSurface) {
-      doc.setDriveResolver(async () => {
-        const docId = doc.id;
-        if (docId === null) return null;
-        const result = await resolveSurface(docId);
-        if (result?.newDocId && hostedForResolve.openSiblingDoc) {
-          await hostedForResolve.openSiblingDoc(result.newDocId, {});
-        }
-        return result;
-      });
-    }
-    if (opts.sourceBlobFetcher) {
-      const fetcher = opts.sourceBlobFetcher;
-      doc.setSourceBlobFetcher(() => fetcher(doc));
-    }
-    doc.setOpenedStreamName(options?.stream ?? DEFAULT_STREAM_NAME);
-    // Streams: manifest list/create over HTTP plus the per-line open
-    // (join + WS subscribe). Bound to the BRANCH this Document opened on,
-    // which is not the line it materialized when the open named a stream: a
-    // manifest belongs to a branch and a line owns none, so binding to the
-    // line would leave `doc.stream(name)` resolving against nothing.
-    if (opts.streamProvider) {
-      const provider = opts.streamProvider;
-      const openedBranchId = parsed.stream_branch_id ?? parsed.branch_id;
-      doc.setStreamRuntime({
-        list: async () =>
-          (await provider.list(docId, openedBranchId)).streams,
-        create: (name) => provider.create(docId, openedBranchId, name),
-        openLine: (lineId) => openStreamLine(docId, lineId),
-      });
-    }
-    // Hosted-UI provider backing the doc's built-in `history` / `details` /
-    // `share` / `delete` commands.
-    if (opts.hostedUiProvider) {
-      doc.setHostedUiProvider(opts.hostedUiProvider);
-      const refreshName = opts.hostedUiProvider.refreshName;
-      if (refreshName && docId) {
-        void refreshName(docId).then((name) => {
-          if (name !== null) doc._setName(name);
-        });
-      }
-    }
+    if (credential.kind === 'session') wireSessionCapabilities(doc, docId, parsed, options);
+    else wireLinkCapabilities(doc, docId, parsed, credential, options, doc.readOnly !== true);
     if (opts.reportError) doc.setErrorReporter(opts.reportError);
     // No socket on a document the caller can write to: the write path reaches
     // no server, so the document reports the first attempt rather than
@@ -2332,21 +3313,13 @@ export function createOpenDocument(
     options: OpenDocumentByIdOptions,
     token: string,
   ): Promise<OpenedDocument> {
-    const { status, parsed, parseFailed } = await fetchAtVersion(
-      docId,
-      version,
-      options.branch,
-      token,
+    const parsed = unwrapJoinResponse(
+      await fetchAtVersion(docId, version, options.branch, token),
+      isAtVersionResponse,
+      'at-version',
     );
-    if (status < 200 || status >= 300) {
-      throw brassErrorFromBody(status, parseFailed ? undefined : parsed);
-    }
-    if (!isAtVersionResponse(parsed)) {
-      throw new BrassError('Malformed document at-version response', {
-        status: 500,
-      });
-    }
-    return materialise(
+    return materialiseAs(
+      SESSION,
       {
         doc_id: docId,
         branch_id: parsed.branch_id,
@@ -2367,29 +3340,50 @@ export function createOpenDocument(
   // same snapshot + tail_ops envelope, member-stripped and read-only.
   async function fetchLinkView(
     token: string,
-    branch: string | undefined,
-  ): Promise<{ status: number; parsed: unknown; parseFailed: boolean }> {
+    // The line, and whether this guest will write. A view link's reader never
+    // does, and an edit link's may, which is the same question the
+    // authenticated join asks with `intent=read` and decides the same thing:
+    // whether a document the platform stores frozen is served as it stands or
+    // converted first.
+    join: OpenDocumentByIdOptions,
+    progress?: LoadProgress,
+    { rejoin = false }: { rejoin?: boolean } = {},
+  ): Promise<JoinAnswer> {
+    const once = (): Promise<JoinAnswer> => linkViewOnce(token, join, rejoin);
+    // An edit link's guest waits out a conversion as a member's editable open
+    // does.
+    return opensReadOnly(join) ? once() : waitWhileConverting(once, progress);
+  }
+
+  async function linkViewOnce(
+    token: string,
+    join: OpenDocumentByIdOptions,
+    rejoin: boolean,
+  ): Promise<JoinAnswer> {
     const search = new URLSearchParams();
     search.set('include', 'snapshot');
-    if (branch !== undefined) search.set('branch', branch);
-    const url = `${baseUrl}/links/${encodeURIComponent(token)}/view?${search.toString()}`;
-    const response = await fetchWithRetry(() => fetch(url, { method: 'GET' }));
-    const text = await response.text();
-    let parsed: unknown = undefined;
-    let parseFailed = false;
-    if (text) {
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parseFailed = true;
-      }
+    search.set('app_id', opts.appId);
+    if (rejoin) search.set('rejoin', '1');
+    const headers = await linkViewHeaders();
+    // A person signed in here who reaches the document on their own opens it
+    // as themselves, with their own role and identity.
+    if (!rejoin && headers['authorization'] !== undefined) search.set('as_member', '1');
+    if (join.branch !== undefined) search.set('branch', join.branch);
+    if (opensReadOnly(join)) search.set('intent', 'read');
+    return sendJoin(`/links/${encodeURIComponent(token)}/view`, search, { headers });
+  }
+
+  // A link open carries no credential unless the person signed in on this
+  // link page, in which case it carries theirs.
+  async function linkViewHeaders(): Promise<Record<string, string>> {
+    const headers: Record<string, string> = {};
+    applyClientVersionHeader(headers);
+    const credential = (await opts.getLinkCredential?.()) ?? null;
+    if (credential !== null) {
+      headers['authorization'] = `Bearer ${credential.accessToken}`;
+      headers['x-brass-app-assertion'] = credential.appAssertion;
     }
-    // A tail op whose bytes spilled to storage arrives as a signed URL, and
-    // a guest join carries them exactly as a signed-in one does. The URL
-    // carries its own signature, so an anonymous reader fetches it with the
-    // same call. Resolving here is what lets `materialise` see one shape.
-    await resolveParsedTailOps(parsed);
-    return { status: response.status, parsed, parseFailed };
+    return headers;
   }
 
   // `GET /links/{token}/streams`: the anonymous stream manifest, the guest
@@ -2400,7 +3394,9 @@ export function createOpenDocument(
     token: string,
   ): Promise<import('./documents-namespace.js').DocumentStreamInfo[]> {
     const url = `${baseUrl}/links/${encodeURIComponent(token)}/streams`;
-    const response = await fetchWithRetry(() => fetch(url, { method: 'GET' }));
+    const headers: Record<string, string> = {};
+    applyClientVersionHeader(headers);
+    const response = await fetchWithRetry(() => fetch(url, { method: 'GET', headers }));
     const text = await response.text();
     if (response.status < 200 || response.status >= 300) {
       let parsed: unknown = undefined;
@@ -2439,137 +3435,138 @@ export function createOpenDocument(
     );
   }
 
-  const openByLink: OpenDocumentByLinkFn = async (token, options) => {
-    const { status, parsed, parseFailed } = await fetchLinkView(
+  const openByLink: OpenDocumentByLinkFn = async (token, asked) => {
+    const options = withReadIntent(asked);
+    const view = await fetchLinkView(
       token,
-      options?.branch,
-    );
-    if (status < 200 || status >= 300) {
-      throw brassErrorFromBody(status, parseFailed ? undefined : parsed);
-    }
-    const b = parsed as {
-      doc_id?: unknown;
-      branch_id?: unknown;
-      snapshot?: unknown;
-      tail_ops?: unknown;
-      current_seq?: unknown;
-      name?: unknown;
-      link_role?: unknown;
-      status?: unknown;
-    };
-    if (
-      typeof b.doc_id !== 'string' ||
-      typeof b.branch_id !== 'string' ||
-      !Array.isArray(b.tail_ops)
-    ) {
-      throw new BrassError('Malformed link view response', { status: 500 });
-    }
-    // The link's grant decides read vs write. An `editor` link is anonymous
-    // EDIT: a live Document (not read-only) whose local mutations ship over
-    // the same token-authenticated socket, with the server admitting the
-    // op-write because the guest's subscription record carries `role: editor`. A
-    // `viewer` link (the default) is read-only: mutate throws and only
-    // inbound frames apply.
-    const canEdit = b.link_role === 'editor';
-    const doc = await materialise(
-      {
-        doc_id: b.doc_id,
-        branch_id: b.branch_id,
-        snapshot: b.snapshot as DocumentSnapshotResponse['snapshot'],
-        tail_ops: b.tail_ops as DocumentSnapshotResponse['tail_ops'],
-      },
-      { ...options?.documentOptions, readOnly: !canEdit },
+      rejoinOptions(options?.branch, options),
       options?.onSnapshotProgress,
     );
-    // The view carries the document's display name; set it so the guest
-    // sees the title (the signed-in open gets this from `finalise`).
-    if (typeof b.name === 'string') doc._setName(b.name);
-    // A link opened while the platform is still preparing the document
-    // carries the same opaque work status the signed-in join does, and the
-    // guest's own topic delivers the phases after it. Seeded before the
-    // transport so the app renders the wait rather than an empty document.
-    const linkStatus = parseWorkStatus(b.status);
-    if (linkStatus) doc._emitStatus(linkStatus);
-    // An edit link's writes fail the same ways a member's do (a shed the
-    // budget outlived, a link revoked mid-edit), and the app hears those
-    // through the same channel it hears a member's, so the reporter is
-    // wired here as `finalise` wires it for a signed-in open.
-    if (opts.reportError) doc.setErrorReporter(opts.reportError);
-
-    wireGuestTransport(doc, token, b.doc_id, b.branch_id, canEdit);
-
-    // Streams: a guest resolves `doc.stream(name)` through the token
-    // routes. `list` hits the anonymous manifest; `openLine` joins the
-    // line read/write exactly like the default stream above, over the same
-    // token-authenticated socket. `create` is refused (a guest cannot mint
-    // a line). Absent when there is no WS client (a snapshot-only guest),
-    // matching the default stream having no live transport there.
-    doc.setStreamRuntime({
-      list: () => fetchLinkStreamManifest(token),
-      openLine: async (lineId) => {
-        const view = await fetchLinkView(token, lineId);
-        if (view.status < 200 || view.status >= 300) {
-          throw brassErrorFromBody(
-            view.status,
-            view.parseFailed ? undefined : view.parsed,
-          );
-        }
-        const lb = view.parsed as {
-          doc_id?: unknown;
-          branch_id?: unknown;
-          snapshot?: unknown;
-          tail_ops?: unknown;
-        };
-        if (
-          typeof lb.doc_id !== 'string' ||
-          typeof lb.branch_id !== 'string' ||
-          !Array.isArray(lb.tail_ops)
-        ) {
-          throw new BrassError('Malformed link stream view response', {
-            status: 500,
-          });
-        }
-        const inner = await materialise(
-          {
-            doc_id: lb.doc_id,
-            branch_id: lb.branch_id,
-            snapshot: lb.snapshot as DocumentSnapshotResponse['snapshot'],
-            tail_ops: lb.tail_ops as DocumentSnapshotResponse['tail_ops'],
-          },
-          { readOnly: !canEdit },
-        );
-        if (opts.reportError) inner.setErrorReporter(opts.reportError);
-        wireGuestTransport(inner, token, lb.doc_id, lb.branch_id, canEdit);
-        return inner;
-      },
-      create: () => {
-        throw new BrassError('A shared-link guest cannot create streams.', {
-          status: 403,
-        });
-      },
-    });
+    if (view.status < 200 || view.status >= 300) {
+      throw brassErrorFromBody(view.status, view.parseFailed ? undefined : view.parsed);
+    }
+    const b = view.parsed as {
+      doc_id?: unknown;
+      opens_as_member?: unknown;
+      link_role?: unknown;
+      status?: unknown;
+      anonymous?: unknown;
+      expires_at?: unknown;
+      awaits_import?: unknown;
+      can_edit?: unknown;
+      read_only_reason?: unknown;
+    };
+    if (typeof b.doc_id !== 'string') {
+      throw new BrassError('Malformed link view response', { status: 500 });
+    }
+    if (b.opens_as_member === true) {
+      return (opts.openAsMember ?? open)(b.doc_id, asked);
+    }
+    // The link's grant decides read vs write; the view answers `can_edit`
+    // as the member join does, so a view link reads as a viewer's grant.
+    const canEdit = b.link_role === 'editor' && b.can_edit !== false;
+    const askedToRead = canEdit && opensReadOnly(options);
+    const linkOptions: OpenDocumentByIdOptions = {
+      ...options,
+      documentOptions: askedToRead
+        ? { ...options?.documentOptions, readOnly: true, readOnlyReason: 'snapshot' }
+        : canEdit
+          ? { ...options?.documentOptions }
+          : { ...options?.documentOptions, readOnly: true, readOnlyReason: 'link' },
+    };
+    // A document minted without an account names when the platform removes
+    // it; every other link carries neither key.
+    const expiresAt = anonymousExpiry(b);
+    const credential: OpenCredential =
+      expiresAt !== null ? { kind: 'temporary', token } : { kind: 'link', token };
+    const doc = await finalise(b.doc_id, view, linkOptions, credential);
+    if (expiresAt !== null) {
+      doc._setExpiresAt(expiresAt);
+      // A document the visitor started from a file is imported by this app
+      // in this page, so it reads its file through the link as a member's
+      // import reads it through the document.
+      const imports = guestImports(token, b.doc_id);
+      doc.setSourceBlobFetcher(() => imports.sourceBlob());
+      doc._awaitsImport = canEdit && b.awaits_import === true;
+    }
     return doc;
   };
+
+  // A read through a route a member's open reads, with the link as the
+  // credential. A 404 answers null, as the session's reads of the same
+  // routes do.
+  async function getWithLink(token: string, path: string, query: Record<string, string>): Promise<unknown> {
+    const search = new URLSearchParams(query).toString();
+    const response = await fetch(`${baseUrl}${search ? `${path}?${search}` : path}`, {
+      headers: { authorization: `Link ${token}` },
+    });
+    if (response.status === 404) return null;
+    const text = await response.text();
+    let parsed: unknown = undefined;
+    try {
+      parsed = text ? JSON.parse(text) : undefined;
+    } catch {
+      parsed = undefined;
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw brassErrorFromBody(response.status, parsed);
+    }
+    return parsed;
+  }
+
+  // A write through a route a member's open writes, with the link as the
+  // credential. Resolves the parsed body, or rejects with the server's
+  // refusal.
+  async function postWithLink<T>(token: string, path: string, body: unknown): Promise<T> {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Link ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let parsed: unknown = undefined;
+    try {
+      parsed = text ? JSON.parse(text) : undefined;
+    } catch {
+      parsed = undefined;
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw brassErrorFromBody(response.status, parsed);
+    }
+    return parsed as T;
+  }
 
   // Write a guest's op over HTTP: `POST /links/{token}/ops`, the anonymous
   // counterpart of `POST /documents/{docId}/ops`. Sends NO Authorization
   // header (the token is the credential) and names the line the guest
-  // opened, which is the branch its socket topic is scoped to.
+  // opened, which is the branch its socket topic is scoped to. An op past
+  // what a request body carries is staged first, as a member's is.
   async function postLinkOp(
     token: string,
+    docId: string,
     lineId: string,
     opBlobB64: string,
     clientOpId: string,
+    base: { base_import_seq?: number } = {},
   ): Promise<{ status: number; parsed: unknown }> {
+    const stagedKey = opBlobNeedsStaging(opBlobB64)
+      ? await stageOpBlob(docId, opBlobB64, { link: token })
+      : undefined;
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    applyClientVersionHeader(headers);
     const response = await fetch(
       `${baseUrl}/links/${encodeURIComponent(token)}/ops`,
       {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          op_blob: opBlobB64,
+          ...(stagedKey === undefined ? { op_blob: opBlobB64 } : { upload_key: stagedKey }),
           branch_id: lineId,
           client_op_id: clientOpId,
+          ...base,
         }),
       },
     );
@@ -2583,341 +3580,17 @@ export function createOpenDocument(
     return { status: response.status, parsed };
   }
 
-  // Wire a guest Document (the default stream or a stream line) to the
-  // token-authenticated socket. Inbound frames (`doc_init` / `doc_op`)
-  // apply for both link kinds; an edit link ALSO wires the outbound path
-  // (`op_ack` resolves the outstanding-op tracker, `setLocalOpHook` ships
-  // each local commit). Best-effort on the read side (no resync / durability
-  // handshake, which need a signed-in token); a guest that misses ops
-  // re-opens. The WRITE side answers a refusal the way the signed-in
-  // transport does, because a guest editor's edit is the same person's work
-  // as a member's and the same two things can happen to it: a frame the
-  // socket cannot carry takes the HTTP route, and a capacity shed is
-  // re-asserted on the shared backoff and reported once the budget is out.
-  // Patches `close` to detach, mirroring `wireDocTransport`, so `Document`
-  // stays free of WS knowledge. A no-op with no WS client (a snapshot-only
-  // guest).
-  function wireGuestTransport(
-    doc: Document,
-    token: string,
-    docId: string,
-    lineId: string,
-    canEdit: boolean,
-  ): void {
-    const wsClient = opts.wsClient;
-    if (!wsClient) {
-      // No socket: a write would change local state and reach no server, so
-      // the document reports the first one instead of discarding it quietly.
-      if (canEdit) doc.markTransportUnavailable();
-      return;
-    }
-    const topic = `doc:${docId}:${lineId}`;
 
-    // Ops on the socket awaiting an answer, keyed by `client_op_id`. An
-    // `unavailable` shed names no op, so re-asserting one needs the frames
-    // in hand. Scoped to what the socket carried: an op that took the HTTP
-    // write must never reach the socket, and that write re-asserts itself.
-    const outstanding = new Map<string, OpFrame>();
-    let shedRounds = 0;
-    let shedTimer: ReturnType<typeof setTimeout> | null = null;
-
-    function clearShedRecovery(): void {
-      if (shedTimer !== null) {
-        clearTimeout(shedTimer);
-        shedTimer = null;
-      }
-      shedRounds = 0;
-    }
-
-    // Every outstanding op is dead: drop the tracker entries and tell the
-    // Document, which stops counting them in `savingCount` and reports each
-    // through the error channel the app reads. The ids are taken first
-    // because `_failOutstandingOp` re-enters app code.
-    function failAllOutstanding(message: string): void {
-      const clientOpIds = [...outstanding.keys()];
-      outstanding.clear();
-      for (const clientOpId of clientOpIds) {
-        doc._failOutstandingOp(clientOpId, message);
-      }
-    }
-
-    // Put every op still awaiting an answer back on the wire. The client
-    // DROPS an op frame it cannot send right now rather than buffering one
-    // (`ownsFrameRetry` below), so this is the only thing that carries a
-    // shed or reconnect-orphaned op across the window, and it is also what
-    // keeps a frame from being written twice: a copy the client held would
-    // flush on the `subscribed` ack while this re-asserts on the `doc_init`
-    // behind it, and the server allocates a fresh seq per send.
-    const resendAllOutstanding = (): void => {
-      for (const frame of outstanding.values()) wsClient.send(frame);
-    };
-
-    const onServerUnavailable = (): void => {
-      if (outstanding.size === 0) return;
-      if (shedTimer !== null) return;
-      shedRounds += 1;
-      if (shedRounds > UNAVAILABLE_MAX_ROUNDS) {
-        clearShedRecovery();
-        failAllOutstanding(UNAVAILABLE_GIVE_UP_MESSAGE);
-        return;
-      }
-      shedTimer = setTimeout(() => {
-        shedTimer = null;
-        resendAllOutstanding();
-      }, unavailableDelayMs(shedRounds));
-      (shedTimer as { unref?: () => void }).unref?.();
-    };
-
-    const unsub = wsClient.subscribe(
-      topic,
-      (frame) => {
-        const init = parseDocInitFrame(frame);
-        if (init) {
-          for (const entry of init.tail_ops) {
-            if (entry.op_blob_b64 === undefined) continue;
-            doc.applyRemoteOp(base64ToBytes(entry.op_blob_b64));
-          }
-          // `doc_init` follows every `subscribed` ack, so this is the point
-          // the topic can carry frames again. A fresh connection also returns
-          // the shed budget to full: this re-assert is the round a pending
-          // one would have run.
-          clearShedRecovery();
-          resendAllOutstanding();
-          return;
-        }
-        if (isDocOpFrame(frame)) {
-          doc.applyRemoteOp(base64ToBytes(frame.op_blob));
-        } else if (isDocGoneFrame(frame)) {
-          // The server fans `doc_gone` to EVERY subscriber on the branched
-          // content topic, guest-link connections included, on a soft-delete /
-          // move of the opened doc.
-          // Without this branch the guest keeps showing removed content and
-          // `doc.onGone(...)` never fires; for an edit link the next local op
-          // would ship onto the evicted subscription record and bounce as a misleading
-          // `forbidden`. Drop the shed recovery first so nothing re-asserts an
-          // op onto an evicted subscription record, then mark the doc gone (mapping the
-          // reason like the signed-in transport).
-          clearShedRecovery();
-          outstanding.clear();
-          doc._markGone(goneReasonOf(frame));
-        } else if (isDocStatusFrame(frame)) {
-          // A guest can open a document whose inbound work is still running,
-          // and hydration writes a SNAPSHOT rather than ops, so nothing on the
-          // op stream would ever fill the view in. Same split as the signed-in
-          // transport: the `reload` hint pulls the content and emits the
-          // terminal status after the import, and anything else renders.
-          const status = normalizeWorkStatus(frame.status);
-          if (frame.reload) pullGuestContent(doc, token, lineId, status);
-          else doc._emitStatus(status);
-        } else if (isDocMetaFrame(frame)) {
-          // `_setName` de-dupes, so a re-emit of the current name is a no-op.
-          doc._setName(frame.name);
-        } else if (canEdit && isOpAckFrame(frame)) {
-          outstanding.delete(frame.client_op_id);
-          doc.resolveOutstandingOp(frame.client_op_id);
-          // The server is durably accepting writes again, so the shed budget
-          // starts over. A round already scheduled still runs: the ops it
-          // re-asserts are the ones this ack did not cover.
-          shedRounds = 0;
-        } else if (canEdit && isServerUnavailableFrame(frame)) {
-          onServerUnavailable();
-        } else if (canEdit && isOpRejectedFrame(frame)) {
-          // Terminal, not transient: stop re-asserting this op (retrying
-          // would only draw the same rejection) and fail it on the Document
-          // so "could not be saved" surfaces instead of a stuck saving count.
-          // A refusal naming the writer (an edit link downgraded or revoked
-          // while the guest had it open) turns the Document read-only, the
-          // same way it does for a signed-in reader.
-          outstanding.delete(frame.client_op_id);
-          if (isCapacityRejection(frame)) doc._markAtCapacity();
-          const readOnly = readOnlyReasonForRejection(frame);
-          if (readOnly !== null) doc._markReadOnly(readOnly);
-          doc._failOutstandingOp(frame.client_op_id, opRejectedMessage(frame));
-        }
-      },
-      // The guest owns its outstanding ops: `resendAllOutstanding` on the
-      // `doc_init` behind every `subscribed` ack IS this topic's
-      // re-assertion, so the client drops an op frame it cannot send now
-      // rather than buffering a second copy of it.
-      { ownsFrameRetry: true },
-    );
-
-    // An op the socket cannot carry, written over HTTP on the same policy
-    // the signed-in path runs: refuse locally what no write can hold, and
-    // re-assert a capacity refusal on the shared backoff before reporting it.
-    async function writeOversizedGuestOp(
-      opBlobB64: string,
-      clientOpId: string,
-    ): Promise<void> {
-      // Yield before any outcome resolves the op. The hook's caller records
-      // the outstanding op AFTER the hook returns, and an async function body
-      // runs synchronously up to its first await, so an exit taken inline
-      // would find nothing tracked and leave the entry behind with
-      // `savingCount` stuck above zero.
-      await Promise.resolve();
-
-      // Both sizes are known here, so refuse without spending a round trip
-      // on a blob that can only come back 400.
-      if (opBlobExceedsDurableLimit(opBlobB64)) {
-        doc._failOutstandingOp(clientOpId, TOO_LARGE_MESSAGE);
-        return;
-      }
-      if (opBlobNeedsStaging(opBlobB64)) {
-        doc._failOutstandingOp(clientOpId, LINK_OP_TOO_LARGE_MESSAGE);
-        return;
-      }
-
-      let status = 0;
-      let parsed: unknown = undefined;
-      for (let round = 0; round <= UNAVAILABLE_MAX_ROUNDS; round += 1) {
-        if (round > 0) {
-          await new Promise((resolve) => {
-            const timer = setTimeout(resolve, unavailableDelayMs(round));
-            (timer as { unref?: () => void }).unref?.();
-          });
-        }
-        try {
-          ({ status, parsed } = await postLinkOp(
-            token,
-            lineId,
-            opBlobB64,
-            clientOpId,
-          ));
-        } catch (err) {
-          // A throw leaves it unknown whether the handler ran, and this op
-          // carries no idempotency the server dedupes on, so replaying it
-          // could double-apply.
-          doc._failOutstandingOp(
-            clientOpId,
-            err instanceof Error ? err.message : String(err),
-          );
-          return;
-        }
-        if (status >= 200 && status < 300) break;
-        if (!opWriteIsRetryable(status)) break;
-      }
-      if (status < 200 || status >= 300) {
-        doc._failOutstandingOp(
-          clientOpId,
-          opWriteIsRetryable(status)
-            ? UNAVAILABLE_GIVE_UP_MESSAGE
-            : opWriteFailureMessage(status, parsed),
-        );
-        return;
-      }
-      doc.resolveOutstandingOp(clientOpId);
-    }
-
-    if (canEdit) {
-      const minter = opts.newClientOpId ?? defaultClientOpIdMinter;
-      doc.setLocalOpHook((opBlob) => {
-        const clientOpId = minter();
-        const opBlobB64 = bytesToBase64(opBlob);
-        const sendFrame: OpFrame = {
-          type: 'op',
-          topic,
-          op_blob: opBlobB64,
-          client_op_id: clientOpId,
-        };
-        // A frame past the transport's cap is not delivered and takes the
-        // connection down with it, so it must never reach the socket: a
-        // guest's document, presence and every other op ride that one
-        // connection. `mutate` batches to a budget well above what a frame
-        // carries, so an ordinary bulk edit arrives here.
-        if (opFrameExceedsWsLimit(sendFrame)) {
-          void writeOversizedGuestOp(opBlobB64, clientOpId);
-          return clientOpId;
-        }
-        outstanding.set(clientOpId, sendFrame);
-        wsClient.send(sendFrame);
-        return clientOpId;
-      });
-    }
-    const originalClose = doc.close.bind(doc);
-    (doc as Document & { close: () => void }).close = () => {
-      clearShedRecovery();
-      try {
-        unsub();
-      } catch {
-        // Already detached; closing the Document is what matters.
-      }
-      originalClose();
-    };
-  }
-
-  // Guest documents with a content pull running, so a repeated terminal frame
-  // does not stack a second pull on one document.
-  const guestPullInFlight = new WeakSet<Document>();
-
-  function pullGuestContent(
-    doc: Document,
-    token: string,
-    lineId: string,
-    finalStatus: DocumentWorkStatus,
-  ): void {
-    if (guestPullInFlight.has(doc)) return;
-    guestPullInFlight.add(doc);
-    void (async () => {
-      await pullContentWithRetry({
-        doc,
-        docId: doc.id ?? '',
-        finalStatus,
-        fetchAndImport: () => importLinkView(doc, token, lineId),
-        ...(opts.reportError ? { reportError: opts.reportError } : {}),
-      });
-      guestPullInFlight.delete(doc);
-    })();
-  }
-
-  // Re-read the link view and import it into the live guest Document: the
-  // anonymous counterpart of the signed-in `refetchAndImport`, over the same
-  // envelope. Named on the line the guest opened, which is the line its topic
-  // is scoped to.
-  async function importLinkView(
-    doc: Document,
-    token: string,
-    lineId: string,
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const result = await fetchLinkView(token, lineId);
-    if (result.status < 200 || result.status >= 300) {
-      return { ok: false, reason: `link view returned ${result.status}` };
-    }
-    const b = result.parsed as {
-      snapshot?: unknown;
-      tail_ops?: unknown;
-    };
-    if (!Array.isArray(b.tail_ops)) {
-      return { ok: false, reason: 'malformed link view response' };
-    }
-    const snap = b.snapshot as DocumentSnapshotResponse['snapshot'];
-    let snapshotBytes: Uint8Array | null = null;
-    if (snap !== null && snap !== undefined && snap.kind === 'inline') {
-      snapshotBytes = base64ToBytes(snap.data_b64);
-    } else if (snap !== null && snap !== undefined && snap.kind === 'presigned') {
-      try {
-        snapshotBytes = await fetchPresignedSnapshot(snap.url);
-      } catch (err) {
-        const status = err instanceof BrassError ? err.status ?? 0 : 0;
-        return {
-          ok: false,
-          reason:
-            status > 0
-              ? `presigned snapshot fetch returned ${status}`
-              : `presigned snapshot fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-    }
-    if (snapshotBytes) doc._applySnapshot(snapshotBytes);
-    const tail = b.tail_ops as DocumentSnapshotResponse['tail_ops'];
-    for (const entry of [...tail].sort((x, y) => x.seq - y.seq)) {
-      doc.applyRemoteOp(base64ToBytes(entry.op_blob_b64));
-    }
-    return { ok: true };
-  }
 
   // Strict open: a 404 propagates as `BrassError`. A `version` option
   // diverts to the read-only at-version path.
-  const open: OpenDocumentByIdFn = async (docId, options) => {
+  const open: OpenDocumentByIdFn = async (docId, asked) => {
+    if (asked?.frozen === true && asked.readOnly === false) {
+      throw new TypeError('openDocumentById: a frozen copy is read-only, so `readOnly: false` cannot apply');
+    }
+    const requested = withReadIntent(asked);
+    const options = requested?.frozen === true ? frozenOptions(requested) : requested;
+    if (requested?.frozen === true) return openFrozen(docId, options!);
     // Cache hit: return the parked Document. Its subscription stayed alive
     // while parked, and the UndoController + outstanding-op map survived, so
     // undo works as if the user never switched away.
@@ -2938,11 +3611,46 @@ export function createOpenDocument(
       endTotal({ docId, path: 'at-version' });
       return atVersion;
     }
-    const snapshot = await fetchSnapshot(docId, options, token);
+    // An editable open waits until the document takes edits. One that never
+    // will is refused terminally, and is then read as a reader would read it.
+    // An import the platform runs holds every open until it lands, the file's
+    // first import or a new version's, so the open resolves with its content.
+    let snapshot = await fetchSnapshot(docId, options, token);
+    snapshot = await joinPastWork(docId, options, snapshot, async () =>
+      fetchSnapshot(docId, options, await requireToken()),
+    );
+    const refused = joinRefusalOf(snapshot);
+    if (refused?.kind === 'at_capacity') {
+      const held = await openTooLarge(docId, options, refused.error);
+      endTotal({ docId, path: 'read-only:at_capacity' });
+      return held;
+    }
     const opened = await finalise(docId, snapshot, options);
     endTotal({ docId });
     return opened;
   };
+
+  // A writable open of a document too large to edit, joined again as a
+  // reader and shown read-only.
+  async function openTooLarge(
+    docId: string,
+    options: OpenDocumentByIdOptions | undefined,
+    error: string | undefined,
+  ): Promise<OpenedDocument> {
+    const readOptions: OpenDocumentByIdOptions = {
+      ...options,
+      documentOptions: {
+        ...options?.documentOptions,
+        readOnly: true,
+        readOnlyReason: 'too_large',
+      },
+    };
+    const snapshot = await fetchSnapshot(docId, readOptions, await requireToken());
+    const doc = await finalise(docId, snapshot, readOptions);
+    doc._markAtCapacity();
+    if (error !== undefined) doc._emitStatus({ message: error, pending: false, blocking: false });
+    return doc;
+  }
 
   // Create a doc and return it fully editable. Two round trips (POST to
   // create + obtain the doc_id, then `open(docId)`); they aren't fused
@@ -2980,7 +3688,290 @@ export function createOpenDocument(
     return open(result.docId, openOptions);
   };
 
-  return { open, create, createDocumentId, openByLink };
+  // The mint's answer is the claim secret's only copy, so it is kept as it
+  // arrives, in the browser that made the document.
+  const rememberClaimSecret = (minted: MintedAnonymousDocument): MintedAnonymousDocument => {
+    if (minted.claimSecret !== undefined) {
+      storeClaimSecret(opts.appId, minted.linkToken, minted.claimSecret, minted.expiresAt);
+    }
+    return minted;
+  };
+
+  const mintAnonymousDocument: DocumentFactory['mintAnonymousDocument'] =
+    async (args) => {
+      const body: Record<string, unknown> = { app_id: opts.appId };
+      if (args.name !== undefined) body['name'] = args.name;
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      };
+      applyClientVersionHeader(headers);
+      // No idempotency key on this route, so a replay could mint twice;
+      // only the gateway's own 503 (the handler never ran) is replayed.
+      const response = await fetchWithRetry(
+        () =>
+          fetch(`${baseUrl}/anonymous-documents`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+          }),
+        { policy: RETRY_WRITE_503, baseDelayMs: 250 },
+      );
+      const text = await response.text();
+      let parsed: unknown = undefined;
+      try {
+        parsed = text ? JSON.parse(text) : undefined;
+      } catch {
+        parsed = undefined;
+      }
+      if (response.status < 200 || response.status >= 300) {
+        throw brassErrorFromBody(response.status, parsed);
+      }
+      return rememberClaimSecret(parseMintedAnonymousDocument(parsed));
+    };
+
+  // The unauthenticated JSON calls a visitor's file-started document makes.
+  const postAnonymous = async (
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<unknown> => {
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    applyClientVersionHeader(headers);
+    const response = await fetchWithRetry(
+      () =>
+        fetch(`${baseUrl}${path}`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+        }),
+      { policy: RETRY_WRITE_503, baseDelayMs: 250 },
+    );
+    const parsed = await readJsonBody(response);
+    if (response.status < 200 || response.status >= 300) {
+      throw brassErrorFromBody(response.status, parsed);
+    }
+    return parsed;
+  };
+
+  const anonymousUploadTypes: DocumentFactory['anonymousUploadTypes'] = async () => {
+    const headers: Record<string, string> = {};
+    applyClientVersionHeader(headers);
+    // `refusal=body` answers an app's refusal of signed-out use in a 200 body,
+    // which keeps an expected answer out of the visitor's console.
+    const response = await fetchWithRetry(
+      () =>
+        fetch(
+          `${baseUrl}/anonymous-documents/upload-types?app_id=${encodeURIComponent(opts.appId)}&refusal=body`,
+          { headers },
+        ),
+      { policy: RETRY_WRITE_503, baseDelayMs: 250 },
+    );
+    const parsed = await readJsonBody(response);
+    if (response.status < 200 || response.status >= 300) {
+      throw brassErrorFromBody(response.status, parsed);
+    }
+    const body = parsed as { refusal?: unknown; offers_new?: unknown } | null;
+    const offersNew = body?.offers_new !== false;
+    if (body?.refusal !== undefined) {
+      return { offersNew, refusal: brassErrorFromBody(409, body.refusal) };
+    }
+    return { offersNew, accept: acceptFromUploadTypes(parsed) };
+  };
+
+  const mintAnonymousDocumentFromFile: DocumentFactory['mintAnonymousDocumentFromFile'] =
+    async (args) => {
+      const minted = (await postAnonymous('/anonymous-documents/upload-url', {
+        app_id: opts.appId,
+        file_name: args.file.name,
+        byte_size: args.file.size,
+      })) as { upload_url?: unknown; upload_key?: unknown } | undefined;
+      if (typeof minted?.upload_url !== 'string' || typeof minted.upload_key !== 'string') {
+        throw new BrassError('Malformed upload response', { status: 500 });
+      }
+      await putFile(minted.upload_url, args.file, args.onUploadProgress);
+      const body: Record<string, unknown> = {
+        app_id: opts.appId,
+        upload_key: minted.upload_key,
+        file_name: args.file.name,
+      };
+      if (args.name !== undefined) body['name'] = args.name;
+      return rememberClaimSecret(
+        parseMintedAnonymousDocument(
+          await postAnonymous('/anonymous-documents/from-upload', body),
+        ),
+      );
+    };
+
+  // One client id per page, which is what holds a claim across the calls
+  // of one import (the signed-in namespace keeps its own).
+  const guestImportClientId = randomToken();
+  const guestImports: DocumentFactory['guestImports'] = (token, docId) => {
+    const base = `${baseUrl}/documents/${encodeURIComponent(docId)}`;
+    const call = async <T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> => {
+      const headers: Record<string, string> = { authorization: `Link ${token}` };
+      if (body !== undefined) headers['content-type'] = 'application/json';
+      applyClientVersionHeader(headers);
+      const response = await fetchWithRetry(
+        () =>
+          fetch(`${base}${path}`, {
+            method,
+            headers,
+            ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+          }),
+        { policy: RETRY_WRITE_503, baseDelayMs: 250 },
+      );
+      const parsed = await readJsonBody(response);
+      if (response.status < 200 || response.status >= 300) {
+        throw brassErrorFromBody(response.status, parsed);
+      }
+      return parsed as T;
+    };
+    return {
+      claimImport: () =>
+        call<ImportClaimResponse>('POST', '/import-claim', {
+          client_id: guestImportClientId,
+          stages: true,
+        }),
+      async stageImport(bundle) {
+        const staged = await call<{ upload_key: string; url: string }>(
+          'POST',
+          '/import-complete/upload',
+          { byte_size: bundle.byteLength },
+        );
+        const put = await fetch(staged.url, {
+          method: 'PUT',
+          body: bundle.buffer.slice(
+            bundle.byteOffset,
+            bundle.byteOffset + bundle.byteLength,
+          ) as ArrayBuffer,
+        });
+        if (!put.ok) {
+          throw new BrassError('Uploading the import failed', { status: put.status });
+        }
+        return staged.upload_key;
+      },
+      completeImport: async (report, uploadKey) =>
+        awaitSeal(
+          await call<unknown>('POST', '/import-complete', {
+            client_id: guestImportClientId,
+            ...(report !== undefined ? { report } : {}),
+            upload_key: uploadKey,
+          }),
+          (sealId) => call<SealStatus>('GET', `/seals/${encodeURIComponent(sealId)}`),
+        ),
+      failImport: (message) =>
+        call<ImportFailedResponse>('POST', '/import-failed', {
+          client_id: guestImportClientId,
+          message,
+        }),
+      sourceBlob: () => call<DocumentSourceBlob>('GET', '/source-blob'),
+    };
+  };
+
+  const claimAnonymousDocument: DocumentFactory['claimAnonymousDocument'] =
+    async (docId, args) => {
+      const token = await requireToken();
+      const body: Record<string, unknown> = {
+        link_token: args.linkToken,
+        claim_secret: args.claimSecret,
+      };
+      if (args.destination !== undefined) body['destination'] = args.destination;
+      if (args.name !== undefined) body['name'] = args.name;
+      const headers: Record<string, string> = {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      };
+      applyClientVersionHeader(headers);
+      await applyAppAssertionHeader(headers, opts.getAppAssertion);
+      const response = await fetchWithRetry(
+        () =>
+          fetch(`${baseUrl}/documents/${encodeURIComponent(docId)}/claim`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+          }),
+        { policy: RETRY_WRITE_503, baseDelayMs: 250 },
+      );
+      const text = await response.text();
+      let parsed: unknown = undefined;
+      let parseFailed = false;
+      if (text) {
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parseFailed = true;
+        }
+      }
+      if (response.status >= 200 && response.status < 300) {
+        return { kind: 'claimed', record: selectionFromDetail(parsed) };
+      }
+      if (response.status === 409 && !parseFailed) {
+        const code = (parsed as { code?: unknown })?.code;
+        if (code === 'destination_required') return { kind: 'needs-destination' };
+        if (code === 'no_organization') return { kind: 'needs-organization' };
+      }
+      throw brassErrorFromBody(response.status, parseFailed ? undefined : parsed);
+    };
+
+  return {
+    open,
+    create,
+    createDocumentId,
+    openByLink,
+    mintAnonymousDocument,
+    anonymousUploadTypes,
+    mintAnonymousDocumentFromFile,
+    guestImports,
+    claimAnonymousDocument,
+  };
+}
+
+// The claimed document in the picker's shape, read off the claim's
+// `DocumentDetail` answer; null when a field the shape needs is missing.
+function selectionFromDetail(parsed: unknown): SelectDocumentResult | null {
+  const d = parsed as Record<string, unknown> | undefined | null;
+  if (!d || typeof d !== 'object') return null;
+  const str = (key: string): string | null =>
+    typeof d[key] === 'string' ? (d[key] as string) : null;
+  const docId = str('doc_id');
+  const organizationId = str('organization_id');
+  const name = str('name');
+  const createdAt = str('created_at');
+  const updatedAt = str('updated_at');
+  const role = d['role'];
+  const projectId = d['project_id'];
+  if (
+    docId === null ||
+    organizationId === null ||
+    name === null ||
+    createdAt === null ||
+    updatedAt === null ||
+    (role !== 'owner' && role !== 'editor' && role !== 'viewer') ||
+    (projectId !== null && typeof projectId !== 'string')
+  ) {
+    return null;
+  }
+  return {
+    doc_id: docId,
+    organization_id: organizationId,
+    project_id: projectId ?? null,
+    role,
+    name,
+    created_at: createdAt,
+    updated_at: updatedAt,
+  };
+}
+
+// The expiry a link view carries for a document minted without an account,
+// or null for every other link.
+function anonymousExpiry(body: {
+  anonymous?: unknown;
+  expires_at?: unknown;
+}): Date | null {
+  if (body.anonymous !== true || typeof body.expires_at !== 'string') {
+    return null;
+  }
+  const at = new Date(body.expires_at);
+  return Number.isNaN(at.getTime()) ? null : at;
 }
 
 interface WireDocTransportArgs {
@@ -3035,6 +4026,11 @@ interface WireDocTransportArgs {
   // is the safe point to reconcile a pending open whose terminal
   // `doc_status` frame may have been dropped. Absent in transport-only tests.
   reconcileStatusOnInit?: () => void;
+  // Invoked on a `doc_status` frame that would lock a document not currently
+  // pending: checks the row before applying it, since such a frame can be
+  // the stream's late delivery of a phase the reconcile already read past.
+  // Absent in transport-only tests, where the frame applies directly.
+  verifyPendingStatus?: (status: DocumentWorkStatus) => void;
   // Invoked on every frame carrying server-side movement (`doc_init`, a
   // remote op). Evidence the document has content to pull for a client whose
   // content pull gave up. Absent in transport-only tests.
@@ -3173,7 +4169,13 @@ function takeParkedDocument(
   options: OpenDocumentByIdOptions | undefined,
   identity: string | null,
 ): Document | null {
+  // A parked Document is a live, writable session with its subscription still
+  // alive. Neither pinned open may take one: it would hand back a document
+  // that receives ops and accepts writes, which is the opposite of what both
+  // asked for. Parking itself already refuses them (`!doc.readOnly`), so this
+  // is the other half of that.
   if (options?.version !== undefined) return null;
+  if (options?.frozen === true) return null;
   const key = parkCacheKey(docId, options?.branch, options?.stream);
   if (!key) return null;
   const entry = parkedDocs.get(key);
@@ -3211,6 +4213,24 @@ export function clearParkedDocuments(): void {
 // a clean slate between cases.
 export function _resetParkCacheForTesting(): void {
   clearParkedDocuments();
+  subscriptionEndedAt.clear();
+}
+
+// When each doc topic last had its subscription ended by the server, so a
+// copy re-opened after one ends for good on a second inside the window. The
+// re-open asks the HTTP join, and a socket gate that keeps refusing what the
+// join admits would otherwise re-open the document in a loop.
+const SUBSCRIPTION_ENDED_REOPEN_WINDOW_MS = 60_000;
+const subscriptionEndedAt = new Map<string, number>();
+
+function endedReasonFor(topic: string): 'moved' | 'deleted' {
+  const now = Date.now();
+  for (const [key, at] of subscriptionEndedAt) {
+    if (now - at >= SUBSCRIPTION_ENDED_REOPEN_WINDOW_MS) subscriptionEndedAt.delete(key);
+  }
+  const recent = subscriptionEndedAt.has(topic);
+  subscriptionEndedAt.set(topic, now);
+  return recent ? 'deleted' : 'moved';
 }
 
 // Wire the WS transport onto a materialised Document. Three pieces:
@@ -3268,6 +4288,17 @@ export const RESEND_MAX_DELAY_MS = 30_000;
 // Exported for the fake-timer tests.
 export const RESEND_FORCE_CEILING_MS = 60_000;
 
+// How long one op may go unacked on the socket before the reader is told,
+// through `status`, that their changes are not saved. A server that answers
+// an op anonymously every time (an error frame naming no op) draws a resend
+// per backoff step, or a forced one per ceiling window, forever, while
+// `savingCount` stays above zero with nothing on screen saying why. Three
+// ceiling windows is past any loss a resend recovers from, since a lost op
+// is answered on its first forced resend. The notice changes nothing about
+// how the op is resent, and clears itself once nothing is waiting.
+// Exported for the fake-timer tests.
+export const UNANSWERED_OP_NOTICE_MS = 3 * RESEND_FORCE_CEILING_MS;
+
 // Server-shed recovery policy, driven by `unavailable` error frames. The
 // frame names no op, so a round re-asserts every outstanding op at once and
 // any further frame arriving before that round runs is part of the same shed
@@ -3285,16 +4316,7 @@ const UNAVAILABLE_BASE_DELAY_MS = 1000;
 const UNAVAILABLE_MAX_DELAY_MS = 30_000;
 const UNAVAILABLE_GIVE_UP_MESSAGE =
   'The server could not store this change, and re-sending it did not ' +
-  'help. Reload the document to continue from the last saved state.';
-
-// Reported for every op left behind when the server ends this document's
-// subscription (it refused the subscribe, or evicted it again after the one
-// silent re-subscribe a connection grants). The ops can never be acked on a
-// subscription that is over, and a fresh one arrives only with a fresh open,
-// so the app's cue is to reload.
-const SUBSCRIPTION_ENDED_MESSAGE =
-  'The live connection to this document ended, so this change was not ' +
-  'saved. Reload the document to continue from the last saved state.';
+  'help. Reload to continue from the last saved state.';
 
 /** How long the Nth (1-based) recovery round waits before re-asserting. */
 function unavailableDelayMs(round: number): number {
@@ -3311,15 +4333,37 @@ const TOO_LARGE_MESSAGE =
   'update; store the bulk of it as a file instead, or split it across ' +
   'several records.';
 
-// What a guest hears for an op no request body can carry. A signed-in
-// editor stages such an op to storage first; that route is behind the
-// sign-in gate, so the anonymous tier writes ops that fit one request.
-const LINK_OP_TOO_LARGE_MESSAGE =
-  'This change is too large to save over a shared link. Sign in to the ' +
-  'document to make a change this size.';
 
 function wireDocTransport(args: WireDocTransportArgs): void {
   const topic = `doc:${args.docId}:${args.branchId}`;
+
+  // A remote op over frozen content means the document is now a CRDT. The
+  // re-join keeps the open's read intent and is served that CRDT, which
+  // `applyJoin` swaps in under the same handles. A run that leaves the
+  // document on frozen content (the join failed, or the document is showing
+  // a version) falls back to the reload. Ops arriving during the run ask the
+  // resync for another pass rather than starting a second upgrade.
+  const resync = args.resyncFromSnapshot;
+  if (resync !== undefined) {
+    let upgradeRun: Promise<void> | null = null;
+    args.doc._setStorageUpgrader(() => {
+      if (upgradeRun !== null) {
+        void Promise.resolve(resync()).catch(() => {});
+        return;
+      }
+      upgradeRun = (async () => {
+        try {
+          await resync();
+        } catch {
+          // Judged by what the document holds afterwards.
+        }
+        const doc = args.doc;
+        if (doc._holdsRecordSet() && !doc._isClosed && doc._goneReason === null) doc._reopen();
+      })().finally(() => {
+        upgradeRun = null;
+      });
+    });
+  }
 
   // Per-op retry tracker. The op-write endpoint can answer with an untyped
   // error frame instead of reaching the handler. That frame has no `type`, so
@@ -3356,7 +4400,7 @@ function wireDocTransport(args: WireDocTransportArgs): void {
   const outstandingResends = new Map<
     string,
     {
-      frame: { type: 'op'; topic: string; op_blob: string; client_op_id: string };
+      frame: OpFrame;
       attempts: number;
       timer: ReturnType<typeof setTimeout>;
       // When this op's current timer was armed, compared against the last
@@ -3374,6 +4418,9 @@ function wireDocTransport(args: WireDocTransportArgs): void {
       // neither queueing nor forgetting an op has to scan the queue, which
       // would be quadratic over a mutation that queues thousands.
       queued: boolean;
+      // When this op was first put on the socket, or 0 before then. See
+      // `UNANSWERED_OP_NOTICE_MS`.
+      firstDispatchedAt: number;
     }
   >();
 
@@ -3422,6 +4469,7 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     entry.queued = false;
     entry.inFlight = size;
     entry.dispatchedAt = Date.now();
+    if (entry.firstDispatchedAt === 0) entry.firstDispatchedAt = entry.dispatchedAt;
     inFlightBytes += size;
     args.wsClient.send(entry.frame);
     scheduleResend(clientOpId);
@@ -3598,6 +4646,12 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     entry.timer = setTimeout(() => {
       const current = outstandingResends.get(clientOpId);
       if (!current) return;
+      if (
+        current.firstDispatchedAt !== 0 &&
+        Date.now() - current.firstDispatchedAt > UNANSWERED_OP_NOTICE_MS
+      ) {
+        args.doc._showConnectionNotice('unanswered');
+      }
       const forced = forceResendDue(clientOpId, current);
       if (lastAckAt >= current.armedAt && !forced) {
         scheduleResend(clientOpId);
@@ -3720,6 +4774,25 @@ function wireDocTransport(args: WireDocTransportArgs): void {
 
   args.doc._setDiagnosticsProvider(collectDiagnostics);
 
+  // A network that refuses WebSocket upgrades opens the document over HTTP
+  // and then carries none of its edits: they apply locally and queue, and the
+  // reconnect loop reports only after its full budget (about five minutes),
+  // so a reload inside that window loses them with nothing said. When edits
+  // have waited `NEVER_OPENED_NOTICE_MS` on a client that has never opened a
+  // socket, the document says so on `status`. Never-opened rather than
+  // currently-closed, because a connection that has worked recovers through
+  // the resend machinery and a drop there is ordinarily brief.
+  let neverOpenedTimer: ReturnType<typeof setTimeout> | null = null;
+  function armNeverOpenedNotice(): void {
+    if (neverOpenedTimer !== null || args.wsClient.everOpened !== false) return;
+    neverOpenedTimer = setTimeout(() => {
+      neverOpenedTimer = null;
+      if (args.wsClient.everOpened !== false || outstandingResends.size === 0) return;
+      args.doc._showConnectionNotice();
+    }, NEVER_OPENED_NOTICE_MS);
+    (neverOpenedTimer as { unref?: () => void }).unref?.();
+  }
+
   // Resend every outstanding op now and restart its backoff. Called on
   // reconnect (`doc_init`): a dropped-and-restored connection is the most
   // common reason an op went unacked, and the backoff may have grown to its
@@ -3782,15 +4855,18 @@ function wireDocTransport(args: WireDocTransportArgs): void {
   // and never apply, and its own escape for an op nothing can apply is to
   // discard it. Most refusals do not change that: the handshake pushes
   // whatever slice the durable frontier is missing and splits it under the
-  // frame cap, so it heals the dependents even where the op itself is
-  // irreducibly too large to re-send.
+  // frame cap, so it heals the dependents of an op a transient refusal
+  // dropped.
   //
   // `healable: false` is for the refusal where pushing again is asking the
   // same question. A full document refuses every op whatever its size, so
   // the handshake's own chunks come back refused, and the counter reset
   // below turns that into a loop rather than a bounded retry. What recovers
   // that document is the periodic re-verify, once the server can take a
-  // write at all.
+  // write at all. An op too large for any transport this writer has is the
+  // same: a split runs between changes, never inside one, so the slice the
+  // handshake would push still carries the whole op, and every edit after it
+  // waits on an op the server will never hold.
   // A refusal the heal cannot work around leaves the writer holding a change
   // that reached no database and no other reader, so the writer is the only
   // copy of the document that shows it. Left editable it reads as applied: the
@@ -3864,7 +4940,28 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     } catch {
       // Told or not, the copy is resolved.
     }
-    args.doc.reload();
+    args.doc._reopen();
+  }
+
+  function markGone(reason: 'moved' | 'deleted'): void {
+    // Cancel every resend timer FIRST so a doc that was saving when delete
+    // landed stops re-trying ops the server will only reject as `forbidden`
+    // (the subscription record was evicted at fanout). Draining before the `_markGone`
+    // listeners keeps the lifecycle observably clean.
+    forgetAllOps();
+    clearUnavailableRecovery();
+    // Stop re-verifying durability against an evicted doc: a resync push
+    // would only bounce as `forbidden`, and a gap pull would only 404.
+    if (reverifyTimer !== null) {
+      clearInterval(reverifyTimer);
+      reverifyTimer = null;
+    }
+    clearDivergenceHeal();
+    if (gapTimer !== null) {
+      clearTimeout(gapTimer);
+      gapTimer = null;
+    }
+    args.doc._markGone(reason);
   }
 
   function failOpTerminally(
@@ -3914,6 +5011,25 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     (unavailableTimer as { unref?: () => void }).unref?.();
   }
 
+  // The ops the durability handshake leaves to this transport: those still
+  // queued behind the in-flight budget, and those first sent too recently for
+  // their resend timer to have doubted them. An op past its first resend step
+  // is fair game for the handshake, since the resend path does not promise it
+  // arrives.
+  function deliveringOpBlobs(): Uint8Array[] {
+    const now = Date.now();
+    const blobs: Uint8Array[] = [];
+    for (const entry of outstandingResends.values()) {
+      if (
+        entry.firstDispatchedAt === 0 ||
+        now - entry.firstDispatchedAt < RESEND_BASE_DELAY_MS
+      ) {
+        blobs.push(base64ToBytes(entry.frame.op_blob));
+      }
+    }
+    return blobs;
+  }
+
   // Durability handshake, run on every `doc_init`. The persisted version
   // vector + durable tail ops define the durable frontier; if the local doc
   // holds CRDT knowledge beyond it (an op acked then discarded by the
@@ -3930,6 +5046,7 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     const outcome = args.doc.maybeResyncPush(
       base64ToBytes(snapshotVersionVectorB64),
       durableTailBlobs,
+      deliveringOpBlobs(),
     );
     // Reported here as well as from the re-verify, or the record holds only
     // the heals that took the slower route and an operator reading it cannot
@@ -3970,6 +5087,7 @@ function wireDocTransport(args: WireDocTransportArgs): void {
             outcome = args.doc.maybeResyncPush(
               base64ToBytes(frontier.snapshotVersionVector),
               frontier.tailBlobs,
+              deliveringOpBlobs(),
             );
             // The handshake having work to do means the server's copy was
             // behind this client's, which is the state a lost op leaves and
@@ -4098,46 +5216,30 @@ function wireDocTransport(args: WireDocTransportArgs): void {
         gapPullRounds = 0;
         return;
       }
-      pullJoin();
+      // The head can be this client's own op still being written over HTTP,
+      // so the judgement waits for that write as a catch-up prompt does.
+      resyncPastSeq(awaited);
     }, delay);
     (gapTimer as { unref?: () => void }).unref?.();
   }
 
-  // The server ended this subscription: it refused the subscribe (a revoked
-  // grant), or evicted it again after the one silent re-subscribe a
-  // connection grants. The client detaches this transport from the topic as
-  // it reports that, so no ack, no fanout and no reconnect reaches it again.
+  // The server ended this subscription: it refused the subscribe (access
+  // that ended between the HTTP join and the subscribe, which no eviction can
+  // reach because no subscription row exists yet), or evicted it again after
+  // the one silent re-subscribe a connection grants. The client detaches this
+  // transport from the topic as it reports that, so no ack, no fanout and no
+  // reconnect reaches it again.
   //
-  // Everything the transport is waiting on is therefore dead. The ops it
-  // holds can never be acked, and re-sending them puts frames on a
-  // subscription the server has refused while `savingCount` climbs and the
-  // app hears nothing, so they are failed here and every later edit fails
-  // the same way: the app reads one actionable error per unsaved change and
-  // its cue to reload, rather than a document that looks like it is saving
-  // forever. The ids are taken before the reports because
-  // `_failOutstandingOp` re-enters app code.
+  // That is the same fact a `doc_gone` reports, so the copy ends the same
+  // way: `moved`, which a session answers by re-opening the id, so the
+  // current gate re-admits a reader who still reaches the document and
+  // refuses one who does not. A second end inside the window is `deleted`,
+  // which ends the copy without the re-open.
   let subscriptionEnded = false;
   function endSubscription(): void {
     if (subscriptionEnded) return;
     subscriptionEnded = true;
-    const clientOpIds = [...outstandingResends.keys()];
-    forgetAllOps();
-    clearUnavailableRecovery();
-    // The heal and the gap pull both work through this transport, so they
-    // are stopped rather than armed: what they would push or fetch has no
-    // subscription left to travel on.
-    clearDivergenceHeal();
-    if (reverifyTimer !== null) {
-      clearInterval(reverifyTimer);
-      reverifyTimer = null;
-    }
-    if (gapTimer !== null) {
-      clearTimeout(gapTimer);
-      gapTimer = null;
-    }
-    for (const clientOpId of clientOpIds) {
-      args.doc._failOutstandingOp(clientOpId, SUBSCRIPTION_ENDED_MESSAGE);
-    }
+    markGone(endedReasonFor(topic));
   }
 
   // 1. Subscribe to the doc topic. Frame routing:
@@ -4161,12 +5263,21 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     (frame) => {
       const init = parseDocInitFrame(frame);
       if (init) {
+        // A new version replaced the line while this copy was away (the
+        // `doc_gone` naming it went to a socket that was down). Its tail is
+        // the new version's, and nothing this copy holds or would re-assert
+        // applies to it, so it reopens before applying or resending anything.
+        if (importSeqMoved(args.doc, init.import_seq)) {
+          markGone('moved');
+          return;
+        }
         // Recorded as the frame arrives rather than after the tail applies.
         // Importing a tail op can throw, and the client swallows it, so a
         // latch written further down would stay behind and read the NEXT
         // reconnect as the opening subscribe, suppressing the report this
         // exists to make.
         const reconnects = args.wsClient.reconnectCount ?? 0;
+        const wasSubscribed = docInitReconnectCount !== null;
         const socketDropped =
           docInitReconnectCount !== null && reconnects > docInitReconnectCount;
         docInitReconnectCount = reconnects;
@@ -4255,6 +5366,9 @@ function wireDocTransport(args: WireDocTransportArgs): void {
           reportSyncHealth('reconnected_unsaved');
         }
         resendAllOutstanding();
+        // A nudge posted while the topic was down is gone, so every status
+        // this document holds asks what moved since its revision.
+        if (wasSubscribed) args.doc._inputStatusNudged(null, null);
         // The handshake needs the WHOLE durable tail, and this frame carries
         // it only when every entry came inline. A spilled op is named here
         // with its bytes withheld, and the HTTP join the reader already ran
@@ -4328,7 +5442,7 @@ function wireDocTransport(args: WireDocTransportArgs): void {
         // Evidence the connection is working through its queue, which is what
         // the resend timers read to tell a slow ack from a silent server.
         lastAckAt = Date.now();
-        args.doc.resolveOutstandingOp(frame.client_op_id);
+        args.doc.resolveOutstandingOp(frame.client_op_id, frame.seq);
         args.setCurrentSeq(frame.seq);
         args.advanceCoveredSeq(frame.seq);
         // An ack for a local op sits above any remote op this client never
@@ -4351,6 +5465,13 @@ function wireDocTransport(args: WireDocTransportArgs): void {
         // the Document so the app hears "could not be saved" instead of a silent
         // wedge. Scoped to this one op; the topic subscription stays live.
         forgetOp(frame.client_op_id);
+        // A new version replaced the line under this copy. Not healable and
+        // not this op's alone: every op it holds names the replaced version,
+        // so the copy reopens, which drops them all.
+        if (frame.reason === OP_REJECTED_MOVED) {
+          markGone('moved');
+          return;
+        }
         // The flip is the one moment the refusal is worth reporting: every op
         // in flight draws the same sentence, and a bulk write has as many of
         // those as it has unacked writes.
@@ -4376,30 +5497,13 @@ function wireDocTransport(args: WireDocTransportArgs): void {
         // slice under the frame cap, which is what reaches the dependents of
         // an op that is itself too large to re-send.
         failOpTerminally(frame.client_op_id, opRejectedMessage(frame), {
-          healable: !atCapacity,
+          healable: !atCapacity && frame.reason !== OP_REJECTED_NOT_IMPORTED,
           report: !atCapacity || firstCapacityRefusal,
         });
         return;
       }
       if (isDocGoneFrame(frame)) {
-        // Cancel every resend timer FIRST so a doc that was saving when delete
-        // landed stops re-trying ops the server will only reject as `forbidden`
-        // (the subscription record was evicted at fanout). Draining before the `_markGone`
-        // listeners keeps the lifecycle observably clean.
-        forgetAllOps();
-        clearUnavailableRecovery();
-        // Stop re-verifying durability against an evicted doc: a resync push
-        // would only bounce as `forbidden`, and a gap pull would only 404.
-        if (reverifyTimer !== null) {
-          clearInterval(reverifyTimer);
-          reverifyTimer = null;
-        }
-        clearDivergenceHeal();
-        if (gapTimer !== null) {
-          clearTimeout(gapTimer);
-          gapTimer = null;
-        }
-        args.doc._markGone(goneReasonOf(frame));
+        markGone(goneReasonOf(frame));
         return;
       }
       if (isDocStatusFrame(frame)) {
@@ -4411,6 +5515,13 @@ function wireDocTransport(args: WireDocTransportArgs): void {
         // nothing (no racy read, no loop).
         if (frame.reload && args.reloadAfterHydration) {
           args.reloadAfterHydration(status);
+        } else if (
+          status.pending &&
+          status.blocking !== false &&
+          args.doc._workStatusNow?.pending !== true &&
+          args.verifyPendingStatus
+        ) {
+          args.verifyPendingStatus(status);
         } else {
           args.doc._emitStatus(status);
         }
@@ -4419,6 +5530,13 @@ function wireDocTransport(args: WireDocTransportArgs): void {
       if (isDocMetaFrame(frame)) {
         // `_setName` de-dupes, so a re-emit of the current name is a no-op.
         args.doc._setName(frame.name);
+        return;
+      }
+      const nudge = parseInputStatusNudge(frame);
+      if (nudge !== null) {
+        // The frame names the key and its new revision alone; the status
+        // fetches what moved.
+        args.doc._inputStatusNudged(nudge.key, nudge.rev);
         return;
       }
       if (isDocDriveStatusFrame(frame)) {
@@ -4469,33 +5587,14 @@ function wireDocTransport(args: WireDocTransportArgs): void {
   //    tracker so a silently-dropped server response triggers a retry.
   args.doc.setLocalOpHook((opBlob) => {
     const clientOpId = args.newClientOpId();
-    // Nothing carries an op once the subscription is over, so it is failed
-    // instead of tracked: an entry nothing can ack pins `savingCount` and
-    // its resends reach a topic the server refused. The caller records the
-    // entry AFTER this hook returns, so the failure waits a microtask for
-    // there to be one to fail.
-    //
-    // Taken before the op is timed, because this path fails the op through
-    // the Document directly rather than through `failOpTerminally`, so a
-    // timing entry written here is one nothing ever drops.
-    if (subscriptionEnded) {
-      void Promise.resolve().then(() => {
-        args.doc._failOutstandingOp(clientOpId, SUBSCRIPTION_ENDED_MESSAGE);
-      });
-      return clientOpId;
-    }
     opStartedAt.set(clientOpId, Date.now());
     const opBlobB64 = bytesToBase64(opBlob);
-    const sendFrame: {
-      type: 'op';
-      topic: string;
-      op_blob: string;
-      client_op_id: string;
-    } = {
+    const sendFrame: OpFrame = {
       type: 'op',
       topic,
       op_blob: opBlobB64,
       client_op_id: clientOpId,
+      ...baseImportSeqField(args.doc),
     };
 
     // A frame past the transport's cap is not delivered and takes the
@@ -4519,8 +5618,10 @@ function wireDocTransport(args: WireDocTransportArgs): void {
       dispatchedAt: 0,
       inFlight: 0,
       queued: false,
+      firstDispatchedAt: 0,
     });
     dispatchOp(clientOpId);
+    armNeverOpenedNotice();
     return clientOpId;
   });
 
@@ -4552,12 +5653,12 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     // The size is known here, so refuse without spending a round trip on a
     // blob that can only come back 400.
     if (opBlobExceedsDurableLimit(opBlobB64)) {
-      failOpTerminally(clientOpId, TOO_LARGE_MESSAGE);
+      failOpTerminally(clientOpId, TOO_LARGE_MESSAGE, { healable: false });
       return;
     }
 
     if (!args.postOversizedOp) {
-      failOpTerminally(clientOpId, TOO_LARGE_MESSAGE);
+      failOpTerminally(clientOpId, TOO_LARGE_MESSAGE, { healable: false });
       return;
     }
     // An oversized op is deliberately kept out of `outstandingResends` (a
@@ -4596,6 +5697,11 @@ function wireDocTransport(args: WireDocTransportArgs): void {
       opStartedAt.delete(clientOpId);
       return;
     }
+    if (!result.ok && result.moved === true) {
+      opStartedAt.delete(clientOpId);
+      markGone('moved');
+      return;
+    }
     if (!result.ok) {
       // Terminal for this op, the same way `op_rejected` is: the local
       // commit stays applied but never persists, so the app hears about it
@@ -4609,7 +5715,10 @@ function wireDocTransport(args: WireDocTransportArgs): void {
         clientOpId,
         result.retryable ? UNAVAILABLE_GIVE_UP_MESSAGE : result.message,
         {
-          healable: result.atCapacity !== true,
+          healable:
+            result.atCapacity !== true &&
+            result.notImported !== true &&
+            result.tooLarge !== true,
           report: result.atCapacity !== true || firstCapacityRefusal,
         },
       );
@@ -4618,7 +5727,7 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     // Same bookkeeping an `op_ack` does: resolve the outstanding entry and
     // advance both cursors past the seq the server allocated.
     opStartedAt.delete(clientOpId);
-    args.doc.resolveOutstandingOp(clientOpId);
+    args.doc.resolveOutstandingOp(clientOpId, result.seq);
     args.setCurrentSeq(result.seq);
     args.advanceCoveredSeq(result.seq);
   }
@@ -4674,6 +5783,10 @@ function wireDocTransport(args: WireDocTransportArgs): void {
       clearInterval(reverifyTimer);
       reverifyTimer = null;
     }
+    if (neverOpenedTimer !== null) {
+      clearTimeout(neverOpenedTimer);
+      neverOpenedTimer = null;
+    }
     clearDivergenceHeal();
     if (gapTimer !== null) {
       clearTimeout(gapTimer);
@@ -4710,7 +5823,7 @@ function wireDocTransport(args: WireDocTransportArgs): void {
     const parkable =
       !args.doc.readOnly &&
       args.parkable !== false &&
-      args.doc.status?.pending !== true &&
+      args.doc._workStatusNow?.pending !== true &&
       args.doc._goneReason === null;
     const cacheKey = parkable
       ? parkCacheKey(args.docId, args.requestedBranchId, args.requestedStream)
@@ -4786,18 +5899,237 @@ async function fetchPresignedSnapshot(
 // legible upgrade prompt (rendered verbatim through `session.error`), never an
 // empty document: treating an unreadable snapshot as "no snapshot" would let
 // the user edit and overwrite content that is actually there.
-function snapshotKindTooNewError(): BrassError {
-  return new BrassError(
-    'This document needs a newer version of this app. Update to the latest @brass-build/client to open it.',
-    { status: 426 },
-  );
+/** Whether the server names a head above the seq its snapshot was sealed at,
+ *  which is state the payload has not delivered. Read beside `tail_ops`, so a
+ *  response that dropped its tail entries for budget is still seen as having
+ *  one rather than as a document that stops at its base. A server that sends
+ *  neither seq answers by its entries alone, which is all it ever had. */
+function coversMoreThanSnapshot(
+  body: Pick<DocumentSnapshotResponse, 'current_seq' | 'snapshot_seq'>,
+): boolean {
+  const { current_seq: current, snapshot_seq: sealed } = body;
+  return current !== undefined && sealed !== undefined && current > sealed;
+}
+
+/** The open with its top-level `readOnly` folded into `documentOptions`,
+ *  which is where every path below reads the intent from. The top-level
+ *  value wins over `documentOptions.readOnly` when both are set. */
+function withReadIntent(
+  options: OpenDocumentByIdOptions | undefined,
+): OpenDocumentByIdOptions | undefined {
+  if (options?.readOnly === undefined) return options;
+  const { readOnly, ...rest } = options;
+  const { readOnly: _alias, ...documentOptions } = rest.documentOptions ?? {};
+  return {
+    ...rest,
+    documentOptions: readOnly ? { ...documentOptions, readOnly: true } : documentOptions,
+  };
+}
+
+/** Whether this open will never write: the caller asked for a snapshot, or
+ *  for a read-only Document. The grant is not consulted, because a caller who
+ *  may edit and says nothing is one that may edit. */
+function opensReadOnly(options: OpenDocumentByIdOptions | undefined): boolean {
+  return options?.frozen === true || options?.documentOptions?.readOnly === true;
+}
+
+/** The options every re-join of `branch` sends, a member's and a guest's
+ *  alike: the line it names, and the read intent of the open it serves, so a
+ *  document opened read-only is re-joined read-only and one opened to write
+ *  is re-joined to write. */
+function rejoinOptions(
+  branch: string | undefined,
+  open: OpenDocumentByIdOptions | undefined,
+): OpenDocumentByIdOptions {
+  const base = branch !== undefined ? { branch } : {};
+  return opensReadOnly(open) ? { ...base, documentOptions: { readOnly: true } } : base;
+}
+
+/** What re-joining an open document did to it. */
+type JoinApplied =
+  /** The join's content and tail were imported into the document. */
+  | { kind: 'applied'; content: JoinContent; tailSeqs: number[] }
+  /** The document holds the frozen content the join serves. */
+  | { kind: 'unchanged' }
+  /** The join serves content the document cannot take in place, so it was
+   *  reloaded. */
+  | { kind: 'reloaded' };
+
+/**
+ * Apply a re-join to an open document: the reload, a line's resync and a
+ * guest's pull all end here.
+ *
+ * CRDT content over a CRDT document merges in place. Over frozen content it is
+ * a storage upgrade (`Document._upgradeStorage`), and frozen content sealed at
+ * another seq replaces the frozen content; both keep the app's handles and
+ * their subscribers. Frozen content served to a CRDT document, or content the
+ * document cannot take in place, reloads it.
+ */
+// The seal of frozen content that holds nothing yet: no join's seq matches it.
+const NO_SEAL = -1;
+
+// The `import_seq` each CRDT copy was opened at. A new version's import
+// replaces a line's content with a CRDT authored by the same pinned peer as
+// the one it replaces, so merging the new content into an old copy dedupes it
+// away and leaves the old copy's ops pointing at containers the line no
+// longer has. A copy that sees the line under a different import reopens
+// instead, and names its base on every op so the server refuses one that
+// raced the import (`moved`).
+const openedImportSeq = new WeakMap<Document, number>();
+
+function recordImportSeq(doc: Document, importSeq: unknown): void {
+  if (typeof importSeq === 'number') openedImportSeq.set(doc, importSeq);
+}
+
+function importSeqMoved(doc: Document, importSeq: unknown): boolean {
+  const base = openedImportSeq.get(doc);
+  return base !== undefined && typeof importSeq === 'number' && importSeq !== base;
+}
+
+function baseImportSeqField(doc: Document): { base_import_seq?: number } {
+  const base = openedImportSeq.get(doc);
+  return base === undefined ? {} : { base_import_seq: base };
+}
+
+async function applyJoin(
+  doc: Document,
+  body: {
+    snapshot: unknown;
+    tail_ops: Array<{ seq: number; op_blob_b64: string }>;
+    snapshot_seq?: number;
+    current_seq?: number;
+    import_seq?: number;
+  },
+  fetchBody: ContentFetch,
+): Promise<JoinApplied> {
+  // Decided off the wire's own statement of the encoding, so content the
+  // document will not keep is never downloaded.
+  const encoding = joinEncoding(body.snapshot);
+  // Frozen content replaces a reader's CRDT rather than merging into it, so a
+  // new version's import is taken in place below.
+  const replacesCrdt = encoding === 'frozen' && !doc._holdsRecordSet();
+  if (!replacesCrdt && importSeqMoved(doc, body.import_seq)) {
+    doc._reopen();
+    return { kind: 'reloaded' };
+  }
+  if (doc._holdsRecordSet()) {
+    const tail = [...body.tail_ops].sort((a, b) => a.seq - b.seq);
+    const tailSeqs = tail.map((entry) => entry.seq);
+    if (encoding === 'frozen') {
+      const held = doc._frozenSealSeq;
+      const sameSeal =
+        held === null || body.snapshot_seq === undefined || held === body.snapshot_seq;
+      if (tail.length === 0 && sameSeal) return { kind: 'unchanged' };
+      if (tail.length === 0 && !coversMoreThanSnapshot(body)) {
+        const content = await decodeJoinContent(body.snapshot, fetchBody);
+        if (
+          content.kind === 'frozen' &&
+          doc._replaceSealedContent(content.content, body.snapshot_seq ?? null)
+        ) {
+          return { kind: 'applied', content, tailSeqs };
+        }
+      }
+      doc._reopen();
+      return { kind: 'reloaded' };
+    }
+    const content = await decodeJoinContent(body.snapshot, fetchBody);
+    await ensureWasmReady();
+    const upgraded = doc._upgradeStorage(
+      content.kind === 'crdt' ? content.bytes : null,
+      tail.map((entry) => base64ToBytes(entry.op_blob_b64)),
+    );
+    if (!upgraded) {
+      doc._reopen();
+      return { kind: 'reloaded' };
+    }
+    return { kind: 'applied', content, tailSeqs };
+  }
+  // A line a reader holds as a CRDT and the server now stores frozen (a new
+  // version of its file was imported over it) is taken as stored, in place.
+  // An editable open asks as a writer and is never served frozen content.
+  if (encoding === 'frozen') {
+    if (
+      doc._openMode !== 'edit' &&
+      body.tail_ops.length === 0 &&
+      !coversMoreThanSnapshot(body)
+    ) {
+      const content = await decodeJoinContent(body.snapshot, fetchBody);
+      if (
+        content.kind === 'frozen' &&
+        doc._downgradeStorage(content.content, body.snapshot_seq ?? null)
+      ) {
+        openedImportSeq.delete(doc);
+        return { kind: 'applied', content, tailSeqs: [] };
+      }
+    }
+    doc._reopen();
+    return { kind: 'reloaded' };
+  }
+  const content = await decodeJoinContent(body.snapshot, fetchBody);
+  if (content.kind === 'crdt') doc._applySnapshot(content.bytes);
+  const tail = [...body.tail_ops].sort((a, b) => a.seq - b.seq);
+  for (const entry of tail) doc.applyRemoteOp(base64ToBytes(entry.op_blob_b64));
+  return { kind: 'applied', content, tailSeqs: tail.map((entry) => entry.seq) };
 }
 
 async function materialise(
   body: DocumentSnapshotResponse,
   documentOptions?: DocumentOptions,
   onSnapshotProgress?: (loaded: number, total: number | null) => void,
+  // A frozen copy of a document whose import has not landed yet starts as
+  // empty frozen content sealed at nothing, so the reload that follows the
+  // import asks for the content as stored and swaps it in place, where an
+  // empty CRDT would ask the server to convert the line for it.
+  { emptyAsFrozen = false }: { emptyAsFrozen?: boolean } = {},
 ): Promise<OpenedDocument> {
+  const endFetch = perfStart('open: snapshot fetch + decode');
+  const content = await decodeJoinContent(body.snapshot, (url) =>
+    fetchPresignedSnapshot(url, onSnapshotProgress),
+  );
+  endFetch({ kind: content.kind });
+  if (content.kind === 'none' && emptyAsFrozen && body.tail_ops.length === 0) {
+    return Document.openFromSealedContent(SealedContent.fromJSON({}), {
+      ...documentOptions,
+      readOnly: true,
+      readOnlyReason: documentOptions?.readOnlyReason ?? 'snapshot',
+      docId: body.doc_id,
+      branchId: body.branch_id,
+      frozenSeal: NO_SEAL,
+    }) as OpenedDocument;
+  }
+  // Frozen content is read with no CRDT engine: no engine is built and the
+  // WASM is not waited on.
+  //
+  // It is served to a reader and never to a writer. Converting it to a CRDT
+  // is the SERVER's, because the conversion's output depends on the paging
+  // constants, the mutation batching budget and loro's encoding, and two
+  // clients on different builds would produce documents that merge into each
+  // other with no error and no agreement. The tail is empty for the same
+  // reason: the conversion is what makes a branch writable, so the ops it
+  // takes are authored after it and against the converted document.
+  if (content.kind === 'frozen') {
+    // Frozen content with state above it is a document the server should not
+    // have been able to build, and the content alone is the document as it
+    // stood before those ops. Refused rather than read, because nothing here
+    // would say so.
+    if (body.tail_ops.length > 0 || coversMoreThanSnapshot(body)) {
+      throw new BrassError(
+        'This could not be opened: its stored records do not ' +
+          'account for every change made to it. Reopen it in a moment.',
+        { status: 500 },
+      );
+    }
+    return Document.openFromSealedContent(content.content, {
+      ...documentOptions,
+      // A property of the content, which holds no op log for an edit to be
+      // written into.
+      readOnly: true,
+      readOnlyReason: documentOptions?.readOnlyReason ?? 'snapshot',
+      docId: body.doc_id,
+      branchId: body.branch_id,
+      ...(body.snapshot_seq !== undefined ? { frozenSeal: body.snapshot_seq } : {}),
+    }) as OpenedDocument;
+  }
   // Constructing the document is the first thing in this package that runs the
   // WASM, and `Brass.init` only starts the fetch, so this is where it is
   // waited on. Usually it resolved during the auth round-trip and this costs
@@ -4812,25 +6144,12 @@ async function materialise(
     branchId: body.branch_id,
   };
   let doc: Document;
-  const snap = body.snapshot;
-  if (snap === null) {
+  if (content.kind === 'none') {
     doc = Document.create(optionsWithId);
-  } else if (snap.kind === 'inline') {
-    const endDecode = perfStart('open: base64 decode (inline snapshot)');
-    const bytes = base64ToBytes(snap.data_b64);
-    endDecode({ base64Chars: snap.data_b64.length, snapshotBytes: bytes.byteLength });
-    const endImport = perfStart('open: loro import (inline snapshot)');
-    doc = Document.openFromSnapshot(bytes, optionsWithId);
-    endImport({ snapshotBytes: bytes.byteLength });
-  } else if (snap.kind === 'presigned') {
-    const endPresigned = perfStart('open: presigned snapshot fetch');
-    const bytes = await fetchPresignedSnapshot(snap.url, onSnapshotProgress);
-    endPresigned({ snapshotBytes: bytes.byteLength });
-    const endImport = perfStart('open: loro import (presigned snapshot)');
-    doc = Document.openFromSnapshot(bytes, optionsWithId);
-    endImport({ snapshotBytes: bytes.byteLength });
   } else {
-    throw snapshotKindTooNewError();
+    const endImport = perfStart('open: loro import');
+    doc = Document.openFromSnapshot(content.bytes, optionsWithId);
+    endImport({ snapshotBytes: content.bytes.byteLength });
   }
 
   // Apply tail ops in seq order. The server delivers them sorted; we sort
@@ -4842,8 +6161,105 @@ async function materialise(
     doc.applyRemoteOp(base64ToBytes(entry.op_blob_b64));
   }
   endTail({ count: tail.length });
+  recordImportSeq(doc, body.import_seq);
 
   // `doc.id` is non-null at runtime (stamped above); the cast closes the type
   // gap without weakening the class's `string | null` signature.
   return doc as OpenedDocument;
+}
+
+/** How many frozen opens run at once. */
+export const FROZEN_OPEN_LANES = 8;
+
+/** Runs at most `lanes` of the tasks handed to it at once, in the order given. */
+export function createPacer(lanes: number): <T>(task: () => Promise<T>) => Promise<T> {
+  let running = 0;
+  const waiting: Array<() => void> = [];
+  return (task) =>
+    new Promise((resolve, reject) => {
+      const start = (): void => {
+        running += 1;
+        task()
+          .then(resolve, reject)
+          .finally(() => {
+            running -= 1;
+            waiting.shift()?.();
+          });
+      };
+      if (running < lanes) start();
+      else waiting.push(start);
+    });
+}
+
+function frozenOptions(options: OpenDocumentByIdOptions): OpenDocumentByIdOptions {
+  // Reading as data: a schema this app did not declare is read rather than
+  // refused, since nothing written through this copy can misread it.
+  return {
+    ...options,
+    acceptSchemaConflict: true,
+    documentOptions: { ...options.documentOptions, readOnly: true },
+  };
+}
+
+// A stream line opened for a frozen copy: the same reading as the copy
+// itself, of the line its manifest names.
+function frozenLineOptions(lineId: string): OpenDocumentByIdOptions {
+  return {
+    branch: lineId,
+    frozen: true,
+    acceptSchemaConflict: true,
+    documentOptions: { readOnly: true },
+  };
+}
+
+function importReportOf(parsed: DocumentSnapshotResponse): ImportReport | null {
+  const report = (parsed as { import_report?: unknown }).import_report;
+  return report !== null && typeof report === 'object' && Array.isArray((report as ImportReport).findings)
+    ? (report as ImportReport)
+    : null;
+}
+
+/**
+ * Whether a frame on a document's topic says the document moved past the
+ * point a frozen copy was taken at: a later op, work that locked the
+ * document finishing (an import landing or failing), or the document going.
+ */
+export function frameMovesDocument(frame: unknown, takenAt: number): boolean {
+  if (frame === null || typeof frame !== 'object') return false;
+  const f = frame as {
+    type?: unknown;
+    seq?: unknown;
+    current_seq?: unknown;
+    reload?: unknown;
+    status?: { pending?: unknown; blocking?: unknown };
+  };
+  switch (f.type) {
+    // The server fans a `doc_op` out to every subscriber but the writer's
+    // connection, so an edit made through another copy on this page's socket
+    // reaches the topic only as that copy's `op_ack`.
+    case 'doc_op':
+    case 'op_ack':
+      return typeof f.seq === 'number' && f.seq > takenAt;
+    case 'doc_init':
+    case 'doc_catch_up':
+      return typeof f.current_seq === 'number' && f.current_seq > takenAt;
+    case 'doc_status':
+      // `reload` is work that replaced the content (an import landing); a
+      // terminal status still blocking is work that failed.
+      return (
+        f.reload === true ||
+        (f.status?.pending === false && f.status.blocking !== false)
+      );
+    case 'doc_gone':
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The document's name as the join that opened it read it, so a copy opened by
+// id carries it from its first frame as a session open does.
+function setJoinedName(doc: Document, parsed: unknown): void {
+  const name = (parsed as { name?: unknown }).name;
+  if (typeof name === 'string') doc._setName(name);
 }

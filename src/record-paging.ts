@@ -79,8 +79,14 @@ function gunzip(bytes: Uint8Array): Uint8Array {
 export const TAG_FIELD = 'type';
 export const BODY_FIELD = 'params';
 
-/** Root container keys the record store occupies on a document. */
+/** Root container keys the record store occupies on a document, and the one
+ *  `meta` entry that is not paging bookkeeping. Fixed names rather than a
+ *  document's configurable `rootKey`: a record store is one shape wherever it
+ *  is written, so the encoding it is written in cannot change where a reader
+ *  looks for it. */
 export const META_KEY = 'meta';
+export const SCHEMA_VERSION_KEY = 'schema_version';
+export const HEADER_KEY = 'header';
 export const RECORDS_KEY = 'instances';
 export const ORDER_KEY = 'instance_order';
 
@@ -172,9 +178,29 @@ export const PAGE_TAG = '__page__';
  *  holds. */
 export const RESERVED_KEY_PREFIX = 'brass:';
 
-/** Whether `key` names one of the store's own entries rather than a record. */
-export function isReservedKey(key: string): boolean {
-  return key.startsWith(RESERVED_KEY_PREFIX);
+/** Whether `key` in the root map `rootKey` is a paged marker
+ *  (`PAGED_ROOT_PREFIX`). `meta` is a root an app reads and writes like any
+ *  other (an import keeps `schema_version` there), so the markers are hidden
+ *  from every read of it and refused on write: an app that copies or clears
+ *  `meta` generically would otherwise delete one, and every reader after that
+ *  takes the unpaged path over a map holding pages, seeing the store's
+ *  `brass:` keys in place of its records. A `paged:` key in any other root is
+ *  an ordinary record key. */
+export function isPagedMarkerEntry(rootKey: string | null, key: string): boolean {
+  return rootCarriesMarkers(rootKey) && key.startsWith(PAGED_ROOT_PREFIX);
+}
+
+/** Whether the root map `rootKey` is the one the paged markers are kept in,
+ *  so a reader can skip the per-key test on every other root. */
+export function rootCarriesMarkers(rootKey: string | null): boolean {
+  return rootKey === META_KEY;
+}
+
+/** Whether `key` names one of the platform's own entries rather than a record:
+ *  the store's bookkeeping under `RESERVED_KEY_PREFIX` in any root, and, when
+ *  the root is named, a paged marker in `meta`. */
+export function isReservedKey(key: string, rootKey: string | null = null): boolean {
+  return key.startsWith(RESERVED_KEY_PREFIX) || isPagedMarkerEntry(rootKey, key);
 }
 
 /** The one key a reader cannot carry as an ordinary object property.
@@ -197,12 +223,21 @@ const UNCARRIABLE_RECORD_KEY = '__proto__';
  *  is from the key alone. The alternative, escaping, would put the escape on
  *  the read of every key of every map, paged or not, and a store that pages
  *  later cannot escape what it already holds. */
-export function assertUsableRecordKey(key: string): void {
+export function assertUsableRecordKey(
+  key: string,
+  rootKey: string | null = null,
+): void {
   if (key === UNCARRIABLE_RECORD_KEY) {
     throw new Error(
       `Key "${key}" is reserved: a record key cannot be ` +
         `"${UNCARRIABLE_RECORD_KEY}", which names an object's prototype ` +
         `rather than one of its entries.`,
+    );
+  }
+  if (isPagedMarkerEntry(rootKey, key)) {
+    throw new Error(
+      `Key "${key}" is reserved: a key in "${META_KEY}" cannot start with ` +
+        `"${PAGED_ROOT_PREFIX}", which marks how a collection is stored.`,
     );
   }
   if (!isReservedKey(key)) return;
@@ -257,11 +292,25 @@ export function repackRecord(
   ];
 }
 
-/** The stored value a page triple carries: the value itself for a whole-value
- *  record, else the `{ type, params }` pair a typed one was split into. */
+/**
+ * The stored value a tag and a body carry: the body itself when there is no
+ * tag, else the `{ type, params }` pair a typed record was split into.
+ *
+ * A null tag is not an absent field, it is the statement that this record was
+ * never split: a map holds whatever its writer assigned and an app's own value
+ * has no tag to take off it. Every reader that rebuilds a value from the two
+ * comes through here, because a reader that built the pair unconditionally
+ * would hand an app `{ type: null, params: 5 }` where the same record read out
+ * of a CRDT document is `5`, which is the encoding showing through.
+ */
+export function recordValueOf(tag: string | null, body: unknown): unknown {
+  if (tag === null) return body;
+  return { [TAG_FIELD]: tag, [BODY_FIELD]: body };
+}
+
+/** The stored value a page triple carries. See `recordValueOf`. */
 export function unpackRecord(packed: PackedRecord<unknown>): unknown {
-  if (packed[1] === null) return packed[2];
-  return { [TAG_FIELD]: packed[1], [BODY_FIELD]: packed[2] };
+  return recordValueOf(packed[1], packed[2]);
 }
 
 /** The tag + body a page triple names, for a reader that walks the two
@@ -388,16 +437,59 @@ export function encodePageFromEncoded(
   encoded: string[],
   keys: string[],
 ): EncodedPage {
+  const bytes = encodePageBytes(encoded, keys);
+  return {
+    body: strFromU8(bytes.body, true),
+    keys: strFromU8(bytes.keys, true),
+    chars: bytes.chars,
+  };
+}
+
+/** A page's two stored strings as raw bytes, for a store that holds bytes
+ *  rather than the latin1 strings a loro container needs. */
+export interface EncodedPageBytes {
+  body: Uint8Array;
+  keys: Uint8Array;
+  chars: number;
+}
+
+/** Encode a page to the gzip bytes `encodePageFromEncoded` widens into
+ *  strings. Byte-identical either way, so a page written into a container and
+ *  a page written into a byte store hold the same compressed run. */
+export function encodePageBytes(
+  encoded: string[],
+  keys: string[],
+): EncodedPageBytes {
   const body = '[' + encoded.join(',') + ']';
   return {
-    body: gzipJson(body),
-    keys: gzipJson(JSON.stringify(keys)),
+    body: gzipJsonBytes(body),
+    keys: gzipJsonBytes(JSON.stringify(keys)),
     chars: body.length,
   };
 }
 
-function gzipJson(json: string): string {
-  return strFromU8(gzip(strToU8(json)), true);
+/** Gzip a JSON string to raw bytes. The latin1 string a page container stores
+ *  is these bytes widened; a store that holds bytes directly keeps them as
+ *  they are, so one compressor serves both. */
+export function gzipJsonBytes(json: string): Uint8Array {
+  return gzip(strToU8(json));
+}
+
+/** Gunzip bytes holding UTF-8 text. */
+export function gunzipText(bytes: Uint8Array): string {
+  return strFromU8(gunzip(bytes));
+}
+
+/** Parse gzipped JSON bytes as an array. Returns null for anything that does
+ *  not decompress to a JSON array, so a reader tolerates a corrupt or stray
+ *  page rather than throwing. */
+export function decodeGzippedJsonArray(bytes: Uint8Array): unknown[] | null {
+  try {
+    const parsed: unknown = JSON.parse(strFromU8(gunzip(bytes)));
+    return Array.isArray(parsed) ? (parsed as unknown[]) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Parse one of a page's stored strings. Returns null for anything that does
@@ -405,12 +497,7 @@ function gzipJson(json: string): string {
  *  page rather than throwing. */
 function decodePageField(value: unknown): unknown[] | null {
   if (typeof value !== 'string') return null;
-  try {
-    const parsed = JSON.parse(strFromU8(gunzip(strToU8(value, true))));
-    return Array.isArray(parsed) ? (parsed as unknown[]) : null;
-  } catch {
-    return null;
-  }
+  return decodeGzippedJsonArray(strToU8(value, true));
 }
 
 /** The record keys a page holds, from the page's own `keys` string. Reading
@@ -419,7 +506,49 @@ function decodePageField(value: unknown): unknown[] | null {
 export function decodePageKeys(keysField: unknown): string[] {
   const parsed = decodePageField(keysField);
   if (parsed === null) return [];
+  return keyStrings(parsed);
+}
+
+/** The record keys a page holds, from the gzipped bytes of its key list. The
+ *  same answer `decodePageKeys` gives for a container-stored page. */
+export function decodePageKeyBytes(keysBytes: Uint8Array): string[] {
+  const parsed = decodeGzippedJsonArray(keysBytes);
+  if (parsed === null) return [];
+  return keyStrings(parsed);
+}
+
+function keyStrings(parsed: unknown[]): string[] {
   return parsed.filter((k): k is string => typeof k === 'string');
+}
+
+/** Zip a page's decoded key list and `[tag, body]` pairs back into triples. A
+ *  key with no pair (or a pair with no key) is dropped: the two arrays are
+ *  written together and index each other, so a length mismatch means a page
+ *  nothing can read as records. */
+function zipPageRecords(
+  keys: readonly string[],
+  pairs: readonly unknown[],
+): PackedRecord<unknown>[] {
+  const out: PackedRecord<unknown>[] = [];
+  for (let i = 0; i < keys.length && i < pairs.length; i += 1) {
+    const pair = pairs[i];
+    if (!Array.isArray(pair)) continue;
+    if (typeof pair[0] !== 'string' && pair[0] !== null) continue;
+    out.push([keys[i]!, pair[0], pair[1]]);
+  }
+  return out;
+}
+
+/** A page's records from the gzipped bytes of its two stored strings. */
+export function decodePageRecordBytes(
+  keysBytes: Uint8Array,
+  bodyBytes: Uint8Array,
+): PackedRecord<unknown>[] {
+  const keys = decodePageKeyBytes(keysBytes);
+  if (keys.length === 0) return [];
+  const pairs = decodeGzippedJsonArray(bodyBytes);
+  if (pairs === null) return [];
+  return zipPageRecords(keys, pairs);
 }
 
 /** A page's records, zipped back into `[key, tag, body]` triples from the two
@@ -433,14 +562,7 @@ export function decodePageRecords(page: unknown): PackedRecord<unknown>[] {
   if (keys.length === 0) return [];
   const pairs = decodePageField(fields[BODY_FIELD]);
   if (pairs === null) return [];
-  const out: PackedRecord<unknown>[] = [];
-  for (let i = 0; i < keys.length && i < pairs.length; i += 1) {
-    const pair = pairs[i];
-    if (!Array.isArray(pair)) continue;
-    if (typeof pair[0] !== 'string' && pair[0] !== null) continue;
-    out.push([keys[i]!, pair[0], pair[1]]);
-  }
-  return out;
+  return zipPageRecords(keys, pairs);
 }
 
 // How many bodies to weigh when estimating a population's record width. A

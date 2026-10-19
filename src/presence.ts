@@ -23,7 +23,7 @@ export const PRESENCE_PUBLISH_INTERVAL_MS = 100;
  */
 export const PRESENCE_LAYER_MAX_BYTES = 2048;
 
-const PRESENCE_TOPIC_PREFIX = 'presence:doc:';
+export const PRESENCE_TOPIC_PREFIX = 'presence:doc:';
 
 const TEXT_ENCODER = new TextEncoder();
 
@@ -107,7 +107,8 @@ export interface PresenceParticipant {
 
 // The partial payload passed to `presence.set(...)`. Either layer may
 // be present; each is shallow-merged into the client's current self
-// payload, so `set({ cursor })` then `set({ camera })` keeps both.
+// payload, so `set({ cursor })` then `set({ camera })` keeps both. A key
+// set to `undefined` is removed from the layer.
 export interface PresenceSetInput {
   state?: Record<string, unknown>;
   ext?: Record<string, unknown>;
@@ -264,6 +265,19 @@ function splitPresencePayload(payload: unknown): {
   };
 }
 
+// Shallow-merge `input` into a layer. A key set to `undefined` is removed, so
+// the payload held here is exactly the one peers are sent.
+function mergeLayer(
+  current: Record<string, unknown>,
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...current, ...input };
+  for (const [key, value] of Object.entries(input)) {
+    if (value === undefined) delete next[key];
+  }
+  return next;
+}
+
 class PresenceController implements PresenceClient {
   private readonly _topic: string;
   private readonly _roster = new Map<string, PresenceParticipant>();
@@ -349,10 +363,10 @@ class PresenceController implements PresenceClient {
   set(input: PresenceSetInput): void {
     if (this._closed) return;
     if (input.state !== undefined) {
-      this._selfState = { ...this._selfState, ...input.state };
+      this._selfState = mergeLayer(this._selfState, input.state);
     }
     if (input.ext !== undefined) {
-      this._selfExt = { ...this._selfExt, ...input.ext };
+      this._selfExt = mergeLayer(this._selfExt, input.ext);
     }
     this._scheduleSend();
   }
@@ -639,7 +653,9 @@ class PresenceController implements PresenceClient {
     lastSent: Record<string, unknown> | null,
     withheld: PresenceLayer[],
   ): Record<string, unknown> | undefined {
-    if (Object.keys(current).length === 0) return undefined;
+    // A layer emptied by removing its keys still has to reach peers, who
+    // otherwise keep the last one this connection published.
+    if (Object.keys(current).length === 0) return lastSent === null ? undefined : current;
     if (presenceLayerBytes(current) <= PRESENCE_LAYER_MAX_BYTES) return current;
     withheld.push(layer);
     return lastSent ?? undefined;

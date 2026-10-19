@@ -37,6 +37,9 @@ export interface VersionBarDeps {
   // The resolved dashboard/embed origin (no trailing slash); the iframe
   // loads `${dashboardBaseUrl}/embed/version-bar`.
   dashboardBaseUrl: string;
+  // The app this bar serves, sent as `appId` in the embed's init so the embed
+  // can check the framing page may host it. `undefined` before `Brass.init()`.
+  appId: string | undefined;
   // Pins the embed's light/dark theme (matches the other hosted surfaces).
   theme?: 'light' | 'dark' | 'auto';
   // Intents from the embed, routed to the live active document. The two
@@ -141,7 +144,7 @@ export function createVersionBarFrame(
   const url = new URL(`${base}/embed/version-bar`);
   url.searchParams.set('theme', theme);
   iframe.src = url.toString();
-  iframe.title = 'Document version';
+  iframe.title = 'Version';
   Object.assign(iframe.style, {
     display: 'block',
     border: '0',
@@ -235,6 +238,7 @@ export function createVersionBarFrame(
         type: 'init',
         surface: 'version-bar',
         params: {
+          ...(deps.appId !== undefined ? { appId: deps.appId } : {}),
           docId: ctx.docId,
           ...(ctx.branch !== undefined ? { branch: ctx.branch } : {}),
           version: ctx.version,

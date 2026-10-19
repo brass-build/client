@@ -6,6 +6,82 @@ and the package follows [semantic versioning](https://semver.org/spec/v2.0.0.htm
 While the version is below `1.0.0`, minor releases may introduce
 breaking changes.
 
+## 0.5.0
+
+### Breaking
+
+- `registerImporter` takes `(file) => { streams, report? }` in place of
+  `(source, doc) => void`. Return your records instead of writing them to a
+  document.
+- 0.5.0 removes `DocumentSourceStream` and `DocumentSourceBlob.streams`.
+- `doc.createCheckpoint()` resolves to `void`, and 0.5.0 removes
+  `DocumentCheckpoint`. Remove code that reads the result.
+
+### Added
+
+- Support for dashboards and other derived content
+  - `Brass.chooseInputs(families)` asks a user to select files, folders, or
+    projects. `Brass.chooseInput(families)` asks the user to pick a single
+    file.
+  - `doc.dependsOn(key, refs)` saves picked references in your document.
+  - `doc.subscribeInputDocuments(key, handlers)` calls your handlers as the
+    referenced files load, change or leave. See "Referencing other
+    documents" in the README.
+  - `Brass.documents.get(id)` returns a document's `family`, and
+    `member_of.chain` lists the folders and archives containing it.
+  - `inputs` in `brass-app.json` lists the schemas your app reads. The picker
+    offers files that match one of them.
+- Faster read-only opening
+  - `readOnly: true` on `Brass.openDocumentById` or `session.open` opens a
+    `ReadOnlyDocument`, for apps that only display documents. Large documents
+    load significantly faster, and unchanged ones reopen without downloading
+    again.
+  - `Brass.init(appId, { open: { readOnly: true } })` opens every session
+    document read-only. Documents the session creates still open editable.
+  - `frozen: true` opens a copy that ignores later edits, for reading many
+    documents at once. `doc.onChanged(cb)` reports a change, and
+    `doc.reload()` updates the same copy to the latest version.
+  - `doc.reopen()` switches an open document between editable, `readOnly` and
+    `frozen`, so a user can view first and edit later.
+- Optional trial use for signed-out users
+  - Signed-out users can create and open temporary documents, to try your app
+    before signing up. `doc.expiresAt` gives the expiry. Signing in from that
+    page keeps the document. See "Try before signing in" in the README.
+  - `access` in `brass-app.json` sets who can use your app. `create`
+    (`false`, `"signed-in"` or `"anyone"`) sets who can make new documents
+    (`"anyone"` needs a public app). Use `false` for an app that makes no
+    documents of its own. `open` (`"signed-in"` or `"anyone"`) sets who can
+    open a public link. A public app with its hosted load gate off and no
+    `create` lets signed-out users create documents. Set
+    `create: "signed-in"` to require a sign-in.
+- `shared_schemas` in `brass-app.json` defines a schema once for other fields
+  to refer to.
+- An `imports` entry can set its own `schema`, for imported files that differ
+  from your app's documents.
+- List handles have `get(index)`, so you can read one item by its position.
+  To walk every entry, map and ordered map handles have `entries()` and list
+  handles have `values()`.
+- `mutate(fn, { undoable: false })` keeps changes the user did not make out of
+  Undo.
+- `doc.importReport` returns the report your importer produced.
+
+### Changed
+
+- `callService` retries brief refusals itself and returns `rate_limited` if
+  they continue. Do not add your own immediate retry.
+- Call `registerImporter` at startup, so your importer is ready whenever an
+  import starts.
+
+### Deprecated
+
+- `read()` on `StoredMap` and `StoredList`. Use `keys()`, `entries()` or
+  `values()`.
+- `session.pick()` and `Brass.selectDocument()`. Use `session.open()` with no
+  id.
+- `documentOptions.readOnly`. Use the top-level `readOnly`, which returns a
+  `ReadOnlyDocument`.
+- `ordered()` on ordered map handles. Use `entries()`.
+
 ## 0.4.1
 
 ### Fixed
@@ -50,10 +126,10 @@ breaking changes.
 
 ### Fixed
 
-- A document that cannot reach Brass reports the failure instead of accepting
-  edits it cannot save. The first write calls `Brass.onError` and sets
-  `doc.readOnly`, and a later `mutate` throws. Disable your editor on
-  `doc.readOnly`.
+- A document opened with no live connection configured to write through
+  reports the failure instead of accepting edits it cannot save. The first
+  write calls `Brass.onError` and sets `doc.readOnly`, and a later `mutate`
+  throws. Disable your editor on `doc.readOnly`.
 - Reopening a document whose import did not finish runs the import again.
 - A `doc.stream(name)` open that fails closes its connection, instead of
   leaving it open for the life of the page.

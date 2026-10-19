@@ -1,6 +1,6 @@
 # Schemas
 
-A schema declares what your app expects a document to hold. Declaring one
+A schema declares what your app expects a document to contain. Declaring one
 in your `brass-app.json` routes matching documents to your app, and lets
 any developer who can open one of those documents build against the same
 shape.
@@ -21,13 +21,16 @@ stream's root collections and records.
   so a namespaced `acme.roster` works and a URL does not. Brass does not
   record a declaration whose family is missing or not a word, and reports
   that on your app's page in the dashboard.
-- **`streams`** maps each stream name your app expects a document to hold
+- **`streams`** maps each stream name your app expects a document to have
   to that stream's contract. `default` is the stream a document opens
   without asking for one, and takes an entry like any other name. Two
   streams that carry the same shape carry the same body.
 - **A collection of records** is an object whose `additionalProperties`
   is the record schema, so the keys are record ids. An ordered collection
   is an array, or an array of keys alongside the map.
+- **A text root** (`doc.text(key)`) reads as a string wherever the
+  document is read as data, `brass contents` included, so describe it as a
+  string property of the stream: `{ "type": "string" }`.
 - **Foreign keys** ride as an `x-brass-ref` extension on the referring
   field, an object whose `to` names the collection it points at.
   Standard validators ignore an `x-` keyword.
@@ -54,8 +57,8 @@ and an approximation reads as a different contract.
 Streams let one document load in parts, so an app pays for what it opens
 rather than the document's total size. `doc.getOrCreateStream(name)`
 opens the document's stream of that name and makes it when the document
-does not hold it yet. `doc.stream(name)` opens one the document already
-holds and rejects any other name.
+does not have it yet. `doc.stream(name)` opens one the document already
+has and rejects any other name.
 
 ```ts
 const stream = await doc.getOrCreateStream(name);
@@ -67,7 +70,7 @@ stream.map('records').mutate((m) => {
 `getOrCreateStream` is idempotent, and concurrent callers converge on one
 stream, so an app reaches for the stream it expects on every open without
 checking first. Only that call writes, so a read-only open reads through
-`doc.stream` and handles the rejection when the document does not hold
+`doc.stream` and handles the rejection when the document does not have
 the stream. Names follow the same rule a family does: `a-z 0-9 . _ -`, 1 to
 64 characters, starting with a letter or digit.
 

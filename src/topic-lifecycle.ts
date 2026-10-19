@@ -21,6 +21,14 @@
 // that: it describes the frame the server could not process, not the
 // subscription it arrived on, so every live phase keeps its state and hands
 // the error to the topic's callbacks, which hold the frame that drew it.
+// While the subscribe is unacked the subscribe may be the frame that drew it,
+// so the client also sends that again after a backoff (a duplicate subscribe
+// is idempotent on the server).
+//
+// A `server_ended` event (the server evicted every subscriber on the topic
+// and deleted their rows) returns any phase to `idle` and detaches the
+// topic's callbacks, so whoever subscribes next sends a subscribe of its own
+// rather than attaching to a subscription the server no longer holds.
 //
 // Invariant: every transition into `tornDown` emits `send_unsubscribe`,
 // so no server-side subscription row can outlive the client-side state
@@ -49,10 +57,17 @@ export type TopicEvent =
   | { type: 'socket_open' }
   | { type: 'socket_closed' }
   | { type: 'subscribed_ack' }
+  | { type: 'server_ended' }
+  // The server reports it holds no subscription row for an established topic
+  // while the socket stays up (a presence row reaped as stale).
+  | { type: 'server_dropped' }
   | { type: 'error'; reason: string };
 
 export type TopicEffect =
   | { kind: 'send_subscribe' }
+  // Send the subscribe again after the client's backoff: the server could
+  // not finish the one in flight.
+  | { kind: 'resend_subscribe_later' }
   | { kind: 'send_unsubscribe' }
   // Flush the frames held for the unacked subscribe, in order.
   | { kind: 'flush_held' }
@@ -87,6 +102,7 @@ export function isFrameScopedReason(reason: string): boolean {
 }
 
 const SEND_SUBSCRIBE: TopicEffect = { kind: 'send_subscribe' };
+const RESEND_SUBSCRIBE_LATER: TopicEffect = { kind: 'resend_subscribe_later' };
 const FLUSH_HELD: TopicEffect = { kind: 'flush_held' };
 const DROP_HELD: TopicEffect = { kind: 'drop_held' };
 
@@ -126,6 +142,10 @@ function unsubscribed(): StepResult {
 }
 
 export function step(state: TopicState, event: TopicEvent): StepResult {
+  if (event.type === 'server_ended') {
+    if (state.phase === 'idle') return { state, effects: [] };
+    return { state: IDLE_TOPIC, effects: [DROP_HELD, { kind: 'drop_listeners' }] };
+  }
   switch (state.phase) {
     case 'idle':
       if (event.type === 'user_subscribe') {
@@ -145,7 +165,13 @@ export function step(state: TopicState, event: TopicEvent): StepResult {
           };
         case 'error':
           if (isFrameScopedReason(event.reason)) {
-            return deliverError(state, event.reason);
+            return {
+              state,
+              effects: [
+                { kind: 'deliver_error', reason: event.reason },
+                RESEND_SUBSCRIBE_LATER,
+              ],
+            };
           }
           // Never established on this connection: the rejection is final.
           return tearDown(state, event.reason);
@@ -182,6 +208,10 @@ export function step(state: TopicState, event: TopicEvent): StepResult {
           return tearDown(state, event.reason);
         case 'subscribed_ack':
           return { state, effects: [FLUSH_HELD] };
+        // Subscribe again, holding frames until it is acked. It spends no
+        // retry: the report arrives once per heartbeat, so it cannot loop.
+        case 'server_dropped':
+          return { state: { ...state, phase: 'subscribing' }, effects: [SEND_SUBSCRIBE] };
         case 'socket_open':
           return reopened();
         case 'socket_closed':
@@ -197,7 +227,13 @@ export function step(state: TopicState, event: TopicEvent): StepResult {
       switch (event.type) {
         case 'error':
           if (isFrameScopedReason(event.reason)) {
-            return deliverError(state, event.reason);
+            return {
+              state,
+              effects: [
+                { kind: 'deliver_error', reason: event.reason },
+                RESEND_SUBSCRIBE_LATER,
+              ],
+            };
           }
           // An eviction draws errors for EVERY frame in flight against the
           // reaped row; the trailing ones land while the retry's subscribe

@@ -19,6 +19,8 @@ import {
   PAGE_KEYS_FIELD,
   type EncodedPage,
   type RecordLocationSink,
+  BODY_FIELD,
+  TAG_FIELD,
   assertUsableRecordKey,
   classifyStoreKey,
   decodePageKeys,
@@ -26,6 +28,7 @@ import {
   decodeRecordValue,
   encodePage,
   flattenPagedLookup,
+  isPagedMarkerEntry,
   isReservedKey,
   overlayKeyFor,
   packWholeValue,
@@ -58,9 +61,11 @@ import type {
   ListSubscriber,
   MapHandle,
   MapSubscriber,
+  MutateOptions,
   OrderedMapHandle,
   OrderedMapPosition,
 } from './handle-types.js';
+import { pushBoundedSplice } from './subscriber-delivery.js';
 
 export type {
   Change,
@@ -227,18 +232,46 @@ function assignList(target: LoroMovableList, value: readonly unknown[]): void {
   // same position, so the pair leaves the entry stored twice while `set`
   // leaves it stored once. That is the same reasoning `assignListPosition`
   // carries, and a whole-array assign is the write that reaches it most.
+  //
+  // The entries both ends share are left alone, and only the span between
+  // them is rewritten. Dropping the first of `[a, b]` is then a delete of `a`
+  // rather than `b` set into position 0 and the tail cut off, which matters
+  // when a peer undoes its own edit to `b` concurrently: the undo removes the
+  // `b` it wrote, and a set of `b` would put one back.
   const oldLen = target.length;
-  for (let i = 0; i < value.length; i++) {
+  let head = 0;
+  while (
+    head < oldLen &&
+    head < value.length &&
+    samePlainValue(plainListItem(target, head), materializeContainers(value[head]))
+  ) {
+    head += 1;
+  }
+  let tail = 0;
+  while (
+    tail < oldLen - head &&
+    tail < value.length - head &&
+    samePlainValue(
+      plainListItem(target, oldLen - 1 - tail),
+      materializeContainers(value[value.length - 1 - tail]),
+    )
+  ) {
+    tail += 1;
+  }
+  const oldMid = oldLen - head - tail;
+  const newMid = value.length - head - tail;
+  const shared = Math.min(oldMid, newMid);
+  for (let i = head; i < head + shared; i++) {
     const item = materializeContainers(value[i]);
-    if (i >= oldLen) {
-      insertListAt(target, i, item);
-      continue;
-    }
     if (samePlainValue(plainListItem(target, i), item)) continue;
     assignListPosition(target, i, item);
   }
-  if (value.length < oldLen) {
-    target.delete(value.length, oldLen - value.length);
+  if (newMid > oldMid) {
+    for (let i = head + oldMid; i < head + newMid; i++) {
+      insertListAt(target, i, materializeContainers(value[i]));
+    }
+  } else if (oldMid > newMid) {
+    target.delete(head + newMid, oldMid - newMid);
   }
 }
 
@@ -292,11 +325,22 @@ function assignListPosition(
   rawItem: unknown,
 ): void {
   const item = materializeContainers(rawItem);
+  // A position already holding a container of the same kind is written in
+  // place, as `assignEntry` does for a map key. A fresh container at the
+  // position is a replace that a peer's concurrent replace of the same
+  // position does not merge with, so undoing either one restores its old
+  // container beside the other's instead of in its place, and the list
+  // comes out one element longer on every peer.
+  const existing = target.get(idx);
   if (isPlainObject(item)) {
-    const child = target.setContainer(idx, new LoroMap());
+    const child =
+      existing instanceof LoroMap ? existing : target.setContainer(idx, new LoroMap());
     assignPlain(child, item);
   } else if (Array.isArray(item)) {
-    const child = target.setContainer(idx, new LoroMovableList());
+    const child =
+      existing instanceof LoroMovableList
+        ? existing
+        : target.setContainer(idx, new LoroMovableList());
     assignList(child, item);
   } else {
     target.set(idx, item as never);
@@ -398,7 +442,7 @@ interface WriteDivert {
 // `loroMap.get(key)` (O(1) per key, so `Object.keys()` is O(N)). Iterating
 // `loroMap.keys()` in the descriptor trap makes `Object.keys()` O(N^2) at
 // 50k entities (measured at >5 min of CPU before giving up).
-export function wrapLoroMapProxy(
+function wrapLoroMapProxy(
   loroMap: LoroMap,
   // Threaded into nested record proxies too, so a field edit counts. A
   // mutation can hold thousands of them (`m[id].params = ...` in a loop),
@@ -411,10 +455,14 @@ export function wrapLoroMapProxy(
   // which is what can page; false inside a record, whose field names are the
   // app's own and constrained by nothing.
   guardKeys = false,
+  // The root this map is, which decides whether it carries platform entries
+  // the draft hides and refuses (`isPagedMarkerEntry`).
+  rootKey: string | null = null,
 ): Record<string, unknown> {
+  const hidden = (key: string): boolean => isPagedMarkerEntry(rootKey, key);
   const handler: ProxyHandler<object> = {
     get(_t, key) {
-      if (typeof key === 'symbol') return undefined;
+      if (typeof key === 'symbol' || hidden(key)) return undefined;
       if (divert?.holds(key)) {
         const held = divert.peek(key);
         if (held === null || typeof held !== 'object') return held;
@@ -452,7 +500,7 @@ export function wrapLoroMapProxy(
     },
     set(_t, key, value) {
       if (typeof key === 'symbol') return false;
-      if (guardKeys) assertUsableRecordKey(key);
+      if (guardKeys) assertUsableRecordKey(key, rootKey);
       // Before the write, so a commit it triggers seals the preceding
       // batch rather than splitting this record out of it.
       batcher?.record(value);
@@ -466,7 +514,7 @@ export function wrapLoroMapProxy(
     },
     deleteProperty(_t, key) {
       if (typeof key === 'symbol') return false;
-      if (guardKeys) assertUsableRecordKey(key);
+      if (guardKeys) assertUsableRecordKey(key, rootKey);
       batcher?.recordDelete(key);
       divert?.drop(key);
       loroMap.delete(key);
@@ -474,16 +522,17 @@ export function wrapLoroMapProxy(
       return true;
     },
     has(_t, key) {
-      if (typeof key === 'symbol') return false;
+      if (typeof key === 'symbol' || hidden(key)) return false;
       if (divert?.holds(key)) return true;
       return loroMap.get(key) !== undefined;
     },
     ownKeys() {
-      if (!divert) return loroMap.keys();
-      return [...new Set([...loroMap.keys(), ...divert.keys()])];
+      const stored = loroMap.keys().filter((key) => !hidden(key));
+      if (!divert) return stored;
+      return [...new Set([...stored, ...divert.keys()])];
     },
     getOwnPropertyDescriptor(_t, key) {
-      if (typeof key === 'symbol') return undefined;
+      if (typeof key === 'symbol' || hidden(key)) return undefined;
       if (divert?.holds(key)) {
         return {
           enumerable: true,
@@ -824,9 +873,6 @@ function wrapLoroListProxy(
 // what turns `5` into an empty container and `'hello'` into one entry per
 // character.
 type FlatRecord = unknown;
-
-const TAG_FIELD = 'type';
-const BODY_FIELD = 'params';
 
 // The record keys one page packs, read off the live container without
 // materialising its bodies. Two fields out of wasm rather than the whole
@@ -1391,11 +1437,14 @@ function buildPagedDeltaIndex(m: LoroMap): PagedDeltaIndex {
   return { pages, shadowed };
 }
 
+// Null when every key the batch touched is one `hidden` withholds, so a
+// subscriber is not handed an empty change for an edit it cannot see.
 function unpagedMapDelta(
   m: LoroMap,
   depth: number,
   batch: LoroEventBatch,
-): Change<unknown> {
+  hidden: (key: string) => boolean,
+): Change<unknown> | null {
   const setKeys = new Set<string>();
   const deleted = new Set<string>();
   for (const ev of batch.events) {
@@ -1414,9 +1463,12 @@ function unpagedMapDelta(
     }
   }
   for (const key of deleted) setKeys.delete(key);
+  const touched = setKeys.size + deleted.size;
   const set = new Map<string, unknown>();
-  for (const key of setKeys) set.set(key, plainEntry(m, key));
-  return { set, deleted: [...deleted] };
+  for (const key of setKeys) if (!hidden(key)) set.set(key, plainEntry(m, key));
+  const removed = [...deleted].filter((key) => !hidden(key));
+  if (touched > 0 && set.size === 0 && removed.length === 0) return null;
+  return { set, deleted: removed };
 }
 
 /**
@@ -2641,24 +2693,21 @@ function trackEntryContainer<C extends LoroMap | LoroMovableList, V>(
 // dedup, a different shape: it models no per-listener external resource, and
 // the Loro subscription each record must re-create on rebind is exactly
 // that.)
-/** Run a callback the SDK owns, without letting it break the caller. */
-/** Report a subscriber that threw, then carry on. One app callback failing
- *  must not break a registration or stop the other subscribers, but swallowing
- *  it leaves an app that stalled inside its own callback with nothing in the
- *  console to read. */
-function reportSubscriberThrow(err: unknown): void {
-  console.error('[Brass] subscriber threw:', err);
-}
-
-function fireQuietly(cb: () => void): void {
+/** Run an app callback without letting a throw break the caller. One app
+ *  callback failing must not break a registration or stop the other
+ *  subscribers, so the throw goes to `report` (the owner's
+ *  `reportSubscriberThrow`) and the walk carries on. */
+function fireQuietly(cb: () => void, report: (err: unknown) => void): void {
   try {
     cb();
   } catch (err) {
-    reportSubscriberThrow(err);
+    report(err);
   }
 }
 
 class SubscriptionRegistry<Cb> {
+  constructor(private readonly _report: (err: unknown) => void) {}
+
   private readonly _subs = new Set<{ cb: Cb; detach: () => void }>();
   private readonly _settled = new Set<() => void>();
   // Whether a whole-container delivery is in progress. Always false while a
@@ -2688,7 +2737,7 @@ class SubscriptionRegistry<Cb> {
    */
   onSettled(cb: () => void): HandleUnsubscribe {
     this._settled.add(cb);
-    if (!this._delivering) fireQuietly(cb);
+    if (!this._delivering) fireQuietly(cb, this._report);
     return () => {
       this._settled.delete(cb);
     };
@@ -2699,7 +2748,7 @@ class SubscriptionRegistry<Cb> {
     // otherwise remove it from the set mid-iteration, and an entry deleted
     // before it is reached is never visited.
     const listeners = Array.from(this._settled);
-    for (const cb of listeners) fireQuietly(cb);
+    for (const cb of listeners) fireQuietly(cb, this._report);
   }
 
   // Fire the whole-container catch-up once, attach the per-container change
@@ -2803,7 +2852,7 @@ export interface PagedRootHooks {
  * Every field is declared with an initialiser, so they all exist by the time
  * this runs and a later assignment keeps the descriptor this sets.
  */
-function hideOwnFields(handle: object): void {
+export function hideOwnFields(handle: object): void {
   for (const key of Object.keys(handle)) {
     Object.defineProperty(handle, key, { enumerable: false });
   }
@@ -2829,7 +2878,7 @@ class MapHandleImpl<T> implements MapHandle<T> {
   // container.
   private readonly _registry = new SubscriptionRegistry<
     InternalMapSubscriber<T>
-  >();
+  >((err) => this._owner.reportSubscriberThrow(err));
   // Keys captured just before a rebind (`_rebindAnchor`), consumed by the
   // matching `_resync` to report the keys the source swap removed. Null
   // outside a rebind cycle, so a bare `_resync` reports no removals.
@@ -2838,18 +2887,34 @@ class MapHandleImpl<T> implements MapHandle<T> {
   // taken before the container exists watches up this chain for the write
   // that creates it (`_nearestLiveContainer`).
   private readonly _parent: MapHandleImpl<unknown> | null;
+  // The document root this handle is, or null for a composed handle. Decides
+  // which keys are the platform's own entries rather than the app's
+  // (`isPagedMarkerEntry`), which every read here hides.
+  private readonly _rootKey: string | null;
 
   constructor(
     anchor: MapAnchor,
     owner: HandleOwner,
     paging: PagedRootHooks | null = null,
     parent: MapHandleImpl<unknown> | null = null,
+    rootKey: string | null = null,
   ) {
     this._anchor = anchor;
     this._owner = owner;
     this._paging = paging;
     this._parent = parent;
+    this._rootKey = rootKey;
     hideOwnFields(this);
+  }
+
+  private _hidden(key: string): boolean {
+    return isPagedMarkerEntry(this._rootKey, key);
+  }
+
+  // An unpaged map's JSON without the platform's own entries.
+  private _visible(json: Record<string, T>): Record<string, T> {
+    for (const key of Object.keys(json)) if (this._hidden(key)) delete json[key];
+    return json;
   }
 
   // The container at the top of this handle's composition chain: the root it
@@ -2891,6 +2956,17 @@ class MapHandleImpl<T> implements MapHandle<T> {
     return isPlainObject(v) ? v : undefined;
   }
 
+  /** Whether the plain body this handle is scoped to holds this entry itself.
+   *  The prototype chain is not part of a record, so a key an app never wrote
+   *  must not resolve through it. */
+  private _plainHas(entryKey: string): boolean {
+    const body = this._plainBody();
+    return (
+      body !== undefined &&
+      Object.prototype.hasOwnProperty.call(body, entryKey)
+    );
+  }
+
   read(): Record<string, T> {
     this._owner.assertReadable();
     const m = this._anchor.resolve();
@@ -2898,7 +2974,7 @@ class MapHandleImpl<T> implements MapHandle<T> {
     // A paged map flattens back to the flat lookup, so a read is identical
     // paged or not.
     if (this._isPaged()) return this._readPaged(m);
-    return m.toJSON() as Record<string, T>;
+    return this._visible(m.toJSON() as Record<string, T>);
   }
 
   // The whole-store read, which decodes every page. That walk answers the same
@@ -2916,8 +2992,17 @@ class MapHandleImpl<T> implements MapHandle<T> {
 
   get(entryKey: string): T | undefined {
     this._owner.assertReadable();
+    if (this._hidden(entryKey)) return undefined;
     const m = this._anchor.resolve();
-    if (!m) return this._plainBody()?.[entryKey] as T | undefined;
+    if (!m) {
+      // One read of the body, not one per check: `_plainBody` resolves the
+      // anchor and reaches into wasm, and this runs on every keyed read.
+      const body = this._plainBody();
+      return body !== undefined &&
+        Object.prototype.hasOwnProperty.call(body, entryKey)
+        ? (body[entryKey] as T)
+        : undefined;
+    }
     if (this._isPaged()) {
       const pager = this._sessionPager(m);
       return recordFromPage(
@@ -2935,6 +3020,14 @@ class MapHandleImpl<T> implements MapHandle<T> {
     return [...this.liveKeySet()];
   }
 
+  // Taken from one whole read: on a paged store that is the pass resolving
+  // every record against the patches and markers that shadow it, which a walk
+  // key by key would repeat per record.
+  *entries(): IterableIterator<[string, T]> {
+    const records = this.read();
+    for (const key of Object.keys(records)) yield [key, records[key] as T];
+  }
+
   /**
    * The keys this map holds, as a set, without materialising a record.
    *
@@ -2948,31 +3041,31 @@ class MapHandleImpl<T> implements MapHandle<T> {
     const m = this._anchor.resolve();
     if (!m) return new Set(Object.keys(this._plainBody() ?? {}));
     if (this._isPaged()) return this._sessionPager(m).ensureIndex(m).liveKeys();
-    return new Set(m.keys());
+    return new Set(m.keys().filter((key) => !this._hidden(key)));
   }
 
   has(entryKey: string): boolean {
     this._owner.assertReadable();
+    if (this._hidden(entryKey)) return false;
     const m = this._anchor.resolve();
-    if (!m) {
-      const body = this._plainBody();
-      return body !== undefined && Object.prototype.hasOwnProperty.call(body, entryKey);
-    }
+    if (!m) return this._plainHas(entryKey);
     if (this._isPaged()) return this.get(entryKey) !== undefined;
     return entryExists(m, entryKey);
   }
 
-  mutate(fn: (draft: Record<string, T>) => void): void {
+  mutate(fn: (draft: Record<string, T>) => void, options?: MutateOptions): void {
     this._owner.assertWritable();
     this._owner.ensureLocalUpdatesSubscribed();
-    // Commits as it goes past a size budget; see `mutate-batching.ts`.
-    this._runMutate(
-      fn,
-      new MutateBatcher(() => {
-        this._owner.commitMutate();
-      }),
-    );
-    this._owner.commitMutate();
+    this._owner.runMutate(options, () => {
+      // Commits as it goes past a size budget; see `mutate-batching.ts`.
+      this._runMutate(
+        fn,
+        new MutateBatcher(() => {
+          this._owner.commitMutate();
+        }),
+      );
+      this._owner.commitMutate();
+    });
   }
 
   // Run a mutate WITHOUT the commit pipeline (the caller owns
@@ -2996,6 +3089,7 @@ class MapHandleImpl<T> implements MapHandle<T> {
       batcher,
       divert?.hooks,
       this._paging !== null,
+      this._rootKey,
     ) as Record<string, T>;
     fn(proxy);
     divert?.finish();
@@ -3313,7 +3407,7 @@ class MapHandleImpl<T> implements MapHandle<T> {
     }
     // One walk of an unpaged map, whose size the paging threshold bounds, and
     // no wasm handle minted per key the way a per-key read would.
-    const keys = new Set(m.keys());
+    const keys = new Set(m.keys().filter((key) => !this._hidden(key)));
     return (key) => keys.has(key);
   }
 
@@ -3347,7 +3441,7 @@ class MapHandleImpl<T> implements MapHandle<T> {
         true,
       );
     } catch (err) {
-      reportSubscriberThrow(err);
+      this._owner.reportSubscriberThrow(err);
     }
   }
 
@@ -3425,13 +3519,14 @@ class MapHandleImpl<T> implements MapHandle<T> {
       const change = (
         index
           ? pagedMapDelta(m, event, index, (key) => this.get(key))
-          : unpagedMapDelta(m, depth, event)
-      ) as Change<T>;
+          : unpagedMapDelta(m, depth, event, (key) => this._hidden(key))
+      ) as Change<T> | null;
+      if (change === null) return;
       const origin: ChangeOrigin = { source: this._owner.originOf(event) };
       try {
         cb(change, origin, false);
       } catch (err) {
-        reportSubscriberThrow(err);
+        this._owner.reportSubscriberThrow(err);
       }
     });
     return () => sub();
@@ -3591,7 +3686,7 @@ class MapHandleImpl<T> implements MapHandle<T> {
     // so a per-container subscription keeps a stable instance across reads.
     const direct = childAnchor(this._anchor, entryKey, ctor);
     if (this._paging === null) return direct;
-    assertUsableRecordKey(entryKey);
+    assertUsableRecordKey(entryKey, this._rootKey);
     const overlay = childAnchor(this._anchor, overlayKeyFor(entryKey), ctor);
 
     // Whether an edit written beside the pages is waiting to be folded over
@@ -3694,6 +3789,23 @@ class MapHandleImpl<T> implements MapHandle<T> {
  * carry the position each edit lands at, so an app applies them in order and
  * is done; nothing about the cursor reaches it.
  */
+/** Whether position `at`, read after the first `count` splices, is one of the
+ *  elements those splices inserted. */
+function insertedBySplices(
+  splices: readonly Splice<unknown>[],
+  count: number,
+  at: number,
+): boolean {
+  let pos = at;
+  for (let i = count - 1; i >= 0; i--) {
+    const { at: start, removed, inserted } = splices[i]!;
+    if (pos < start) continue;
+    if (pos < start + inserted.length) return true;
+    pos += removed - inserted.length;
+  }
+  return false;
+}
+
 function splicesFromListDiff(diff: readonly Delta<unknown[]>[]): Splice<unknown>[] {
   const out: Splice<unknown>[] = [];
   let at = 0;
@@ -3708,7 +3820,7 @@ function splicesFromListDiff(diff: readonly Delta<unknown[]>[]): Splice<unknown>
     }
     if (part.insert !== undefined) {
       const inserted = part.insert.map(plainDiffItem);
-      out.push({ at, removed: 0, inserted });
+      pushBoundedSplice(out, { at, removed: 0, inserted });
       at += inserted.length;
     }
   }
@@ -3742,8 +3854,9 @@ class ListHandleImpl<T> implements ListHandle<T> {
   private readonly _owner: HandleOwner;
   // Active subscriptions, tracked so a version checkout can re-fire and
   // re-attach each one against the new container.
-  private readonly _registry =
-    new SubscriptionRegistry<InternalListSubscriber>();
+  private readonly _registry = new SubscriptionRegistry<InternalListSubscriber>(
+    (err) => this._owner.reportSubscriberThrow(err),
+  );
   // See `MapHandleImpl._parent`.
   private readonly _parent: MapHandleImpl<unknown> | null;
 
@@ -3778,17 +3891,39 @@ class ListHandleImpl<T> implements ListHandle<T> {
     return l ? l.length : (this._plainBody()?.length ?? 0);
   }
 
-  mutate(fn: (draft: ListDraft<T>) => void): void {
+  get(index: number): T | undefined {
+    this._owner.assertReadable();
+    if (!Number.isInteger(index) || index < 0) return undefined;
+    const l = this._anchor.resolve();
+    if (!l) return this._plainBody()?.[index] as T | undefined;
+    if (index >= l.length) return undefined;
+    const v: unknown = l.get(index);
+    if (!isContainer(v)) return v as T;
+    const container = v as { toJSON(): unknown; free(): void };
+    try {
+      return container.toJSON() as T;
+    } finally {
+      container.free();
+    }
+  }
+
+  *values(): IterableIterator<T> {
+    yield* this.read();
+  }
+
+  mutate(fn: (draft: ListDraft<T>) => void, options?: MutateOptions): void {
     this._owner.assertWritable();
     this._owner.ensureLocalUpdatesSubscribed();
-    // Commits as it goes past a size budget; see `mutate-batching.ts`.
-    this._runMutate(
-      fn,
-      new MutateBatcher(() => {
-        this._owner.commitMutate();
-      }),
-    );
-    this._owner.commitMutate();
+    this._owner.runMutate(options, () => {
+      // Commits as it goes past a size budget; see `mutate-batching.ts`.
+      this._runMutate(
+        fn,
+        new MutateBatcher(() => {
+          this._owner.commitMutate();
+        }),
+      );
+      this._owner.commitMutate();
+    });
   }
 
   // Run a list mutate without the commit pipeline; see
@@ -3803,7 +3938,7 @@ class ListHandleImpl<T> implements ListHandle<T> {
     fn(proxy);
   }
 
-  // Fire the whole list as ONE splice replacing everything the subscriber was
+  // Fire the whole list as one change replacing everything the subscriber was
   // last told. Used for registration and for a checkout / return resync, which
   // describe no authored transition and so carry no origin.
   //
@@ -3817,9 +3952,11 @@ class ListHandleImpl<T> implements ListHandle<T> {
     const held = this._held.get(cb) ?? 0;
     this._held.set(cb, inserted.length);
     try {
-      cb({ splices: [{ at: 0, removed: held, inserted }] });
+      const splices: Splice<unknown>[] = [];
+      pushBoundedSplice(splices, { at: 0, removed: held, inserted });
+      cb({ splices });
     } catch (err) {
-      reportSubscriberThrow(err);
+      this._owner.reportSubscriberThrow(err);
     }
   }
 
@@ -3848,19 +3985,35 @@ class ListHandleImpl<T> implements ListHandle<T> {
     l: LoroMovableList,
     cb: InternalListSubscriber,
   ): () => void {
+    const depth = containerDepth(l);
     const sub = l.subscribe((event) => {
-      const diff =
-        event.events[0]?.diff.type === 'list'
-          ? (event.events[0].diff.diff as readonly Delta<unknown[]>[])
-          : [];
-      const splices = splicesFromListDiff(diff);
+      const splices: Splice<unknown>[] = [];
+      // An element held as a child container changes inside that container,
+      // which the list's own diff does not name. Each such element is
+      // reported as a replace of its position, read after the list's own
+      // splices so the index is the one the subscriber holds by then. An
+      // element those splices inserted already arrived as it now stands, so
+      // its own fields being written in the same commit adds no replace.
+      const touched = new Set<number>();
+      for (const e of event.events) {
+        if (e.path.length === depth && e.diff.type === 'list') {
+          splices.push(...splicesFromListDiff(e.diff.diff as readonly Delta<unknown[]>[]));
+        } else if (e.path.length > depth && typeof e.path[depth] === 'number') {
+          touched.add(e.path[depth]);
+        }
+      }
+      const listSplices = splices.length;
+      for (const at of [...touched].sort((x, y) => x - y)) {
+        if (at >= l.length || insertedBySplices(splices, listSplices, at)) continue;
+        splices.push({ at, removed: 1, inserted: [plainListItem(l, at)] });
+      }
       let held = this._held.get(cb) ?? 0;
       for (const splice of splices) held += splice.inserted.length - splice.removed;
       this._held.set(cb, held);
       try {
         cb({ splices }, { source: this._owner.originOf(event) });
       } catch (err) {
-        reportSubscriberThrow(err);
+        this._owner.reportSubscriberThrow(err);
       }
     });
     return () => sub();
@@ -4014,6 +4167,10 @@ class OrderedMapHandleImpl<T> implements OrderedMapHandle<T> {
     return sequenceOf(this._map.liveKeySet(), this._order.read());
   }
 
+  *entries(): IterableIterator<[string, T]> {
+    for (const { key, value } of this.ordered()) yield [key, value];
+  }
+
   ordered(): { key: string; value: T }[] {
     const records = this._map.read();
     const seen = new Set<string>();
@@ -4150,9 +4307,15 @@ class OrderedMapHandleImpl<T> implements OrderedMapHandle<T> {
     return true;
   }
 
-  mutate(fn: (draft: Record<string, T>) => void): void {
+  mutate(fn: (draft: Record<string, T>) => void, options?: MutateOptions): void {
     this._owner.assertWritable();
     this._owner.ensureLocalUpdatesSubscribed();
+    this._owner.runMutate(options, () => {
+      this._mutateOrdered(fn);
+    });
+  }
+
+  private _mutateOrdered(fn: (draft: Record<string, T>) => void): void {
 
     // Net structural effect: keys added (`added` iterates in insertion
     // order, and a delete-then-re-set re-appends, matching the order list's
@@ -4363,8 +4526,15 @@ export function createRootMapHandle<T>(
   root: LoroMap,
   owner: HandleOwner,
   paging?: PagedRootHooks,
+  rootKey?: string,
 ): MapHandle<T> {
-  return new MapHandleImpl<T>(rootAnchor(root), owner, paging ?? null);
+  return new MapHandleImpl<T>(
+    rootAnchor(root),
+    owner,
+    paging ?? null,
+    null,
+    rootKey ?? null,
+  );
 }
 
 export function createRootListHandle<T>(

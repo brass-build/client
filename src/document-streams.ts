@@ -26,12 +26,17 @@ import type {
   DocumentStatusUnsubscribe,
   DocumentWorkStatus,
 } from './document-signals.js';
+import type { InputStatus } from './inputs-status.js';
+import type { InputDocumentHandlers, InputDocumentOptions } from './input-documents.js';
 import type {
   ListHandle,
   MapHandle,
+  MutateOptions,
   OrderedMapHandle,
   TextHandle,
 } from './handle-types.js';
+import type { InputReference } from './hosted-ui.js';
+import type { MarkReadOptions, MarkReadStatus } from './references.js';
 
 // The wiring `Document.stream()` runs on: list/create manifests over
 // HTTP, and open a stream's line (join + WS subscribe) returning the
@@ -80,8 +85,22 @@ export class DocumentStream {
 
   mutate<E extends object = EntityProxy>(
     fn: (d: DocumentMutator<E>) => void,
+    options?: MutateOptions,
   ): void {
-    this._inner.mutate<E>(fn);
+    this._inner.mutate<E>(fn, options);
+  }
+
+  /** Records the documents `key` depends on for this stream; see
+   *  `Document.dependsOn`. A reference to any stream of this document is
+   *  refused. */
+  dependsOn(key: string, refs: readonly InputReference[] | null): void {
+    this._inner.dependsOn(key, refs);
+  }
+
+  /** @internal Records what this reader read for the key `status` reports
+   *  on this stream; see `Document.markRead`. */
+  markRead(status: MarkReadStatus, options?: MarkReadOptions): void {
+    this._inner.markRead(status, options);
   }
 
   roots(): Record<string, RootKind> {
@@ -111,6 +130,12 @@ export class DocumentStream {
     return this._inner.readOnly;
   }
 
+  /** @internal This stream's line's `updated_at` as it was opened; see
+   *  `Document.updatedAt`. */
+  get updatedAt(): string | null {
+    return this._inner.updatedAt;
+  }
+
   // Locally-issued ops on this stream the server has not acked yet. This
   // stream's own line: `doc.savingCount` is the one that adds the streams up,
   // and the default stream's inner IS the document, so reading that here would
@@ -126,14 +151,18 @@ export class DocumentStream {
     return this._inner.atCapacity;
   }
 
-  // The latest opaque work-status for this stream, or `null` when no slow
-  // server-side work is in flight. Render `message` verbatim.
+  /**
+   * The work in flight on this stream, or `null` when there is none. Render
+   * `message` verbatim.
+   */
   get status(): DocumentWorkStatus | null {
     return this._inner.status;
   }
 
-  // Subscribe to this stream's work-status updates. Fires once on attach when
-  // a status is already known.
+  /**
+   * Calls `cb` with every work-status update for this stream, and once on
+   * attach when a status is already known. Returns an unsubscribe.
+   */
   onStatus(cb: DocumentStatusListener): DocumentStatusUnsubscribe {
     return this._inner.onStatus(cb);
   }
@@ -144,23 +173,63 @@ export class DocumentStream {
     return this._inner.onGone(cb);
   }
 
-  // Per-stream undo/redo: each stream keeps its own local-edit stack
-  // (its edits are its own CRDT commits). The doc-level `doc.undo()`
-  // covers only the default stream.
+  /** @internal On a frozen copy: whether this stream has moved since it was
+   *  read. Each stream is its own line, so each is watched on its own. */
+  get changed(): false {
+    return this._inner.changed;
+  }
+
+  /** @internal */
+  onChanged(cb: () => void): () => void {
+    return this._inner.onChanged(cb);
+  }
+
+  /** @internal Typed on `ReadOnlyStream`: loads this stream as it stands now
+   *  on a frozen copy. */
+  reload(): Promise<void> {
+    return this._inner.reload();
+  }
+
+  /** The input files of a key this stream records references under;
+   *  see `Document.subscribeInputDocuments`. A stream's keys are its own,
+   *  apart from the document's and every other stream's. */
+  subscribeInputDocuments(
+    key: string,
+    handlers: InputDocumentHandlers,
+    options?: InputDocumentOptions,
+  ): () => void {
+    return this._inner.subscribeInputDocuments(key, handlers, options);
+  }
+
+  /** @internal The status of a key this stream records references under. */
+  subscribeInputStatus(key: string, cb: (status: InputStatus) => void): () => void {
+    return this._inner.subscribeInputStatus(key, cb);
+  }
+
+  /**
+   * Reverts this stream's part of the newest undo step that touched it,
+   * leaving the document's other streams as they are.
+   * @deprecated Call `doc.undo()`, which reverts the newest step in every
+   * stream it touched.
+   */
   undo(): boolean {
-    return this._inner.undo();
+    return this._inner._replayOwnUndoStep('undo');
   }
 
+  /**
+   * Re-applies this stream's part of the step it most recently undid.
+   * @deprecated Call `doc.redo()`.
+   */
   redo(): boolean {
-    return this._inner.redo();
+    return this._inner._replayOwnUndoStep('redo');
   }
 
-  // Seal the stream's open undo group, so the next local edit starts a
-  // fresh undo step. Local and synchronous (no server call). Call it
-  // when a user operation completes: commits group into one step until
-  // sealed (the same same-stroke collapsing the doc-level undo has), so
-  // an app that never seals gets one giant step per session. The
-  // cross-stream operation recipe in `docs/streams.md` is built on this.
+  /**
+   * Ends the document's open undo step, so the next local edit in any stream
+   * starts a new one.
+   * @deprecated Call `doc.createCheckpoint()` at the end of each user action,
+   * which also ends the step.
+   */
   sealUndoStep(): void {
     this._inner._sealUndoStep();
   }

@@ -31,6 +31,7 @@ export interface OpFrame {
   topic: string;
   op_blob: string;
   client_op_id: string;
+  base_import_seq?: number;
 }
 
 /**

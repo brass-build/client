@@ -3,7 +3,10 @@
 `doc.presence` is the "who is here right now" layer over an open
 document: the roster of other live participants plus a small per-user
 `state` (cursor / camera / selection) and an app-namespaced `ext` blob.
-It is non-null on any open writable `Document`, and `null` otherwise.
+It is non-null on any live open, editable or `{ readOnly: true }`,
+including a signed-out visitor's open through a shared link, so a viewer
+shows up in the roster beside the editors, and `null` on a
+`{ frozen: true }` copy.
 Presence is fully ephemeral: nothing survives a disconnect.
 
 ```ts
@@ -16,6 +19,8 @@ const doc = await Brass.openDocumentById('doc_abc');
 // (e.g. on every pointermove).
 doc.presence?.set({ state: { cursor: { x, y, z } } });
 doc.presence?.set({ ext: { myApp: { tool: 'select' } } });
+// A key set to `undefined` is removed, for you and for every peer.
+doc.presence?.set({ state: { selection: undefined } });
 
 // React to everyone else. `roster` is the other participants; each
 // carries a server-stamped `displayName` + `color` (CSS-ready string,
@@ -78,8 +83,8 @@ interface PresenceState {
 
 A caret belongs in `state` rather than in `ext` for the same reason a
 selection does: a document of prose is often open in more than one app,
-and a reader wants to see where the other person is working whichever
-app they are each in. Publish it on every selection change, which the
+and each user wants to see where the others are working, whichever
+app each is in. Publish it on every selection change, which the
 10 Hz debounce already paces.
 
 App-specific state (the current tool, a chat bubble, a typing
@@ -122,7 +127,14 @@ is a `PresenceParticipant` with
 `{ connectionId, sub, displayName, avatarUrl, color, joinedAt, lastSeen,
 state, ext }`. `displayName`, `avatarUrl`, and `color` are always
 present as strings, and `avatarUrl` is `''` when the user has no
-picture. Both types are exported from `@brass-build/client`, alongside
+picture. A signed-out visitor on a shared link has `sub: ''` and a
+`displayName` such as `Guest 1a2b3c`, so when you group participants
+into people by `sub`, show each participant with an empty `sub` on its
+own, keyed by `connectionId`. A visitor's second tab is a second guest.
+On that visitor's page, every signed-in participant also arrives with
+`sub: ''`, an empty `avatarUrl` and a `displayName` such as
+`Member 4d5e6f`.
+Both types are exported from `@brass-build/client`, alongside
 `PresenceSetInput` and `PresenceChangeListener`, for annotating your
 handlers and roster state.
 

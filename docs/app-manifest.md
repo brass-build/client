@@ -14,8 +14,8 @@ build: a bundler that skips dot-directories drops it silently.
 
 `brass publish` reads that same path out of the directory it publishes
 (`<dir>/.well-known/brass-app.json`), falling back to `brass-app.json` in
-the working directory, so it takes your `name` and `client_token` from the
-manifest you already ship.
+the working directory, and refuses to publish a manifest whose `$ref`
+entries do not resolve.
 
 The platform re-reads the manifest after each deploy, so publishing
 your bundle is what registers it. If Brass hosts your bundle
@@ -25,8 +25,12 @@ the bundle from your own origin, the platform fetches
 `<origin>/.well-known/brass-app.json` as an anonymous client, so serve
 that path publicly even when the rest of your app requires sign-in.
 
-The `opens` and `creates` tokens below only drive discovery and grant
-no access, so you declare them yourself.
+Brass applies your published manifest, including to your app running
+on your own machine, so publish after every change to it.
+
+Brass uses `opens`, `inputs` and `creates` below to decide where to
+offer your app. Declaring them grants your app no access to any
+document.
 
 ## What goes in it
 
@@ -47,15 +51,57 @@ no access, so you declare them yourself.
 
 Every field is optional, so ship only the ones your app uses.
 
-- **`opens`** lists the `schema_type`s of documents your app reads.
-  Declaring a `schema` already folds its family in, so most apps list
-  nothing extra here.
-- **`imports`** matches an uploaded file by extension or content type,
-  so Brass offers your app to whoever uploads one. Your app then reads
-  the file's bytes through `sourceBlob()`.
-- **`creates`** is the `schema_type` Brass stamps on the documents your
-  app makes, so peer apps that declare `opens` for the token can open
-  them. It folds into your own `opens` as well.
+- **`opens`** lists the families of documents your app opens as
+  the document a user is working in. Brass offers your app in "Open
+  with" for them, and a user can make it their default. Declaring a `schema`
+  already folds its family in, so most apps list nothing extra here.
+- **`inputs`** lists the schemas your app reads as inputs, such as the
+  models and drawings a dashboard counts. Each entry is a schema,
+  `{ "family", "streams" }`. The hosted picker presents a document to the
+  user when it matches one of these schemas (see
+  [What an app can open](./schemas.md#what-an-app-can-open)). For files that
+  have not been imported yet, the picker evaluates compatibility against the
+  schema declared by the file's importer. A schema declared only under
+  `inputs` does not add your app to the "Open with" menu for those documents.
+  Declare a schema under `inputs` rather than its family under `opens`
+  when your app reads documents through `Brass.chooseInputs` and never
+  edits them. Extract the schema from an existing document with
+  `npx @brass-build/cli schema pull --doc <docId> --out input-schema.json`,
+  which writes to that file while leaving your manifest's own `schema`
+  intact. Copy that file's `schema` into an `inputs` entry, then trim it to
+  only the required fields your code reads, since fewer requirements match
+  a wider set of documents.
+
+  ```json
+  {
+    "inputs": [
+      {
+        "family": "ifc",
+        "streams": { "default": { "type": "object", "required": ["instances"] } }
+      }
+    ]
+  }
+  ```
+
+- **`imports`** lists the file types your app imports. Brass offers your app
+  to whoever uploads a matching file and passes the file to your
+  `Brass.registerImporter` callback. Each entry has these fields:
+
+  | Field | |
+  | --- | --- |
+  | `extension` | The file extension to match, without the dot, in any case, such as `"csv"`. |
+  | `content_type` | The media type to match exactly, such as `"text/csv"`. |
+  | `schema` | Optional. The schema of the document your importer makes from a matching file. Without it, your app's `schema` applies. |
+
+  An entry needs `extension` or `content_type`, and a file matches an entry
+  when it matches every field the entry sets. A file whose entry has no
+  `schema`, in an app with no `schema`, is not imported.
+- **`creates`** is the family Brass stamps on the documents your
+  app makes, so peer apps that declare `opens` for that family can open
+  them. It folds into your own `opens` as well. When you declare a
+  `schema`, Brass stamps `schema.family` instead, so either leave
+  `creates` out or set it to the same family. `brass publish` warns
+  when the two differ.
 - **`exports`** names the file format your app writes a document out
   to, and your `Brass.registerSerializer` callback produces the bytes.
   Declaring it makes those documents downloadable. Declare it when your
@@ -74,6 +120,64 @@ Every field is optional, so ship only the ones your app uses.
 - **`schema`** declares the record shape your app works with, whether
   you designed it or adopted an existing one. See
   [`schemas.md`](./schemas.md).
+- **`shared_schemas`** defines schemas by name for other fields to refer
+  to. See [Shared schemas](#shared-schemas) below.
+- **`access`** says who may use your app. Declare `"create": "anyone"`
+  when a visitor who is not signed in can do something in your app, so
+  they can try it before creating an account. A visitor belongs to no
+  organization, so `Brass.chooseInputs`, `Brass.chooseInput` and calls to
+  a service your manifest declares are not available to them.
+
+  | Field | Values |
+  | --- | --- |
+  | `create` | Who may start a new document in your app. `false` when your app makes no new documents of its own, such as a viewer of files other apps import: Brass then offers no New for it, and if your app calls `Brass.createDocument` anyway, the call throws a `BrassError` whose `code` is `"create_not_offered"`. Brass still opens uploaded and imported files in it. `"signed-in"` for people who are signed in. `"anyone"` adds visitors without an account, who can create, upload and edit temporary documents. For `"anyone"`, publish the app with `--gate off --visibility public`. |
+  | `open` | Who may open an organization's public link in your app: `"anyone"`, or `"signed-in"` to ask a visitor to sign in first. |
+
+  When you leave `create` out, Brass uses `"anyone"` for a public app
+  whose load gate is off and `"signed-in"` otherwise, so declare it to
+  keep the same answer when the gate changes. When you leave `open` out,
+  Brass uses `"anyone"`.
+
+  ```json
+  { "access": { "create": "anyone", "open": "anyone" } }
+  ```
+
+  The hosted load gate (`brass publish --gate on|off`) is separate from
+  `access`: it decides whether your hosted bundle loads for a visitor who
+  is not signed in, before any of your code or this manifest runs.
+
+## Shared schemas
+
+Define schemas by name in `shared_schemas`. To use one, write
+`{ "$ref": "#/shared_schemas/<name>" }` in place of a schema in `schema`, a
+`inputs` entry, or an `imports` entry's `schema`. Brass treats a reference as
+the schema it names.
+
+This app writes `tracker` documents, reads as inputs any tracker that has
+`rows`, and imports CSV files as `csv-table` documents that it also reads
+as inputs:
+
+```json
+{
+  "shared_schemas": {
+    "tracker": {
+      "family": "tracker",
+      "streams": { "default": { "type": "object", "required": ["rows", "columns"] } }
+    },
+    "tracker-input": {
+      "family": "tracker",
+      "streams": { "default": { "type": "object", "required": ["rows"] } }
+    },
+    "csv-table": {
+      "family": "csv-table",
+      "streams": { "default": { "type": "object", "required": ["header", "rows"] } }
+    }
+  },
+  "schema": { "$ref": "#/shared_schemas/tracker" },
+  "inputs": [{ "$ref": "#/shared_schemas/tracker-input" }, { "$ref": "#/shared_schemas/csv-table" }],
+  "imports": [{ "extension": "csv", "schema": { "$ref": "#/shared_schemas/csv-table" } }]
+}
+```
 
 ## Services, for calling third-party APIs
 
@@ -132,7 +236,7 @@ because that name belongs to whoever created the bucket.
 
 ### Credential fields
 
-A field is one value the person connecting a credential is asked for. Each one
+A field is one value the user connecting a credential is asked for. Each one
 is a box on the form they fill in.
 
 Some authentication methods declare their own fields, and each method below
@@ -142,7 +246,7 @@ lists the ones it declares. Declare any others in `fields`:
 | --- | --- |
 | `name` | Required. Identifies the field. |
 | `secret` | `true` by default. Brass encrypts the value and shows only its last few characters afterwards. `false` stores it in the clear and shows it in full. |
-| `label` | What the form calls the field. Use the vendor's own word for it, since that is what the person is reading from. Defaults to the name. |
+| `label` | What the form calls the field. Use the vendor's own word for it, since that is what the user is reading from. Defaults to the name. |
 | `readable` | `false` by default. `true` returns the value to your app with the service, for a value your app has to include in the request. Such a field is not secret, so `secret` defaults to `false` for it and declaring both is refused. See [Values the app reads](./services.md#values-the-app-reads). |
 
 ```json
@@ -200,9 +304,9 @@ The fields are `username` and `password`.
 { "host": "api.twilio.com", "auth": { "type": "basic" } }
 ```
 
-Some services take a fixed word as the user half rather than an account name,
+Some services take a fixed word as the username rather than an account name,
 such as `api` for Mailgun. Set it as `username` on the `auth` block and the
-person is asked for the password alone.
+form asks for the password alone.
 
 ```json
 { "host": "api.mailgun.net", "auth": { "type": "basic", "username": "api" } }
